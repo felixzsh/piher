@@ -1,0 +1,37 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "packageManager": "npm",
+  "testRunner": "command",
+  "commandRunner": {
+    "command": "node --test packages/ext/test/*.test.ts"
+  },
+  "mutate": [
+    "packages/ext/src/tool-gate.ts",
+    "packages/ext/src/lock-core.ts",
+    "packages/ext/src/pipe-channel.ts",
+    "packages/ext/src/gc-core.ts",
+    "packages/ext/src/config-catalog-core.ts"
+  ],
+  "thresholds": {
+    "high": 80,
+    "low": 60,
+    "break": 50
+  },
+  "timeoutMS": 12000,
+  "concurrency": 4,
+  "incremental": true,
+  "incrementalFile": "reports/stryker-incremental.json",
+  "coverageAnalysis": "off",
+  "reporters": [
+    "html",
+    "clear-text",
+    "progress",
+    "json"
+  ],
+  "htmlReporter": {
+    "fileName": "reports/mutation/html/index.html"
+  },
+  "jsonReporter": {
+    "fileName": "reports/mutation/mutation.json"
+  }
+}

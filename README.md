@@ -1,0 +1,260 @@
+<div align="center">
+
+# piher
+
+**pi** × h**er**dr — subagents and terminals for [pi](https://pi.dev/), on [herdr-core](https://herdr.dev/).
+
+</div>
+
+`piher` is one pi extension. It gives a pi session two tools — `subagent` and `terminal` — and runs
+what they start as real terminals through [herdr-core](https://herdr.dev/) (`hc`), which the optional
+**Herdr app** displays as spaces, tabs and panes. A subagent is a separate pi session in its own
+terminal: its own context, visible to the person watching, and attachable at any time.
+
+There is no app-side mod. piher writes terminals and labels through core; the app displays them by
+its own rules.
+
+## What it is
+
+| Piece | Package | Role |
+|---|---|---|
+| **pi extension** | `packages/ext` (npm: [`piher`](https://www.npmjs.com/package/piher)) | Registers `subagent` and `terminal`; starts, reads and reclaims their terminals through core; carries the role manifests and the delegation ledger |
+| **herdr-core** | `hc` ≥ 0.1.16 | Terminal server: `terminal.run/read/wait/send/keys/interrupt/label/kill/rm` plus status and events over `HC_TERMINAL_SOCKET` |
+| **Herdr app** | `herdr-app` (optional) | Displays core terminals as spaces, tabs and panes; its built-in sidebar shows agents and raises blocked notifications |
+
+## Architecture
+
+- piher talks to core over the terminal socket it inherits: `HC_TERMINAL_SOCKET` (the socket) and
+  `HC_TERMINAL_ID` (its own address). Both are injected by core and read-only for piher.
+- A worker is one `terminal.run {argv, cwd, env, labels: {herdr.space, herdr.tab}, noNotify: true}`
+  call. Core starts the program; the app adopts that terminal as an unfocused pane of the caller's
+  tab. A **new** `herdr.tab` id makes the app create a new tab — piher never does placement math. A
+  spawn that asks for a `worktree` is the one exception on the app side: piher creates the checkout,
+  then asks `herdr-app` for a space (`space.new`) that shows it, and places the worker there.
+- A worker's process ends with its parent; piher closes terminals through `terminal.kill` +
+  `terminal.rm`.
+- **Status comes only from pi's native OSC 7501 report**, which core stores and the app renders.
+  piher never writes terminal status.
+- Metadata lives in **terminal labels**, and only ones with a reader inside piher: `piher.session`
+  (the worker's own session file) and `piher.lock.<hash>` (write-lock beacons). `hc get <terminal>
+  --json` shows them.
+- Machine-to-machine messages use **pipe-channel** (a private local socket per pair), never PTY
+  injection: PTY input belongs to the human at that pane. Core's parent notes are disabled for worker
+  terminals (`noNotify: true`).
+- State arrives through core's `events.subscribe` (`status` / `turn` / `finished` / `labels`); a
+  snapshot is pulled only when an event fires or a `missed` event says to resync.
+
+## The two tools
+
+### `subagent`
+
+One worker = one pi session in one core terminal. `spawn` returns an acknowledgement at once — the
+worker's result arrives later, as a settlement notice at the caller's next turn boundary.
+
+| Action | What it does |
+|---|---|
+| `spawn` (default) | Start a worker from `prompt` (the whole task), `description`, `cwd` **or** `worktree`, `role`, `allowed_tools`, `tab`. Several spawns in one message run in parallel (cap four) |
+| `send` | Follow-up to a running or settled worker: at its next tool gap when it is working, as a new turn when it is idle |
+| `output` | What the worker printed since the previous `output` call, plus the final report once it has one |
+| `list` | Every worker of this session with state, handle, role and last activity |
+| `interrupt` | Abort the current turn only — the pane and its session stay, and no report arrives for that turn |
+| `resume` | Revive a finished worker from the ledger (`taskId`) in a new pane and its own session |
+| `role` | Switch a live worker's role profile; the reply reports the tool diff |
+| `close` | Reclaim a worker that already finished: pane and tab go, session and ledger row stay. A running worker is refused (interrupt its turn first) |
+| `help` | The full manual: placement, role profiles, the ledger, every parameter |
+
+A task is addressed by `agentId`: the slug printed by `spawn`/`list`, the bare pane id, or the
+combined `slug@paneId`.
+
+`worktree: "<name>"` makes piher create `~/.herdr/worktrees/<repo>/<slug>` on branch `<name>` from
+the caller's HEAD, ask the app for a space named after it, and record the checkout in the ledger;
+repeating it reuses the checkout that already sits on that branch. `close` removes what a spawn
+created — the space goes, the worktree is removed, the branch survives. A dirty worktree is refused,
+naming the files. `cwd` is the other way round: a checkout the caller already has stays the caller's
+to remove.
+
+A role that declares `lifecycle: "one-shot"` is reclaimed this way automatically at its settlement.
+
+### `terminal`
+
+Persistent interactive shells in dedicated core terminals; cwd, environment and background
+processes survive between calls.
+
+| Action | What it does |
+|---|---|
+| `open` | Create the shell (`cwd`, optional `terminal_id`); returns its id and readiness |
+| `send` | Type `text` at the prompt (Enter appended; multi-line runs line by line) |
+| `wait` | Block until output matches `pattern` (literal or `regex`), or until a log named by `file` matches |
+| `read` | What is new since the previous read, up to `max_chars`; `pane_id` reads another terminal of the tab |
+| `signal` | Send a control key: `ctrl+c`, `ctrl+d`, `ctrl+z`, `esc`, `enter` |
+| `close` | Kill the process tree |
+| `list` | This session's shells |
+
+A single-line command typed at a POSIX prompt reports itself: when it finishes, one notice carries
+its exit code, the last lines and the path of the log with the full output — no `wait` and no sleep
+loop. Nothing else notifies: an idle shell is not a finished command.
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `/piher-tree` | The delegation tree: every running subagent plus the settled nodes still resumable, with ages. An in-pi overlay (`esc`/`q` closes, live refresh while open); without `ui.custom` it falls back to a notify view |
+| `/piher-role` | Without arguments: the current role and the available names. `/piher-role <name>` switches mid-session (widening beyond the current toolset asks for confirmation) |
+| `/piher-config` | Read-only configuration guide: the plane index, `show [roles\|env\|all]` with effective value and source, `check`, `doc` |
+| `/piher-locks` | Write locks held by this pane and by live panes — the human view of the `piher.lock.<hash>` labels |
+
+## Roles
+
+A role is a JSON manifest that decides what a worker is: `model`, `thinking`, `lifecycle`
+(`persistent` or `one-shot`), `instructions`, `modelInvocable`, `guidelines`, and a `manifest` of
+tool rules (`tools`, `rules`, `unknownTools`).
+
+Layers, in order: `<cwd>/.piher/roles/<name>.json` → `~/.pi/agent/piher/roles/<name>.json` → the
+bundled `src/roles/`. `master` and `worker-default` are reserved and read only from the bundle. Names
+are `[a-z0-9-]+`; a malformed manifest is an error at the layer that holds it instead of silently
+falling through.
+
+The caller's model learns which roles exist from a derived `piher-roles` prompt section, not from a
+skill file, so a role added to a directory appears without editing any text. Deny rules are not
+bypassable: a denied tool call returns `terminate`, so a batch whose results are all terminating ends
+without another model round trip.
+
+## The delegation ledger
+
+Every spawn, settlement, reclaim and close appends one row to `<repo>/.piher/history/history.jsonl`
+in the **main** checkout — a worker in a linked worktree records into the repository, never into the
+worktree. `resume` reads it, and at session start piher closes the spaces whose checkout is gone.
+Outside a git repository nothing is recorded and `resume` says so.
+
+On the parent side, a settled worker's result arrives as a notice that names the worker and marks its
+text as that worker's output; while the parent is busy, notices are buffered and the batch shows the
+first few plus a tail that says how many were withheld.
+
+## Install
+
+### Requirements
+
+- Node ≥ 22
+- pi ≥ 1.4.0 (`@earendil-works/pi-coding-agent`) — its native OSC 7501 program-status reporter is the
+  only status source
+- herdr-core ≥ 0.1.16 (`hc`) — `curl -fsSL https://releases.herdr.dev/core/install.sh | sh`
+- Herdr app (optional) — without it pi still runs and piher still spawns workers; you just cannot
+  watch them in a window
+
+### One-shot install
+
+```sh
+npx piher-setup@latest            # user mode: pi install npm:piher (preflights node / pi / hc)
+npx piher-setup@latest version    # local vs npm latest (installer / extension / herdr-core)
+npx piher-setup@latest update     # refresh the extension in place
+npx piher-setup@latest uninstall
+```
+
+Pin `@latest` so npx does not reuse a cached installer. `piher-setup --help` lists every command.
+The installer never touches core's own configuration; upgrade core with `hc update`.
+
+### Manual install (equivalent steps)
+
+```sh
+curl -fsSL https://releases.herdr.dev/core/install.sh | sh   # herdr-core, once
+pi install npm:piher                                         # the extension
+```
+
+Dev mode links a clone instead, so code edits are live:
+
+```sh
+git clone <this repo> && cd <this repo>
+node install.mjs install --dev
+```
+
+piher must be registered in pi from exactly one source; `install`/`update` stop (exit 1, nothing
+changed) when it is already registered from another one, and print the `pi remove …` to run.
+
+## Scope — what the extension changes
+
+After install, piher is live in every pi session, not only inside a core terminal.
+
+| Surface | Bare `pi` | Inside a herdr-core terminal |
+|---|---|---|
+| `subagent`, `terminal` | **not registered** | live |
+| Worker-terminal rules, write locks, pipe channel | off | live |
+| Role manifest and its visible-tool layer (`setActiveTools`) | off | on |
+| Session entries of the extension's own types | replayed from the transcript | live |
+
+Outside core, a session still replays what it recorded before, so a resumed transcript keeps its
+delegation cards. Detection is `HC_TERMINAL_ID` + `HC_TERMINAL_SOCKET`.
+
+## Configuration
+
+Runtime policy is one registry (`packages/ext/src/options.ts`); every knob is milliseconds unless
+noted. `PIHER_*` is the only namespace.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PIHER_SUBAGENT_TIMEOUT_MS` | `600000` | Inactivity budget before a subagent is terminated (a working turn renews it) |
+| `PIHER_READY_TIMEOUT_MS` | `90000` | How long to wait for a spawned pane to open its pipe (a dead pane fails fast) |
+| `PIHER_SETTLE_WINDOW_MS` | `4000` | Debounce after a worker turn ends before it counts as settled |
+| `PIHER_POLL_INTERVAL_MS` | `30000` | Safety re-check when no core event arrives |
+| `PIHER_GC_TICK_MS` | `30000` | Idle GC sweep cadence |
+| `PIHER_SESSION_TTL_SECONDS` | `600` | Session retention after a worker exits, before GC |
+| `PIHER_GIT_TIMEOUT_MS` | `10000` | git command timeout (worktree creation, status probes) |
+| `PIHER_TERM_READ_MAX` | `8000` | Characters returned per terminal read |
+| `PIHER_TERM_IDLE_MS` | `300000` | Idle time before the second cleanup nudge for an open terminal |
+| `PIHER_TERM_GRACE_MS` | `30000` | Settle grace before that nudge |
+| `PIHER_TERMINAL_PROMPT` | auto from `$SHELL` | Prompt strategy for terminal readiness: `bash\|zsh\|powershell\|pwsh` |
+| `PIHER_WRITE_LOCK` | – | `1` makes a conflicting `write`/`edit` block instead of warn |
+| `PIHER_TRACE` | – | Write diagnostics (renderers, swallowed errors) to stderr, or to this path |
+| `PIHER_HMR` | – | Dev only: enable the cordis HMR boundary (needs `--expose-internals`) |
+
+`PIHER_SUBAGENT`, `PIHER_DELEGATION`, `PIHER_ROLE_MANIFEST` and `PIHER_ROLE_BASE` are contracts
+handed to a child at spawn, not knobs to set by hand. Core's own `HC_*` variables are core's.
+
+The same values are inspectable in-session, read-only:
+
+```text
+/piher-config            # plane index; hands a guided change to the agent
+/piher-config show all   # effective value + source per key (env > default; roles are per-file)
+/piher-config check      # validation across planes   ·   /piher-config doc → written report
+```
+
+See [docs/configuration.md](docs/configuration.md) for the plane map and the "which plane do I edit?"
+table.
+
+## Plugin conflicts
+
+pi keeps one provider per tool name and refuses to load a second one, so two extensions that register
+`subagent` cannot coexist — the second one is a hard load failure. Do not install alongside another
+extension that owns `subagent` (for example `@tintinweb/pi-subagents`, `@minhduydev/pi-subagents` or
+`pi-herdr-subagents`), and do not add a second OSC 7501 status reporter for the same terminal.
+
+## Design principles
+
+- **The session transcript is the source of truth**: delegations, registries and role switches replay
+  from session branches, so a restart or a branch switch stays correct.
+- **Event-driven, never poll**: core's `events.subscribe` drives state; polling is a safety net with a
+  long interval, not the mechanism.
+- **Zero app-side mod**: piher writes terminals and labels through core; the app decides how they look.
+- **PTY input belongs to humans**: machine-to-machine messages use the pipe channel; core's parent
+  notes are off for worker terminals.
+- **Best-effort metadata**: a label or notice failure is swallowed and never blocks the session.
+
+## Repository layout
+
+```
+packages/
+  ext/             # the pi extension (npm: piher): tools, core client, roles, ledger, skill
+docs/              # install guide, configuration overview, decision index, release process
+install.mjs        # the one-shot installer (npm: piher-setup)
+```
+
+## Development
+
+```sh
+npm install --ignore-scripts
+npm test           # typecheck + node --test (449 tests)
+npm run test:mutation
+```
+
+## License
+
+MIT

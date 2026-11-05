@@ -1,0 +1,58 @@
+# Nightly mutation testing, sharded (3 parallel jobs, each with its own
+# incremental file + cache). A full sweep at testRunner=command costs
+# ~full-suite-per-mutant (~15s/mutant), which exceeds the 360-minute Actions
+# job cap — shards bring each job under it and per-push CI stays fast
+# (mutation is a quality patrol, not a merge gate; thresholds live in
+# stryker.conf.json and stay per-shard).
+name: mutation
+
+on:
+  schedule:
+    - cron: '0 19 * * *' # 19:00 UTC = 03:00 Beijing next day
+  workflow_dispatch:
+
+jobs:
+  mutate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: core
+            # pipe-channel is the slowest (socket IO per mutant); pair it with small pure cores
+            files: packages/ext/src/tool-gate.ts,packages/ext/src/lock-core.ts,packages/ext/src/gc-core.ts,packages/ext/src/config-catalog-core.ts,packages/ext/src/pipe-channel.ts
+          - shard: delegation
+            files: packages/ext/src/delegation-core.ts,packages/ext/src/ledger.ts,packages/ext/src/subagent-core.ts,packages/ext/src/subagent-session.ts
+          - shard: surface
+            files: packages/ext/src/core-client.ts,packages/ext/src/terminal-core.ts,packages/ext/src/terminal-run.ts,packages/ext/src/settlement-card.ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --ignore-scripts
+      - uses: actions/cache/restore@v4
+        with:
+          path: reports/stryker-incremental-${{ matrix.shard }}.json
+          key: stryker-${{ matrix.shard }}-${{ github.run_id }}
+          restore-keys: stryker-${{ matrix.shard }}-
+      - name: Run shard
+        run: >-
+          npx stryker run
+          --incremental
+          --incrementalFile reports/stryker-incremental-${{ matrix.shard }}.json
+          --mutate "${{ matrix.files }}"
+      # Save even on failure: Stryker persists tested-mutant state before the
+      # break threshold exits, so the next nightly resumes instead of redoing.
+      - uses: actions/cache/save@v4
+        if: always() && hashFiles(format('reports/stryker-incremental-{0}.json', matrix.shard)) != ''
+        with:
+          path: reports/stryker-incremental-${{ matrix.shard }}.json
+          key: stryker-${{ matrix.shard }}-${{ github.run_id }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-report-${{ matrix.shard }}
+          path: reports/mutation
+          if-no-files-found: ignore

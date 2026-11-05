@@ -1,0 +1,56 @@
+{
+  "name": "piher-setup",
+  "version": "0.5.2",
+  "description": "One-shot installer for piher: install / update / version / uninstall of the piher extension on herdr-core",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "piher-setup": "./install.mjs"
+  },
+  "files": [
+    "install.mjs"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/July24/piher.git"
+  },
+  "homepage": "https://github.com/July24/piher#readme",
+  "bugs": {
+    "url": "https://github.com/July24/piher/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "piher",
+    "installer",
+    "herdr",
+    "herdr-core",
+    "coding-agent"
+  ],
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p packages/ext/tsconfig.json",
+    "test": "npm run typecheck && node --test \"packages/*/test/*.test.ts\"",
+    "test:mutation": "stryker run",
+    "prepare": "node ./install.mjs --prepare"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis-plugin-group": "^1.0.1",
+    "@deepseek-ai/cordis-plugin-hmr": "^1.0.16",
+    "@deepseek-ai/cordis-plugin-loader": "^1.0.2",
+    "@deepseek-ai/cordis-plugin-timer": "^1.1.3",
+    "@stryker-mutator/core": "^10.0.0",
+    "typescript": "~5.9.3"
+  },
+  "pi": {
+    "extensions": [
+      "./packages/ext/src/index.ts"
+    ],
+    "skills": [
+      "./packages/ext/skills/piher-tools"
+    ]
+  }
+}

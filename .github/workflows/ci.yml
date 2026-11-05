@@ -1,0 +1,26 @@
+# Test on macOS / Linux / Windows. Mutation testing lives in mutation.yml
+# (nightly + manual): a full command-runner sweep needs ~11h across 2824
+# mutants, which cannot fit the per-push path or a single 6h job cap.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install --ignore-scripts
+      - run: npm test
+

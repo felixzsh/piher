@@ -1,0 +1,511 @@
+/**
+ * Child-session transcript I/O + pane-output reads for subagents. Path resolution, settlement
+ * text and liveness probes share one candidate order (the worker's own `piher.session` label before
+ * recent-file fallback, excluding the master's own session and sessions claimed by other live
+ * terminals), so settlement text can never cross sessions.
+ */
+import { accessSync, constants, statSync } from 'node:fs';
+import type { CoreClientLike, CoreStatus } from './core-client.ts';
+import {
+  bareSessionId,
+  deriveSubSessionState,
+  listSessionFiles,
+  readSessionFile,
+  resolveSessionFileValue,
+  type SubSessionState,
+} from './session-tail.ts';
+import { idParam, reportFingerprint, type AliveProbe, type SubEntry } from './subagent-core.ts';
+import { toolError } from './tool-error.ts';
+
+/* ── subagent output delta (pure) ───────────────────────────────── */
+
+export const OUTPUT_DEFAULT_MAX_CHARS = 6000;
+export const OUTPUT_HARD_CAP_CHARS = 16000;
+const OUTPUT_MIN_OVERLAP = 16;
+const OUTPUT_TAIL_CHARS = 500;
+
+const BOX_CHARS = '│┃║╭╮╰╯┌┐└┘├┤┬┴┼─━═╌╍';
+const FRAME_ONLY_LINE = new RegExp(`^[\\s${BOX_CHARS}]*[${BOX_CHARS}][\\s${BOX_CHARS}]*$`);
+const SIDE_BORDER = /^\s*[│┃║] ?|\s*[│┃║]\s*$/g;
+/** pi's status footer: `↑43k ↓13k R820k CH99.1% $0.017 …`, preceded by a `~/cwd (branch)` line. */
+const PI_FOOTER_LINE = /^↑[\d.]+[kKmM]?\s+↓[\d.]+[kKmM]?\s/;
+const PI_FOOTER_CWD_LINE = /^~?\/\S*( \([^)]*\))?$/;
+
+/**
+ * Strip TUI chrome from a worker pane read: frame-only box-drawing rows, side borders, right-padding,
+ * pi's footer, and blank-line runs. A real read was ~20% whitespace, box glyphs and footer. Applied
+ * before the delta, so the cursor tracks the same cleaned text on every call.
+ */
+export function cleanPaneChrome(text: string): string {
+  // Frame rows are judged before border stripping, which would otherwise leave them as blank lines.
+  const lines = text.split('\n')
+    .filter((line) => !FRAME_ONLY_LINE.test(line))
+    .map((line) => line.replace(SIDE_BORDER, '').trimEnd());
+  const kept: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (PI_FOOTER_LINE.test(line)) continue;
+    if (PI_FOOTER_CWD_LINE.test(line) && PI_FOOTER_LINE.test(lines[i + 1] ?? '')) continue;
+    if (line === '' && kept[kept.length - 1] === '') continue;
+    kept.push(line);
+  }
+  return kept.join('\n');
+}
+
+/** Normalized-text length of the report opening that identifies the pane's rendered copy. */
+const REPORT_KEY_CHARS = 24;
+
+/**
+ * The pane shows the final report rendered (markdown stripped, long lines cut at pane width), so it
+ * is a lossy copy of the transcript text. When the transcript report is attached, cut the pane delta
+ * where the report's opening appears (whitespace and markdown markers ignored). Null: no copy found.
+ */
+export function cutPaneReportCopy(delta: string, report: string): string | null {
+  const isNoise = (ch: string): boolean => /[\s`*_#>]/.test(ch);
+  const key = [...report].filter((ch) => !isNoise(ch)).slice(0, REPORT_KEY_CHARS).join('');
+  if (key.length < REPORT_KEY_CHARS) return null;
+  let normalized = '';
+  const origin: number[] = [];
+  for (let i = 0; i < delta.length; i++) {
+    if (isNoise(delta[i]!)) continue;
+    normalized += delta[i];
+    origin.push(i);
+  }
+  const at = normalized.indexOf(key);
+  if (at < 0) return null;
+  const lineStart = delta.lastIndexOf('\n', origin[at]!) + 1;
+  const before = delta.slice(0, lineStart).trimEnd();
+  const marker = '(the pane\'s rendered copy of the final report is omitted — full text in the Subagent Report section below)';
+  return before ? `${before}\n${marker}` : marker;
+}
+
+export type SubagentStatus = 'running' | 'idle' | 'blocked' | 'settled';
+
+export interface SubagentOutputCursor {
+  tail: string;
+  fullLength: number;
+  /** Fingerprint of the last transcript report delivered to this pane; deduplicates the fallback across polls. */
+  reportTail?: string;
+}
+
+function boundText(text: string, maxChars: number): { text: string; truncated: boolean } {
+  if (text.length <= maxChars) return { text, truncated: false };
+  return { text: text.slice(text.length - maxChars), truncated: true };
+}
+
+function extractTail(text: string, tailChars = OUTPUT_TAIL_CHARS): string {
+  return text.length <= tailChars ? text : text.slice(text.length - tailChars);
+}
+
+/**
+ * Incremental delta between the previous cursor and the current full buffer: an initial read returns
+ * bounded full text, an append the text after the previous tail; ambiguous repeats and scrolled-off
+ * boundaries degrade to full text with `restart: true`.
+ */
+export function computeSubagentOutputDelta(
+  prevCursor: SubagentOutputCursor | null | undefined,
+  currText: string,
+  options?: { maxChars?: number; minOverlap?: number; tailChars?: number },
+): { delta: string; restart: boolean; truncated: boolean; nextCursor: SubagentOutputCursor } {
+  const maxChars = Math.max(1, Math.min(options?.maxChars ?? OUTPUT_DEFAULT_MAX_CHARS, OUTPUT_HARD_CAP_CHARS));
+  const minOverlap = options?.minOverlap ?? OUTPUT_MIN_OVERLAP;
+  const tailChars = options?.tailChars ?? OUTPUT_TAIL_CHARS;
+  const nextCursor = (): SubagentOutputCursor => ({
+    tail: extractTail(currText, tailChars),
+    fullLength: currText.length,
+  });
+  const carry = (text: string, restart: boolean) => {
+    const bounded = boundText(text, maxChars);
+    return { delta: bounded.text, restart, truncated: bounded.truncated, nextCursor: nextCursor() };
+  };
+
+  if (!prevCursor || !prevCursor.tail) return carry(currText, false);
+
+  const prevTail = prevCursor.tail;
+  // Same length and suffix → nothing new; keep the cursor (and its report fingerprint) as-is.
+  if (currText.length === prevCursor.fullLength && currText.endsWith(prevTail)) {
+    return { delta: '', restart: false, truncated: false, nextCursor: prevCursor };
+  }
+
+  const firstIdx = currText.indexOf(prevTail);
+  if (firstIdx !== -1) {
+    // Repeats of the tail make the boundary ambiguous; fall back to the whole buffer.
+    if (firstIdx !== currText.lastIndexOf(prevTail)) return carry(currText, true);
+    const rawDelta = currText.slice(firstIdx + prevTail.length);
+    if (rawDelta.length === 0) return { delta: '', restart: false, truncated: false, nextCursor: prevCursor };
+    return carry(rawDelta, false);
+  }
+
+  // Tail scrolled off the top: the longest suffix of prevTail matching a prefix of currText is the boundary.
+  const maxPossibleOverlap = Math.min(prevTail.length - 1, currText.length);
+  const effectiveMinOverlap = Math.min(minOverlap, prevTail.length);
+  for (let k = maxPossibleOverlap; k >= effectiveMinOverlap; k--) {
+    if (currText.startsWith(prevTail.slice(prevTail.length - k))) return carry(currText.slice(k), false);
+  }
+  return carry(currText, true);
+}
+
+type StatusInput = { localStatus: SubEntry['status']; status?: CoreStatus | null };
+
+/** First matching rule wins; a worker with no other signal is running. An `error` terminal ended
+ *  its turn like `done`, so the transcript decides what came out. */
+const STATUS_RULES: ReadonlyArray<{ status: SubagentStatus; match: (i: StatusInput) => boolean }> = [
+  { status: 'blocked', match: (i) => i.status === 'blocked' },
+  { status: 'running', match: (i) => i.status === 'working' },
+  { status: 'settled', match: (i) => i.localStatus === 'settled' || i.localStatus === 'closed' || i.status === 'done' || i.status === 'error' },
+  { status: 'idle', match: (i) => i.status === 'idle' },
+];
+
+export function resolveSubagentStatus(input: StatusInput): SubagentStatus {
+  return STATUS_RULES.find((rule) => rule.match(input))?.status ?? 'running';
+}
+
+export interface FormatSubagentOutputOpts {
+  paneId: string;
+  status: SubagentStatus;
+  revision: number;
+  bufferTruncated: boolean;
+  deltaResult: { delta: string; restart: boolean; truncated: boolean };
+  askQuestion?: string | null;
+}
+
+export function formatSubagentOutput(opts: FormatSubagentOutputOpts): string {
+  const parts: string[] = [];
+  const metaItems: string[] = [
+    `pane: ${opts.paneId}`,
+    `status: ${opts.status}${opts.status === 'blocked' && opts.askQuestion ? ` (question: "${opts.askQuestion}")` : ''}`,
+    `revision: ${opts.revision}`,
+  ];
+  if (opts.deltaResult.restart) {
+    metaItems.push('buffer scrolled or reset — full text returned (not a process restart)');
+  }
+  if (opts.bufferTruncated || opts.deltaResult.truncated) metaItems.push('truncated: true');
+  parts.push(`[Subagent Output | ${metaItems.join(' | ')}]`);
+  parts.push(opts.deltaResult.delta.length === 0 ? '(no new output since last read)' : opts.deltaResult.delta);
+  return parts.join('\n');
+}
+
+/* ── session file resolution + liveness probes ──────────────────── */
+
+export interface SessionIoHost {
+  client: CoreClientLike;
+  getSessionId: () => string;
+  sessionsDir: () => string;
+}
+
+export interface ResolveSessionFileOpts {
+  /** Reject candidates last written before this timestamp, so a request is never attributed to a
+   * session file that was not written after the request was injected (spawn-race mis-attribution). */
+  minMtimeMs?: number;
+}
+
+export interface SessionIo {
+  resolveSessionFile(paneId: string, cwd: string, preferred?: string | null, opts?: ResolveSessionFileOpts): Promise<string | null>;
+  readAskFlag(paneId: string): Promise<string | null>;
+  probeAlive(paneId: string, cwd: string): Promise<AliveProbe>;
+  subSessionState(paneId: string, cwd: string, sinceTs: number, preferred?: string | null): Promise<SubSessionState>;
+  /** Re-attribute a registry sessionFile with no writes since `sinceTs`: keep `preferred` when fresh,
+   * else accept herdr's per-pane report when fresh. An existing value is only replaced by the
+   * authoritative report; null means "keep the old one" (never an mtime guess). */
+  reattributeStaleSessionFile(paneId: string, cwd: string, sinceTs: number, preferred: string | null): Promise<string | null>;
+}
+
+interface FileStamp {
+  size: number;
+  mtimeMs: number;
+}
+
+function stampOf(file: string): FileStamp | null {
+  try {
+    const s = statSync(file);
+    if (!s.isFile()) return null;
+    accessSync(file, constants.R_OK);
+    return { size: s.size, mtimeMs: s.mtimeMs };
+  } catch {
+    return null;
+  }
+}
+
+/** Memo of values derived from a session file, invalidated by (size, mtime, sinceTs): worker
+ * sessions reach tens of MB, and the poll loop re-derives the same state every tick. */
+class DerivedCache<T> {
+  private readonly entries = new Map<string, { key: string; value: T }>();
+  private readonly limit: number;
+
+  constructor(limit = 32) {
+    this.limit = limit;
+  }
+
+  get(file: string, stamp: FileStamp, sinceTs: number): T | undefined {
+    const hit = this.entries.get(file);
+    return hit && hit.key === `${stamp.size}:${stamp.mtimeMs}:${sinceTs}` ? hit.value : undefined;
+  }
+
+  set(file: string, stamp: FileStamp, sinceTs: number, value: T): void {
+    this.entries.delete(file);
+    this.entries.set(file, { key: `${stamp.size}:${stamp.mtimeMs}:${sinceTs}`, value });
+    for (const oldest of this.entries.keys()) {
+      if (this.entries.size <= this.limit) break;
+      this.entries.delete(oldest);
+    }
+  }
+}
+
+export function createSessionIo(h: SessionIoHost): SessionIo {
+  const stateCache = new DerivedCache<SubSessionState>();
+
+  /** This terminal's `piher.session` label plus the sessions claimed by other terminals; one
+   *  `terminal.list` serves both, so the poll hot paths pay a single RPC. */
+  async function reportedAndTaken(paneId: string): Promise<{ reported: string | null; taken: Set<string> }> {
+    const taken = new Set<string>();
+    let reported: string | null = null;
+    try {
+      for (const terminal of await h.client.listTerminals({ all: true })) {
+        const sessionFile = terminal.labels['piher.session'];
+        if (!sessionFile) continue;
+        if (terminal.id === paneId) reported = sessionFile;
+        else taken.add(bareSessionId(sessionFile));
+      }
+      // list may not include a terminal created moments ago: ask for it directly before giving up.
+      if (!reported) {
+        const own = await h.client.getTerminal(paneId);
+        reported = own?.labels['piher.session'] ?? null;
+      }
+    } catch {
+      try {
+        reported = (await h.client.getTerminal(paneId))?.labels['piher.session'] ?? null;
+      } catch {
+        /* both unavailable → no report, own/taken exclusions still hold */
+      }
+    }
+    return { reported, taken };
+  }
+
+  /** Ordered candidates: pipe self-report (authoritative), the worker's own label, then the newest session files. */
+  async function resolveSessionFileCandidates(paneId: string, cwd: string, preferred?: string | null): Promise<string[]> {
+    // A sub's sessionFile must never resolve to the master's own transcript (compare via
+    // bareSessionId: herdr reports ids and paths interchangeably).
+    const own = bareSessionId(h.getSessionId());
+    const { reported, taken } = await reportedAndTaken(paneId);
+    const out: string[] = [];
+    const push = (file: string | null): void => {
+      if (!file || out.includes(file)) return;
+      const id = bareSessionId(file);
+      if (own && id === own) return;
+      if (taken.has(id)) return;
+      out.push(file);
+    };
+    push(resolveSessionFileValue(cwd, h.sessionsDir(), preferred));
+    push(resolveSessionFileValue(cwd, h.sessionsDir(), reported));
+    for (const f of listSessionFiles(cwd, h.sessionsDir(), 4)) push(f);
+    return out;
+  }
+
+  async function* readableCandidates(paneId: string, cwd: string, preferred?: string | null): AsyncGenerator<{ file: string; stamp: FileStamp }> {
+    for (const file of await resolveSessionFileCandidates(paneId, cwd, preferred)) {
+      // herdr reports .jsonl paths before the file exists; vanished paths are skipped, never surfaced.
+      const stamp = stampOf(file);
+      if (stamp) yield { file, stamp };
+    }
+  }
+
+  async function resolveSessionFile(
+    paneId: string,
+    cwd: string,
+    preferred?: string | null,
+    opts?: ResolveSessionFileOpts,
+  ): Promise<string | null> {
+    for await (const { file, stamp } of readableCandidates(paneId, cwd, preferred)) {
+      if (opts?.minMtimeMs != null && stamp.mtimeMs < opts.minMtimeMs) continue;
+      return file;
+    }
+    return null;
+  }
+
+  async function reattributeStaleSessionFile(
+    paneId: string,
+    cwd: string,
+    sinceTs: number,
+    preferred: string | null,
+  ): Promise<string | null> {
+    // Tolerate fs timestamp granularity against the pre-injection injectTs capture.
+    const minMtimeMs = sinceTs - 2_000;
+    const own = bareSessionId(h.getSessionId());
+    const { reported, taken } = await reportedAndTaken(paneId);
+    // Own/taken exclusions apply to `preferred` too: a registry value pointing at the master's own
+    // transcript is always "fresh", so the gate cannot veto it and herdr's report takes over.
+    const preferredId = preferred ? bareSessionId(preferred) : null;
+    const preferredHeld = preferredId != null && ((own != null && preferredId === own) || taken.has(preferredId));
+    const preferredStamp = preferred ? stampOf(preferred) : null;
+    if (preferred && !preferredHeld && preferredStamp && preferredStamp.mtimeMs >= minMtimeMs) return preferred;
+    const file = resolveSessionFileValue(cwd, h.sessionsDir(), reported);
+    if (!file) return null;
+    const id = bareSessionId(file);
+    if (own && id === own) return null;
+    if (taken.has(id)) return null;
+    const stamp = stampOf(file);
+    return stamp && stamp.mtimeMs >= minMtimeMs ? file : null;
+  }
+
+  /** The blocked question text: pi's OSC 7501 reporter carries it as the status message. */
+  async function readAskFlag(paneId: string): Promise<string | null> {
+    return readBlockedQuestion(h.client, paneId);
+  }
+
+  async function probeAlive(paneId: string, cwd: string): Promise<AliveProbe> {
+    const probe: AliveProbe = { paneExists: false, agentStatus: null, lastActivityMs: null };
+    try {
+      const terminal = await h.client.getTerminal(paneId);
+      probe.paneExists = terminal != null && terminal.state !== 'finished';
+      probe.agentStatus = terminal?.status ?? null;
+    } catch {
+      /* core unavailable: liveness stays unknown (false), never a guessed death */
+    }
+    for await (const { stamp } of readableCandidates(paneId, cwd)) {
+      if (probe.lastActivityMs == null || stamp.mtimeMs > probe.lastActivityMs) probe.lastActivityMs = stamp.mtimeMs;
+    }
+    return probe;
+  }
+
+  async function subSessionState(
+    paneId: string,
+    cwd: string,
+    sinceTs: number,
+    preferred?: string | null,
+  ): Promise<SubSessionState> {
+    for await (const { file, stamp } of readableCandidates(paneId, cwd, preferred)) {
+      const cached = stateCache.get(file, stamp, sinceTs);
+      if (cached) return cached;
+      const entries = readSessionFile(file);
+      if (!entries?.length) continue;
+      const state = deriveSubSessionState(entries, sinceTs);
+      stateCache.set(file, stamp, sinceTs, state);
+      return state;
+    }
+    return { text: null, pendingTool: false, activity: false, turnEnded: false };
+  }
+
+  return {
+    resolveSessionFile,
+    readAskFlag,
+    probeAlive,
+    subSessionState,
+    reattributeStaleSessionFile,
+  };
+}
+
+/* ── output action ──────────────────────────────────────────────── */
+
+interface SubagentOutputRead {
+  text: string;
+  /** False when part of what was asked for may be missing (a full-screen app read while working). */
+  complete: boolean;
+}
+
+/** Blocked question text: pi's OSC 7501 reporter carries it as the status message. */
+async function readBlockedQuestion(client: CoreClientLike, paneId: string): Promise<string | null> {
+  try {
+    const terminal = await client.getTerminal(paneId);
+    if (!terminal || terminal.status !== 'blocked') return null;
+    const msg = terminal.statusMsg?.trim();
+    return msg ? msg : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function executeSubagentOutput(
+  params: Record<string, unknown> | undefined,
+  toolCtx: unknown,
+  deps: {
+    client: CoreClientLike;
+    resolveEntry: (rawId: string, cwd: string) => { entry: SubEntry } | { error: string };
+    outputCursors: Map<string, SubagentOutputCursor>;
+    getCwd: (toolCtx: unknown) => string;
+    /** Monotonic per-pane read counter shown in the header. */
+    nextRevision: (paneId: string) => number;
+    /** Last finalized assistant text from the worker's transcript: the pane read alone cannot
+     * recover it when the fullscreen TUI shows only the status overlay. Optional for tests. */
+    readFinalReport?: (paneId: string, entryCwd: string) => Promise<string | null>;
+    /** Persists `entry.reportDelivered` so the settlement notice can skip a report already shown. */
+    persistSubs?: () => void;
+  },
+) {
+  const rawId = idParam(params, 'agentId', 'taskId');
+  if (!rawId) return toolError('Error: missing agentId for output. Pass it as a top-level argument {"action":"output","agentId":"<pane id>"}, not nested under parameters.');
+
+  const cwd = deps.getCwd(toolCtx);
+  const resolved = deps.resolveEntry(rawId, cwd);
+  if ('error' in resolved) return toolError(resolved.error);
+
+  const entry = resolved.entry;
+  let terminalStatus: CoreStatus | null = null;
+  try {
+    terminalStatus = (await deps.client.getTerminal(entry.paneId))?.status ?? null;
+  } catch {
+  }
+
+  const status = resolveSubagentStatus({ localStatus: entry.status, status: terminalStatus });
+  const askQuestion = terminalStatus === 'blocked' ? await readBlockedQuestion(deps.client, entry.paneId) : null;
+
+  let rawRead: SubagentOutputRead;
+  try {
+    const read = await deps.client.read(entry.paneId);
+    rawRead = { text: read.text, complete: read.complete };
+  } catch (err) {
+    return toolError(`Error: failed to read output for subagent ${entry.paneId}: ${(err as Error).message}`);
+  }
+
+  const prevCursor = deps.outputCursors.get(entry.paneId);
+  const maxChars = typeof params?.max_chars === 'number'
+    ? params.max_chars
+    : typeof params?.maxChars === 'number' ? params.maxChars : undefined;
+  const deltaResult = computeSubagentOutputDelta(prevCursor, cleanPaneChrome(rawRead.text), { maxChars });
+  // A resumed process has no cursor; the durable delivery record keeps the report from repeating.
+  deltaResult.nextCursor.reportTail ??= prevCursor?.reportTail ?? entry.reportDelivered?.fingerprint;
+
+  // Transcript fallback: the terminal delta can be empty (or footer-only) while the finished
+  // report exists only in the session file. Surface it once per distinct report.
+  let reportSection: string | null = null;
+  if ((status === 'settled' || status === 'idle') && deps.readFinalReport) {
+    try {
+      const report = await deps.readFinalReport(entry.paneId, entry.cwd);
+      const fingerprint = report ? reportFingerprint(report) : '';
+      if (report && fingerprint && fingerprint !== deltaResult.nextCursor.reportTail) {
+        const bounded = boundText(report, Math.max(1, Math.min(maxChars ?? OUTPUT_DEFAULT_MAX_CHARS, OUTPUT_HARD_CAP_CHARS)));
+        reportSection = `[Subagent Report | latest finalized message from session transcript${bounded.truncated ? ' | truncated' : ''}]\n${bounded.text}`;
+        deltaResult.nextCursor.reportTail = fingerprint;
+        deltaResult.delta = cutPaneReportCopy(deltaResult.delta, report) ?? deltaResult.delta;
+        if (!bounded.truncated) {
+          entry.reportDelivered = { fingerprint, at: Date.now() };
+          deps.persistSubs?.();
+        }
+      }
+    } catch {
+    }
+  }
+  deps.outputCursors.set(entry.paneId, deltaResult.nextCursor);
+  const revision = deps.nextRevision(entry.paneId);
+
+  const formatted = formatSubagentOutput({
+    paneId: entry.paneId,
+    status,
+    revision,
+    bufferTruncated: !rawRead.complete,
+    deltaResult,
+    askQuestion,
+  });
+
+  return {
+    content: [{ type: 'text' as const, text: reportSection ? `${formatted}\n${reportSection}` : formatted }],
+    details: {
+      paneId: entry.paneId,
+      status,
+      revision,
+      truncated: !rawRead.complete || deltaResult.truncated,
+      restart: deltaResult.restart,
+      deltaLength: deltaResult.delta.length,
+      reportDelivered: Boolean(reportSection),
+    },
+  };
+}

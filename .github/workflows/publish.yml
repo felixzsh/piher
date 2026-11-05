@@ -1,0 +1,45 @@
+# Two-package release: a v* tag triggers this, publishing through npm Trusted Publishing (OIDC, no token).
+# Prerequisite: this workflow is registered under Settings → Trusted Publishing for both npm packages,
+# piher and piher-setup.
+name: publish
+
+on:
+  push:
+    tags:
+      - 'v*'   # v-prefixed
+      - '[0-9]*' # bare semver (e.g. 0.2.0)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required by npm Trusted Publishing (OIDC)
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+      # npm Trusted Publishing (OIDC) needs npm >= 11.5; Node 22 ships npm 10.x
+      - run: npm install -g npm@^11
+
+      - name: Check tag matches package versions
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          EXT=$(node -p "require('./packages/ext/package.json').version")
+          ROOT=$(node -p "require('./package.json').version")
+          [ "$TAG" = "$EXT" ] && [ "$TAG" = "$ROOT" ] || {
+            echo "✗ tag v$TAG does not match the package versions (piher=$EXT, piher-setup=$ROOT)"; exit 1; }
+
+      - run: npm install --ignore-scripts
+
+      - name: Test
+        run: npm test
+
+      - name: Publish piher
+        run: npm publish
+        working-directory: packages/ext
+
+      - name: Publish piher-setup
+        run: npm publish

@@ -1,0 +1,26 @@
+node_modules/
+# macOS Finder artifacts (a global ignore usually covers this; tracked so CI and fresh clones stay clean)
+.DS_Store
+# The CI workflows must be tracked (a global gitignore often ignores .github/, so this is an explicit exception)
+!.github/
+!.github/**
+docs/research/
+reports/
+.stryker-tmp/
+# /piher-config doc output (machine-truth report; regenerate on demand)
+.piher/config-report.md
+# Delegation ledger: one append-only JSONL per repository, never committed (never the parent
+# .piher/, whose roles/ are meant to be committed)
+.piher/history/
+
+# Development-only docs (reviews, RFCs, per-feature design notes) are local artifacts:
+# the repository tracks user-facing documentation and code only. Remove a line here if a
+# document becomes user-facing.
+code review.md
+docs/rfc-*.md
+docs/piher-config-command.md
+docs/adr/
+docs/history/
+docs/efficiency-review-*.md
+docs/herdr-0.9.1-optimization-design.md
+spike/

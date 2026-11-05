@@ -1,0 +1,23 @@
+{
+  "role": "worker-default",
+  "version": "1.0.0",
+  "description": "Default worker role (D83 inheritance): mirrors master.tools minus subagent and terminal (no nesting, the worker owns no other worker); the excluded families are also denied explicitly, so the ban survives the D82 unknownTools=allow stance.",
+  "manifest": {
+    "unknownTools": "allow",
+    "tools": [
+      "read",
+      "grep",
+      "glob",
+      "bash",
+      "pwsh",
+      "edit",
+      "write",
+      "web_search"
+    ],
+    "rules": {
+      "subagent": "deny",
+      "terminal": "deny",
+      "*": "allow"
+    }
+  }
+}

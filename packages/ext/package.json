@@ -1,0 +1,60 @@
+{
+  "name": "piher",
+  "version": "0.5.2",
+  "description": "piher: registers the subagent and terminal tools in pi and runs them as herdr-core terminals shown by the Herdr app",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "herdr-core",
+    "herdr-app",
+    "coding-agent",
+    "subagents"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/July24/piher.git",
+    "directory": "packages/ext"
+  },
+  "homepage": "https://github.com/July24/piher#readme",
+  "bugs": {
+    "url": "https://github.com/July24/piher/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "src",
+    "skills",
+    "schemas",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "skills": [
+      "./skills/piher-tools"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test \"test/*.test.ts\""
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/cordis-plugin-group": "^1.0.1",
+    "@deepseek-ai/cordis-plugin-loader": "^1.0.2"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.4.0",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "typebox": "~1.3.7",
+    "typescript": "~5.9.3"
+  }
+}
