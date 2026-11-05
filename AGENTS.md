@@ -48,3 +48,34 @@ interrupted pi session, send ESC to the pane (`pane.send_keys {keys:["escape"]}`
 Anything that compiles, builds, installs dependencies or runs a test suite belongs in a background
 terminal (`hc run --bg …`, then `hc wait`), not in a blocking shell call. `bash` is for short,
 interactive or order-dependent commands.
+
+## Tests: two tiers, and the rule for when to run which
+
+The suite has two tiers. Pick by the size of the change, never by habit — running the full suite
+after a one-line edit wastes the most expensive resource in the loop.
+
+| Command | What runs | Time |
+|---|---|---|
+| `node --test --test-force-exit test/<file>.test.ts` | one suite you know you touched | ~1 s |
+| `npm run test:fast` | `packages/ext/test/*.test.ts` — pure planners, roles, config catalog, renderers, transcript folding (296 tests) | ~4 s |
+| `npm run test:integration` | `packages/ext/test/integration/*.test.ts` — boots the extension, real git worktrees, installer subprocesses, core-client sockets (153 tests) | ~9 s |
+| `npm test` | `tsc --noEmit` + both tiers (449 tests) | ~20 s |
+
+Rules:
+
+- **A small edit runs the file you touched, or `test:fast`.** Never the full suite: a string, a
+  comment or one function does not justify 20 s.
+- **`npm test` is for a change that crosses modules, and before every commit and push.** That is
+  where `typecheck` lives too.
+- `test/integration/` is the tier for anything that spawns a process, starts a socket, touches a real
+  git worktree or boots the composition root. A new suite with those properties belongs there, and
+  the fast tier stays fast because of it.
+- **Never remove `--test-force-exit` from the scripts.** Without it, the spawn harness in
+  `worktree.test.ts` leaves a readiness wait pending and the process idles for the full 90 s
+  `PIHER_READY_TIMEOUT_MS` after the last test — the suite looked 100 s long for that reason alone.
+- `--test-timeout` (30 s fast, 120 s integration) is what turns a hang into a failure instead of a
+  blocked terminal.
+- Do not add real sleeps to a test to satisfy a timer. Set the budget the code reads
+  (`PIHER_SETTLE_WINDOW_MS`, `PIHER_READY_TIMEOUT_MS`, …) to something small in the harness instead.
+- Anything long goes to a background terminal (`hc run --bg …`, then `hc wait`), not to a blocking
+  shell call.

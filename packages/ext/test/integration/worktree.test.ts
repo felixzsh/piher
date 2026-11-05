@@ -8,10 +8,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import type { Server, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { ledgerFile } from '../src/history-store.ts';
-import { pipeNameFor, startPipeServer } from '../src/pipe-channel.ts';
-import type { SubagentPortBox } from '../src/subagent-core.ts';
-import { HerdrAppSpaceIo, NodeCheckoutIo, parsePorcelain } from '../src/worktree-io.ts';
+import { ledgerFile } from '../../src/history-store.ts';
+import { pipeNameFor, startPipeServer } from '../../src/pipe-channel.ts';
+import type { SubagentPortBox } from '../../src/subagent-core.ts';
+import { HerdrAppSpaceIo, NodeCheckoutIo, parsePorcelain } from '../../src/worktree-io.ts';
 import {
   checkoutAckLine,
   dirtyCheckoutText,
@@ -26,10 +26,10 @@ import {
   type ReconcileRow,
   type SpaceIo,
   type WorktreeIo,
-} from '../src/worktree.ts';
+} from '../../src/worktree.ts';
 import {
   TempHome, fakeWatch, fire, mountSubagent, runSubagent, runSubagentRejects, terminalInfo, type FakePi,
-} from './test-utils.ts';
+} from '../test-utils.ts';
 
 /* ── planners ───────────────────────────────────────────────────── */
 

@@ -8,15 +8,15 @@ import { fileURLToPath } from 'node:url';
 import {
   CONFIG_KNOBS, CONFIG_PLANES, checkEnvKnobs, formatValue, redactValue, renderCheck,
   renderIndex, renderPlane, renderReport, resolveEnvKnobs, summarizePlane,
-} from '../src/config-catalog-core.ts';
-import { OPTION_SPECS } from '../src/options.ts';
+} from '../../src/config-catalog-core.ts';
+import { OPTION_SPECS } from '../../src/options.ts';
 import {
   CONFIG_GUIDANCE_PROMPT, collectConfigSnapshot, guideReportMarkdown,
   renderGuide, type ConfigGuideDeps, type ConfigGuideSnapshot,
-} from '../src/config-command.ts';
-import { withCleanup, type CleanupContext } from './test-utils.ts';
+} from '../../src/config-command.ts';
+import { withCleanup, type CleanupContext } from '../test-utils.ts';
 
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..');
 const knobsOfPlane = (plane: string): string[] => CONFIG_KNOBS.filter((k) => k.plane === plane).map((k) => k.key);
 const planeReport = (snapshot: ConfigGuideSnapshot, plane: string) => snapshot.reports.find((r) => r.plane === plane)!;
 

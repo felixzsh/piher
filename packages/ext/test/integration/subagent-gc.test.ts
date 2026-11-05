@@ -4,10 +4,10 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fakeWatch, fire, mountSubagent, subEntry, subsSnapshot, terminalInfo } from './test-utils.ts';
-import { SUBS_REGISTRY_TAIL, type SubEntry } from '../src/subagent-core.ts';
-import type { TerminalInfo } from '../src/core-client.ts';
-import { shouldClosePane, shouldCloseTaskTab, type GcEntryLike } from '../src/gc-core.ts';
+import { fakeWatch, fire, mountSubagent, subEntry, subsSnapshot, terminalInfo } from '../test-utils.ts';
+import { SUBS_REGISTRY_TAIL, type SubEntry } from '../../src/subagent-core.ts';
+import type { TerminalInfo } from '../../src/core-client.ts';
+import { shouldClosePane, shouldCloseTaskTab, type GcEntryLike } from '../../src/gc-core.ts';
 
 const NOW = 1_000_000;
 const TTL = 600_000;

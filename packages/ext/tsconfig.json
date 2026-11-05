@@ -5,6 +5,8 @@
     "moduleResolution": "NodeNext",
     "allowImportingTsExtensions": true,
     "noEmit": true,
+    "incremental": true,
+    "tsBuildInfoFile": "./.tsbuildinfo",
     "skipLibCheck": true,
     "esModuleInterop": true,
     "strict": true,

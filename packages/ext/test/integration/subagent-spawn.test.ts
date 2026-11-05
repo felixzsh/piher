@@ -3,18 +3,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import type { Server, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import type { CoreClientLike } from '../src/core-client.ts';
-import { pipeNameFor, startPipeServer, type PipeRequest } from '../src/pipe-channel.ts';
-import { appendLedger, ledgerFile } from '../src/history-store.ts';
-import type { SubagentPortBox } from '../src/subagent-core.ts';
-import { NodeGitAdapter, createSpawner, type GitExecFile } from '../src/subagent-spawn.ts';
+import type { CoreClientLike } from '../../src/core-client.ts';
+import { pipeNameFor, startPipeServer, type PipeRequest } from '../../src/pipe-channel.ts';
+import { appendLedger, ledgerFile } from '../../src/history-store.ts';
+import type { SubagentPortBox } from '../../src/subagent-core.ts';
+import { NodeGitAdapter, createSpawner, type GitExecFile } from '../../src/subagent-spawn.ts';
 import {
   TempHome, fakeCore, fakeWatch, jsonl, mountSubagent, runSubagent, runSubagentRejects, subsSnapshot, terminalInfo, transcriptMessage, type FakePi,
-} from './test-utils.ts';
+} from '../test-utils.ts';
 
 /* ── readiness failures ─────────────────────────────────────────── */
 
@@ -316,6 +316,9 @@ test('resume: a task spawned from a linked worktree lives in the repository ledg
     const paneId = spawned.details?.paneId as string;
 
     const repoLedger = ledgerFile(env.cwd)!;
+    // The spawn must not wait on the ledger write (S41 keeps it off the spawn's critical path), so a
+    // test that reads the file waits for the append instead of assuming it already landed.
+    await waitFor(() => existsSync(repoLedger));
     assert.deepEqual(
       JSON.parse(readFileSync(repoLedger, 'utf8').trim().split('\n').at(-1)!).cwd,
       wt,

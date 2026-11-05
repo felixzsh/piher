@@ -37,7 +37,7 @@ or at a file that no longer exists, fails the suite.
 | S1 | The package is the delegation surface: role manifests and tool wiring live here, and a workflow policy belongs to the prompt that asks for it | `packages/ext/src/index.ts:1` |
 | S2 | Write locks are a soft veto by default and a hard one under `PIHER_WRITE_LOCK=1`; the warning names every holder | `packages/ext/src/lock-core.ts:1` |
 | S9 | A role may declare `lifecycle`; only `one-shot` changes behaviour (the worker is reclaimed at its settlement), and an unresolvable role never reclaims a pane by surprise | `packages/ext/src/role-manifest.ts:1` |
-| S10 | The registered tool set is exactly `{subagent, terminal}`, asserted by a test, because pi keeps one provider per tool name | `packages/ext/test/tool-scope.test.ts:1` |
+| S10 | The registered tool set is exactly `{subagent, terminal}`, asserted by a test, because pi keeps one provider per tool name | `packages/ext/test/integration/tool-scope.test.ts:1` |
 | S20 | The role menu is derived from the manifests on every turn, so a role added to a directory appears without editing any shipped text | `packages/ext/src/role-catalog.ts:1` |
 | S21 | The catalog rides the prompt: an action would spend a round trip on text that fits in the request for free | `packages/ext/src/role-catalog.ts:1` |
 | S22 | A role switch is the one recompute point for the visible tool set; a widen from a human asks first | `packages/ext/src/role-state.ts:1` |

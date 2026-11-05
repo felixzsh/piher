@@ -3,7 +3,7 @@
   "packageManager": "npm",
   "testRunner": "command",
   "commandRunner": {
-    "command": "node --test packages/ext/test/*.test.ts"
+    "command": "node --test --test-force-exit --test-timeout=60000 \"packages/ext/test/**/*.test.ts\""
   },
   "mutate": [
     "packages/ext/src/tool-gate.ts",

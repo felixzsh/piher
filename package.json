@@ -33,7 +33,9 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit -p packages/ext/tsconfig.json",
-    "test": "npm run typecheck && node --test \"packages/*/test/*.test.ts\"",
+    "test:fast": "node --test --test-force-exit --test-timeout=30000 \"packages/*/test/*.test.ts\"",
+    "test:integration": "node --test --test-force-exit --test-timeout=120000 \"packages/*/test/integration/*.test.ts\"",
+    "test": "npm run typecheck && node --test --test-force-exit --test-timeout=120000 \"packages/*/test/**/*.test.ts\"",
     "test:mutation": "stryker run",
     "prepare": "node ./install.mjs --prepare"
   },

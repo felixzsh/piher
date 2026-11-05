@@ -9,8 +9,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import extension from '../src/index.ts';
-import { TempHome, fakePi, fire, withCleanup, type CleanupContext, type FakePi } from './test-utils.ts';
+import extension from '../../src/index.ts';
+import { TempHome, fakePi, fire, withCleanup, type CleanupContext, type FakePi } from '../test-utils.ts';
 
 /** The whole tool surface piher registers: the delegation mechanics and nothing else. */
 const PIHER_TOOLS = ['subagent', 'terminal'];

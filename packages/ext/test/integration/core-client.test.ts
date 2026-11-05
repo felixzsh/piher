@@ -6,7 +6,7 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { CoreClient, CoreError, CoreWatch, childEnvironment, coreUnavailableHint, detectCoreEnv } from '../src/core-client.ts';
+import { CoreClient, CoreError, CoreWatch, childEnvironment, coreUnavailableHint, detectCoreEnv } from '../../src/core-client.ts';
 
 
 /** Windows named pipes live in the kernel namespace: listening on a filesystem path fails with
@@ -136,7 +136,7 @@ test('coreUnavailableHint: transport failures get a hint, domain errors do not',
 /* ── contract: requests stay inside the hc 0.1.16 OpenRPC snapshot ── */
 
 interface OpenRpc { methods: Array<{ name: string; params: Array<{ name: string; required?: boolean }> }> }
-const schema = JSON.parse(readFileSync(new URL('./fixtures/hc-contract.json', import.meta.url), 'utf8')) as OpenRpc;
+const schema = JSON.parse(readFileSync(new URL('../fixtures/hc-contract.json', import.meta.url), 'utf8')) as OpenRpc;
 
 test('contract: every request piher sends names a real method, known params, and all required ones', async () => {
   await withCore((c) => {

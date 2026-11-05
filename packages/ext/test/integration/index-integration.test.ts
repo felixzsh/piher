@@ -6,12 +6,12 @@ import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import extension from '../src/index.ts';
-import { pipeNameFor, pipeRequestTo, startPipeServer, type PipeRequest } from '../src/pipe-channel.ts';
-import { sessionDirName } from '../src/storage-layout.ts';
-import { WIDGET_MAX_LINES } from '../src/tree-view.ts';
-import { fakePi, fire, jsonl, subEntry, transcriptMessage, withCleanup, type CleanupContext, type FakePi } from './test-utils.ts';
-import { readWorkerMarker, writeWorkerMarker } from '../src/worker-marker.ts';
+import extension from '../../src/index.ts';
+import { pipeNameFor, pipeRequestTo, startPipeServer, type PipeRequest } from '../../src/pipe-channel.ts';
+import { sessionDirName } from '../../src/storage-layout.ts';
+import { WIDGET_MAX_LINES } from '../../src/tree-view.ts';
+import { fakePi, fire, jsonl, subEntry, transcriptMessage, withCleanup, type CleanupContext, type FakePi } from '../test-utils.ts';
+import { readWorkerMarker, writeWorkerMarker } from '../../src/worker-marker.ts';
 
 type IndexMode = 'worker' | 'core-worker' | 'bare' | 'master';
 

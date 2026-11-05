@@ -7,8 +7,8 @@ import * as net from 'node:net';
 import * as fs from 'node:fs';
 import {
   pipeNameCandidates, pipeNameFor, pipePathFor, pipeRequest, pipeRequestTo, startPipeServer,
-} from '../src/pipe-channel.ts';
-import { jsonl } from './test-utils.ts';
+} from '../../src/pipe-channel.ts';
+import { jsonl } from '../test-utils.ts';
 
 type Handler = Parameters<typeof startPipeServer>[1];
 type FrameCase = { name: string; line: string; handler: Handler; message: RegExp };

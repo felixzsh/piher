@@ -7,8 +7,8 @@ import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFil
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
-import { cordisProvide } from '../src/cordis-services.ts';
-import terminalPlugin from '../src/plugins/terminal.ts';
+import { cordisProvide } from '../../src/cordis-services.ts';
+import terminalPlugin from '../../src/plugins/terminal.ts';
 import {
   MAX_TERMINALS, POSIX_PROMPT, POWERSHELL_PROMPT, SHELL_INIT_COMMAND, SIGNAL_KEYS, TERMINALS_CUSTOM_TYPE, TERM_REMINDERS_MAX,
   TERM_REMINDER_CUSTOM_TYPE, closeTerminal, compilePattern, computeIncrement, detectContinuationPrompt, detectFullscreenTUI,
@@ -16,12 +16,12 @@ import {
   makeTerminalsRegistry, nextTerminalId, planTerminalReminder, planShellInit, promptStrategyFor, registerTerminal,
   classifyWaitMatch, redirectedSentinel, regexLiteralPrefix, sentinelEchoHazard, stripAnsi, summarizeSessions, terminalIdleMs, validateSendText, validateSignal,
   type PromptStrategy, type TerminalEntry,
-} from '../src/terminal-core.ts';
-import { runExitCode } from '../src/terminal-run.ts';
-import { PiSurface } from '../src/pi-surface.ts';
-import { DisposeLedger } from '../src/ledger.ts';
-import { CoreError, type CoreClientLike } from '../src/core-client.ts';
-import { fakeCore, fakePi, fire, terminalInfo, withCleanup, type FakePi } from './test-utils.ts';
+} from '../../src/terminal-core.ts';
+import { runExitCode } from '../../src/terminal-run.ts';
+import { PiSurface } from '../../src/pi-surface.ts';
+import { DisposeLedger } from '../../src/ledger.ts';
+import { CoreError, type CoreClientLike } from '../../src/core-client.ts';
+import { fakeCore, fakePi, fire, terminalInfo, withCleanup, type FakePi } from '../test-utils.ts';
 
 const base = { paneId: 'pane-a', tabId: 'tab-1', cwd: 'F:/work', label: 'dev server', createdAt: 1000, lastActivityAt: 1000 };
 
@@ -700,7 +700,7 @@ test('plugins/terminal: session lifecycle — shutdown closes every open termina
   assert.equal(registry.terminals[0].status, 'closed', 'the ledger records closed'); assert.ok(registry.terminals[0].closedAt != null);
 
   // hmr/reload reports the plugin file path — the normalized ledger matches the module key
-  const key = new URL('../src/plugins/terminal.ts', import.meta.url).href;
+  const key = new URL('../../src/plugins/terminal.ts', import.meta.url).href;
   assert.equal(ledger.disposeKey(key), 1, 'the ledger matched the terminal module registration');
   const tombstoned = await run(pi, { action: 'list' });
   assert.match(tombstoned.content[0].text, /disposed/, 'the tool is inert after the tombstone');

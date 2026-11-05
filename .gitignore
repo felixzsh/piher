@@ -6,6 +6,9 @@ node_modules/
 !.github/**
 docs/research/
 reports/
+# tsc --incremental state (a local build artifact, never committed)
+.tsbuildinfo
+packages/ext/.tsbuildinfo
 .stryker-tmp/
 # /piher-config doc output (machine-truth report; regenerate on demand)
 .piher/config-report.md
