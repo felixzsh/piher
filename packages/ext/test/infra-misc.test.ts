@@ -182,10 +182,10 @@ test('createRuntimePolicy: an invalid/out-of-range value warns once and falls ba
   assert.equal(createRuntimePolicy().readinessTimeoutMs, 90_000);
 }));
 
-test('registry: legacy spellings still reach the real readers', withCleanup((cleanup) => {
+test('registry: every registered name reaches the reader that owns it', withCleanup((cleanup) => {
   applyEnv(cleanup, { PIHER_TERM_IDLE_MS: '1234', PIHER_TERM_GRACE_MS: '4321' });
-  assert.equal(terminalIdleMs(), 1234, 'legacy name works'); assert.equal(terminalReminderGraceMs(), 4321, 'canonical name works');
-  assert.equal(promptStrategyFor({ PIHER_TERMINAL_PROMPT: 'powershell' }), POWERSHELL_PROMPT, 'legacy prompt name');
+  assert.equal(terminalIdleMs(), 1234); assert.equal(terminalReminderGraceMs(), 4321);
+  assert.equal(promptStrategyFor({ PIHER_TERMINAL_PROMPT: 'powershell' }), POWERSHELL_PROMPT);
   assert.equal(promptStrategyFor({ PIHER_TERMINAL_PROMPT: 'bash' }), POSIX_PROMPT);
 }));
 
@@ -212,7 +212,7 @@ test('swallow: the ring buffer is bounded (no unbounded growth per session)', ()
   assert.equal(entries.length, SWALLOW_BUFFER_MAX); assert.match(entries[entries.length - 1]!.message, /e74$/, 'the newest entry is kept');
 });
 
-test('swallow: PIHER_TRACE / legacy PIHER_TRACE writes to stderr', () => {
+test('swallow: PIHER_TRACE writes the entry to stderr, silence otherwise', () => {
   resetSwallowedErrors();
   const seen: string[] = [];
   const orig = console.error;

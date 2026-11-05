@@ -461,7 +461,7 @@ test('redirectedSentinel: a `$?` sentinel appended to a log is found with its fi
   assert.equal(redirectedSentinel('echo hello > out.txt'), null, 'no `$?` sentinel, no hint');
 });
 
-test('plugins/terminal：wait file: polls the log for a later match, reports an old one, and times out on a missing file', async (t) => {
+test('plugins/terminal: wait file: polls the log for a later match, reports an old one, and times out on a missing file', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'piher-file-wait-'));
   const log = join(dir, 'run.log');
   writeFileSync(log, 'starting\n');
@@ -821,7 +821,7 @@ function runNonceOf(text: string): string {
   return match[1]!;
 }
 
-test('plugins/terminal：a finished command sends one notice with its exit code and an existing log', (t) => withCleanup(async (cleanup) => {
+test('plugins/terminal: a finished command sends one notice with its exit code and an existing log', (t) => withCleanup(async (cleanup) => {
   cleanup.env().set('PIHER_TERMINAL_PROMPT', 'bash');
   const { pi, calls, pane } = await mountRunTerminal(t, { foreground: SHELL_FOREGROUND });
   await run(pi, { action: 'send', terminal_id: 'term-1', text: 'npm test' });
@@ -852,7 +852,7 @@ test('plugins/terminal：a finished command sends one notice with its exit code 
   await run(pi, { action: 'close', terminal_id: 'term-1' });
 })());
 
-test('plugins/terminal：a REPL owning the pane, and a multi-line block, are sent untouched and notify nothing', (t) => withCleanup(async (cleanup) => {
+test('plugins/terminal: a REPL owning the pane, and a multi-line block, are sent untouched and notify nothing', (t) => withCleanup(async (cleanup) => {
   cleanup.env().set('PIHER_TERMINAL_PROMPT', 'bash');
   const repl = await mountRunTerminal(t, { foreground: { pid: 9, name: 'python3', argv: ['python3'], cwd: '/test/cwd' } });
   await run(repl.pi, { action: 'send', terminal_id: 'term-1', text: 'print(1)' });
@@ -866,7 +866,7 @@ test('plugins/terminal：a REPL owning the pane, and a multi-line block, are sen
   assert.deepEqual(shell.pi.sent, [], 'neither case notifies');
 })());
 
-test('plugins/terminal：interrupting a run cancels its notice (no exit code was observed)', (t) => withCleanup(async (cleanup) => {
+test('plugins/terminal: interrupting a run cancels its notice (no exit code was observed)', (t) => withCleanup(async (cleanup) => {
   cleanup.env().set('PIHER_TERMINAL_PROMPT', 'bash');
   const { pi, calls, pane } = await mountRunTerminal(t, { foreground: SHELL_FOREGROUND });
   await run(pi, { action: 'send', terminal_id: 'term-1', text: 'sleep 60' });
@@ -879,7 +879,7 @@ test('plugins/terminal：interrupting a run cancels its notice (no exit code was
   assert.deepEqual(pi.sent, [], 'an interrupted run reports nothing');
 })());
 
-test('plugins/terminal：a command that ends the shell still reports one notice with its outcome', (t) => withCleanup(async (cleanup) => {
+test('plugins/terminal: a command that ends the shell still reports one notice with its outcome', (t) => withCleanup(async (cleanup) => {
   cleanup.env().set('PIHER_TERMINAL_PROMPT', 'bash');
   const pane = { text: '$ ' };
   let finished: { exitCode: number | null } | null = null;
@@ -913,7 +913,7 @@ test('plugins/terminal：a command that ends the shell still reports one notice 
   rmSync(dirname(logPath), { recursive: true, force: true });
 })());
 
-test('plugins/terminal：a shell this host cannot place a reporter in is never wrapped', (t) => withCleanup(async (cleanup) => {
+test('plugins/terminal: a shell this host cannot place a reporter in is never wrapped', (t) => withCleanup(async (cleanup) => {
   // fish/nushell do not parse `cmd; printf …`: the text must reach the shell exactly as typed.
   cleanup.env().set('PIHER_TERMINAL_PROMPT', 'fish');
   const { pi, calls } = await mountRunTerminal(t, { foreground: SHELL_FOREGROUND });
@@ -923,7 +923,7 @@ test('plugins/terminal：a shell this host cannot place a reporter in is never w
   assert.deepEqual(pi.sent, [], 'no notice from a shell that cannot report');
 })());
 
-test('plugins/terminal：heredoc bodies and `read` answers go out as data, never with a reporter', (t) => withCleanup(async (cleanup) => {
+test('plugins/terminal: heredoc bodies and `read` answers go out as data, never with a reporter', (t) => withCleanup(async (cleanup) => {
   cleanup.env().set('PIHER_TERMINAL_PROMPT', 'bash');
   const { pi, calls, pane } = await mountRunTerminal(t, { foreground: SHELL_FOREGROUND });
 
@@ -950,7 +950,7 @@ test('plugins/terminal：heredoc bodies and `read` answers go out as data, never
   await until(() => pi.sent.length > 0);
 })());
 
-test('plugins/terminal：a line typed while the shell is busy is data (a `read` answer), not a run', (t) => withCleanup(async (cleanup) => {
+test('plugins/terminal: a line typed while the shell is busy is data (a `read` answer), not a run', (t) => withCleanup(async (cleanup) => {
   cleanup.env().set('PIHER_TERMINAL_PROMPT', 'bash');
   const { pi, calls, pane } = await mountRunTerminal(t, { foreground: SHELL_FOREGROUND });
 
