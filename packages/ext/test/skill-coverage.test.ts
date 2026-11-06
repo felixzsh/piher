@@ -196,6 +196,14 @@ test('SUBAGENT_DESCRIPTION names every action and stays inside its per-request b
     `SUBAGENT_DESCRIPTION is ${t.description.length} chars, over its ${budget}`);
 });
 
+test('SUBAGENT_MANUAL stays inside the inline budget it is read through', () => {
+  // An output larger than 4096 B is indexed and replaced by a pointer by the context-mode extension:
+  // a help text that big arrives as "ctx_search(...) searches the whole output" and the caller never
+  // sees the manual or the role catalog. The catalog costs ~650 B, so the manual keeps 3000.
+  const manual = truth().manual as string;
+  assert.ok(Buffer.byteLength(manual) <= 3000, `SUBAGENT_MANUAL is ${Buffer.byteLength(manual)} B, over 3000`);
+});
+
 test('SUBAGENT_MANUAL names every action and every parameter', () => {
   const t = truth();
   const missing = [

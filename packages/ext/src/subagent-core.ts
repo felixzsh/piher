@@ -539,7 +539,10 @@ export function formatRoleCatalog(
       profile.lifecycle === 'one-shot' ? 'one-shot' : 'persistent',
       profile.tools?.length ? `tools: ${profile.tools.join(', ')}` : 'tools: none declared',
     ].join(' · ');
-    const what = profile.description?.trim() ? profile.description.trim() : 'no description';
+    const described = profile.description?.trim() ?? '';
+    // One line each: a long description must not push `help` over the inline budget (4096 B on a
+    // context-mode host, which replaces larger outputs with a pointer — silently losing the catalog).
+    const what = described === '' ? 'no description' : described.length > 120 ? `${described.slice(0, 117)}…` : described;
     return `  - ${profile.name} — ${what} (${facts})`;
   });
   return [
