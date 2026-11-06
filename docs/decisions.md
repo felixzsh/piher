@@ -35,7 +35,8 @@ or at a file that no longer exists, fails the suite.
 | D98 | Execution is a program, not a typed shell line: `bg_job` runs an argv and core reports the child's exit, so no sentinel is parsed from a screen | `packages/ext/src/bg-job-core.ts:1` |
 | D102 | A worker is spent when the master was told: a consumed one-shot or a closed one leaves `list`, and `resume` exists only for work left unfinished | `packages/ext/src/plugins/subagent.ts:1` |
 | D101 | A `bg_job` job is adopted by label after a reload: core knows what is alive, so an in-memory registry never decides whether the launcher gets told | `packages/ext/src/bg-job-core.ts:1` |
-| D100 | piher never calls `herdr-app`: its `Open worktree` lists `git worktree list`, so the shared path convention is the whole integration | `packages/ext/src/worktree.ts:1` |
+| D100 | A checkout worker opens its app space by `herdr.space` label alone (the app creates an unknown space from it); only closing that space calls `herdr-app`, best effort | `packages/ext/src/worktree.ts:1` |
+| D103 | A one-shot closes its space but never its checkout: the working tree is what the master reviews before deciding to merge | `packages/ext/src/plugins/subagent.ts:1` |
 | D99 | There is no `terminal` tool: an interactive shell is `hc`'s business through the bundled skill, so the extension never re-implements a PTY CLI | `packages/ext/skills/piher-tools/SKILL.md:1` |
 | D104 | The config catalog is one plane map: roles are per file, env is per process, and every value reports its source | `packages/ext/src/config-catalog-core.ts:1` |
 | D113 | The delegation tree (running workers plus the settled nodes still resumable) renders inside pi as an overlay; the resident widget stays one line per running worker | `packages/ext/src/tree-view.ts:1` |

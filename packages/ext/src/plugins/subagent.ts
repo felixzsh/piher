@@ -51,12 +51,14 @@ import { mainWorktreeRoot } from '../storage-layout.ts';
 import { settlementCard, type SettlementCard } from '../settlement-card.ts';
 import { DELEGATION_ENV, type DelegationContext } from '../delegation-core.ts';
 import { createGitIo, createSpawnAction, createSpawner } from '../subagent-spawn.ts';
-import { createCheckoutIo } from '../worktree-io.ts';
+import { createCheckoutIo, createCheckoutSpace } from '../worktree-io.ts';
 import {
   missingCheckoutText,
+  closeCheckoutSpace,
   releaseCheckout,
   releasedCheckoutLine,
   type CheckoutIo,
+  type CheckoutSpace,
 } from '../worktree.ts';
 import { createPoller } from '../subagent-poller.ts';
 import { createGcController, createSubagentRegistry, retirePane } from '../subagent-gc.ts';
@@ -83,6 +85,7 @@ export interface SubagentDeps {
   terminalState: PaneStateSlot;
   /** Test seam for the checkout piher may create and the app space that shows it (S71). */
   checkoutIo?: CheckoutIo;
+  checkoutSpace?: CheckoutSpace;
 }
 
 /** Sent with every request: what a call needs. Details live in SUBAGENT_MANUAL (`action: "help"`). */
@@ -100,7 +103,7 @@ const SUBAGENT_DESCRIPTION = [
 const SUBAGENT_MANUAL = [
   'subagent manual — what a call needs beyond the description that rides every request; help returns this text.',
   '',
-  'spawn — the subagent shares this workspace and works independently; its result is its final text answer, delivered as a settlement notice. The call returns at once with the worker handle, so never wait on it in-turn. `prompt` is the whole task: the worker does not see this conversation, so paths, acceptance criteria, the command that proves the work and what to report back all belong in it. Do not delegate the current step itself. Placement: by default panes group by git worktree — a subagent in your checkout shares your tab, one in a separate worktree gets its own tab named after the worktree directory. `tab` joins or creates a named task tab instead. `cwd` targets an existing directory or worktree you already have. `worktree` is a name, never a path: piher creates `~/.herdr/worktrees/<repo>/<slug>` (the name, anything outside A-Za-z0-9._- turned into a dash) on branch `<name>` from your HEAD and reuses it when it already sits on that branch; the app\'s Open worktree lists it, and piher never talks to the app — `cwd` and `worktree` are mutually exclusive.',
+  'spawn — the subagent shares this workspace and works independently; its result is its final text answer, delivered as a settlement notice. The call returns at once with the worker handle, so never wait on it in-turn. `prompt` is the whole task: the worker does not see this conversation, so paths, acceptance criteria, the command that proves the work and what to report back all belong in it. Do not delegate the current step itself. Placement: a subagent in your checkout shares your tab; a subagent in its own checkout opens a space of its own in the app, exactly as the app\'s worktree button does — piher only labels the terminal, the app creates the space and never steals focus. `tab` joins or creates a named task tab instead. `cwd` targets an existing directory or worktree you already have. `worktree` is a name, never a path: piher creates `~/.herdr/worktrees/<repo>/<slug>` (the name, anything outside A-Za-z0-9._- turned into a dash) on branch `<name>` from your HEAD and reuses it when it already sits on that branch. `close` ends that space and removes the checkout, refusing a dirty one; a one-shot closes only its space and keeps the checkout, because merging is your decision — `cwd` and `worktree` are mutually exclusive.',
   '',
   'role + allowed_tools — when role matches a profile (searched: workspace .piher/roles/ → user-global ~/.pi/agent/piher/roles/ → builtin), the worker toolset becomes baseline ∪ allowed_tools minus role-deny tools (deny always wins). Custom roles: drop a JSON profile into .piher/roles/ (master/worker-default reserved). Unknown role names stay display labels. action role switches a live worker (pi transcript tool delta: applies on its next request, survives resume); the reply reports the tool diff.',
   '',
@@ -195,17 +198,18 @@ export default function subagentPlugin(ctx: Context): void {
   const { persist: persistSubs } = registry;
   const git = createGitIo();
   const checkout = d.checkoutIo ?? createCheckoutIo();
+  const checkoutSpace = d.checkoutSpace ?? createCheckoutSpace();
 
   /** S54/S71: a role-declared one-shot reclaims its pane and the checkout its spawn created. */
   function reclaim(entry: SubEntry): void {
     void (async () => {
       if (entry.worktree) {
+        // A one-shot closes its window, never its checkout: the master decides whether to merge, and
+        // the working tree is what it reviews. Removing it here would leave only the branch behind.
         const record = entry.worktree;
         const ledgerCwd = mainWorktreeRoot(entry.cwd) ?? entry.cwd;
-        const released = await releaseCheckout(checkout, record).catch(() => null);
-        if (released !== null && released.ok) {
-          writeHistory(entry, { worktree: record }, 'one-shot-reclaim', ledgerCwd);
-        }
+        await closeCheckoutSpace(checkoutSpace, record).catch(() => null);
+        writeHistory(entry, { worktree: record }, 'one-shot-reclaim', ledgerCwd);
       }
       await retirePane(client, entry.paneId);
     })();
@@ -726,7 +730,7 @@ export default function subagentPlugin(ctx: Context): void {
     const ledgerCwd = mainWorktreeRoot(entry.cwd) ?? entry.cwd;
     let checkoutLine = '';
     if (entry.worktree) {
-      const released = await releaseCheckout(checkout, entry.worktree);
+      const released = await releaseCheckout(checkout, entry.worktree, checkoutSpace);
       if (!released.ok) return toolError(released.text);
       checkoutLine = ` ${releasedCheckoutLine(entry.worktree, released.removed)};`;
     }
@@ -818,6 +822,7 @@ export default function subagentPlugin(ctx: Context): void {
     notifySpawnFailed: injectNotice,
     git,
     checkout,
+    checkoutSpace,
     session,
     spawn,
     poller,

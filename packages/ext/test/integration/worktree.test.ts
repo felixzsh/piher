@@ -14,6 +14,7 @@ import type { SubagentPortBox } from '../../src/subagent-core.ts';
 import { NodeCheckoutIo, parsePorcelain } from '../../src/worktree-io.ts';
 import {
   checkoutAckLine,
+  checkoutSpaceId,
   dirtyCheckoutText,
   ensureCheckout,
   missingCheckoutText,
@@ -249,6 +250,8 @@ interface WtHarness {
   /** `herdr.*` labels handed to `terminal.run`, in spawn order. */
   labels: Array<Record<string, string>>;
   retired: string[];
+  /** Spaces the app was asked to close, and a way to make the app unreachable. */
+  spaces: { closed: string[]; fail: boolean };
 }
 
 async function withHarness(fn: (h: WtHarness) => Promise<void>): Promise<void> {
@@ -285,9 +288,19 @@ async function withHarness(fn: (h: WtHarness) => Promise<void>): Promise<void> {
 
   const labels: Array<Record<string, string>> = [];
   const retired: string[] = [];
+  const spaces: WtHarness['spaces'] = { closed: [], fail: false };
   let paneIndex = 0;
   const { root, pi, port } = await mountSubagent({
-    deps: { checkoutIo: new NodeCheckoutIo() },
+    deps: {
+      checkoutIo: new NodeCheckoutIo(),
+      checkoutSpace: {
+        close: async (id) => {
+          if (spaces.fail) return 'herdr-app did not answer';
+          spaces.closed.push(id);
+          return null;
+        },
+      },
+    },
     client: {
       getTerminal: async (id: string) => terminalInfo({ id }),
       // Parked forever: an unparked fake watch makes the poll loop spin on microtasks.
@@ -300,7 +313,7 @@ async function withHarness(fn: (h: WtHarness) => Promise<void>): Promise<void> {
     },
   });
   try {
-    await fn({ repo, home, pi, port, labels, retired });
+    await fn({ repo, home, pi, port, labels, retired, spaces });
   } finally {
     await root.fiber.dispose();
     for (const sock of sockets) sock.destroy();
@@ -334,6 +347,9 @@ test('spawn worktree: one name makes the checkout, and says where it is', async 
     assert.equal(result.details?.worktree !== undefined, true, 'the answer carries the record');
     // The checkout is real, on its own branch, and the app was asked for a space that shows it.
     assert.ok(existsSync(join(path, 'README.md')));
+    // The app opens the space from this label alone: no app call, and no tab of the master's.
+    assert.equal(h.labels[0]!['herdr.space'], checkoutSpaceId(path));
+    assert.equal('herdr.tab' in h.labels[0]!, false, 'the app makes the tab inside the space');
 
     // The ledger row names the checkout `resume` and `close` depend on.
     await waitFor(() => ledgerRows(h.repo).some((r) => r.via === 'spawn'));
@@ -381,6 +397,7 @@ test('close: the worktree goes, the branch survives; a dirty checkout is refused
 
     rmSync(join(path, 'uncommitted.txt'));
     const closed = (await runSubagent(h.pi, { action: 'close', agentId: paneId }, h.repo)).content[0]!.text;
+    assert.deepEqual(h.spaces.closed, [checkoutSpaceId(path)], 'the master\'s close ends the window too');
     assert.match(closed, /worktree .*probe removed/);
     assert.match(closed, /branch probe survives/);
     assert.equal(existsSync(path), false);
@@ -420,7 +437,7 @@ test('resume: unfinished work revives; a closed worker is final', async () => {
   });
 });
 
-test('one-shot: its settlement reclaims the checkout it was spawned into', async () => {
+test('one-shot: its settlement closes the space and keeps the checkout for the master', async () => {
   await withHarness(async (h) => {
     mkdirSync(join(h.repo, '.piher', 'roles'), { recursive: true });
     writeFileSync(
@@ -433,11 +450,13 @@ test('one-shot: its settlement reclaims the checkout it was spawned into', async
     assert.ok(existsSync(path), 'the one-shot got its checkout');
     await waitFor(() => h.port.current !== null);
     h.port.current!.consumeReply(paneId, 'REPORT: swept');
-    await waitFor(() => !existsSync(path));
-    assert.equal(existsSync(path), false, 'a one-shot leaves nothing to clean up');
+    await waitFor(() => h.spaces.closed.length > 0);
+    // The window closes; the working tree stays, because the master decides whether to merge.
+    assert.deepEqual(h.spaces.closed, [checkoutSpaceId(path)]);
+    assert.ok(existsSync(path), 'a one-shot keeps its checkout for review');
     assert.ok(branches(h.repo).includes('shot'), 'the branch survives');
 
-    // S72: the reclaim records that the space went with the checkout, so a later start finds nothing.
+    // The reclaim records the checkout it left behind, so a later close or resume reads the truth.
     await waitFor(() => ledgerRows(h.repo).some((r) => r.via === 'one-shot-reclaim'));
     const reclaimed = ledgerRows(h.repo).filter((r) => r.via === 'one-shot-reclaim').at(-1)!;
     assert.deepEqual(reclaimed.worktree, { path, branch: 'shot' });

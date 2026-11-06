@@ -13,7 +13,7 @@ import { childEnvironment, type CoreClientLike, type CoreEnv } from './core-clie
 import { delegationEnv } from './delegation-core.ts';
 import { bareSessionId } from './session-tail.ts';
 import { mainWorktreeRoot } from './storage-layout.ts';
-import { checkoutAckLine, ensureCheckout, planWorktree, releaseCheckout, type CheckoutIo, type WorktreeRecord } from './worktree.ts';
+import { checkoutAckLine, checkoutSpaceId, ensureCheckout, planWorktree, releaseCheckout, type CheckoutIo, type CheckoutSpace, type WorktreeRecord } from './worktree.ts';
 import { pipeNameCandidates, pipeNameFor, pipeRequest, pipeRequestTo } from './pipe-channel.ts';
 import { composeForRole } from './manifest-compose.ts';
 import type { Lifecycle } from './role-manifest.ts';
@@ -33,6 +33,7 @@ import {
   sleep,
   subRef,
   withAdmission,
+  withoutPlacement,
   type SubEntry,
   type WorktreeZone,
 } from './subagent-core.ts';
@@ -354,10 +355,14 @@ export function createSpawner(h: SpawnerHost): Spawner {
     return { alive, status, tail };
   }
 
-  /** Create the worker terminal in the planned tab. The app adopts it as an unfocused pane; a new
-   *  `herdr.tab` id makes the app create that tab, so no layout math is needed here. */
+  /**
+   * Create the worker terminal where its labels say. A worker in its own checkout names a
+   * `herdr.space` and no tab: the app creates that space (folder = the checkout, no focus steal) and
+   * a tab inside it — the same thing its own worktree button does. Every other worker joins a tab of
+   * this master's space.
+   */
   async function spawnPaneInTaskTab(
-    placement: { desiredTab?: string | null; description: string; zone?: WorktreeZone },
+    placement: { desiredTab?: string | null; description: string; zone?: WorktreeZone; spaceId?: string | null },
     cwd: string,
     envOver: Record<string, string>,
     argv: readonly string[],
@@ -368,7 +373,9 @@ export function createSpawner(h: SpawnerHost): Spawner {
       zone: placement.zone,
     });
     const placementLabels = await h.client.placementLabels();
-    const labels = plan.tabId ? { ...placementLabels, 'herdr.tab': plan.tabId } : placementLabels;
+    const labels = placement.spaceId
+      ? { ...withoutPlacement(placementLabels), 'herdr.space': placement.spaceId }
+      : plan.tabId ? { ...placementLabels, 'herdr.tab': plan.tabId } : placementLabels;
     const terminal = await h.client.run({
       argv: [...argv],
       cwd,
@@ -376,7 +383,9 @@ export function createSpawner(h: SpawnerHost): Spawner {
       labels,
       noNotify: true,
     });
-    return {
+    return placement.spaceId
+      ? { tabId: '', paneId: terminal.id, tabName: '' }
+      : {
         tabId: plan.tabId ?? placementLabels['herdr.tab'] ?? '',
         paneId: terminal.id,
         tabName: plan.tabName,
@@ -425,8 +434,10 @@ interface SpawnActionHost {
   /** A spawn whose pane never came up: the only report a failed start can make off the turn. */
   notifySpawnFailed: (content: string) => Promise<void>;
   git: GitIo;
-  /** S71: the checkout piher may create on request. The app is not involved. */
+  /** S71: the checkout piher may create on request. */
   checkout: CheckoutIo;
+  /** Closes the app space a checkout worker opened; omitted means no app at all. */
+  checkoutSpace?: CheckoutSpace;
   session: SessionIo;
   spawn: Spawner;
   poller: Poller;
@@ -502,7 +513,7 @@ export function createSpawnAction(h: SpawnActionHost) {
       const base = checkoutBase;
       if (!createdCheckout || !record || !base) return;
       void (async (): Promise<void> => {
-        await releaseCheckout(h.checkout, record).catch(() => null);
+        await releaseCheckout(h.checkout, record, h.checkoutSpace).catch(() => null);
         appendCheckoutRow(masterCwd, base, record, { status: 'closed', via: 'spawn-failed' });
       })();
     };
@@ -536,6 +547,8 @@ export function createSpawnAction(h: SpawnActionHost) {
     const zone: WorktreeZone = worktreeRecord
       ? { zone: 'worktree', tabName: basename(worktreeRecord.path) }
       : classifyWorktreeZone({ cwd, masterCwd, worktrees: await git.listWorktrees(masterCwd) });
+    // A checkout piher just made gets its own app space, named by the label the app adopts.
+    const spaceId = worktreeRecord ? checkoutSpaceId(worktreeRecord.path) : null;
     // D86 trust: pass -a only for the master's checkout/worktrees; external dirs stay behind pi's Trust dialog.
     const approve = worktreeRecord != null || isPathUnder(cwd, masterCwd) || zone.zone === 'worktree';
 
@@ -546,7 +559,7 @@ export function createSpawnAction(h: SpawnActionHost) {
       // The slot covers pane creation only: the readiness wait and the prompt injection run off this
       // call's turn (S50), so they must never hold a slot a spawn would have to queue behind.
       const spawned = await withAdmission(h.subSemaphore, () => spawnPaneInTaskTab(
-        { desiredTab: tab, description: spec.description, zone },
+        { desiredTab: tab, description: spec.description, zone, spaceId },
         cwd,
         // Status comes ONLY from pi's native OSC 7501 reporter; piher never writes it.
         { PIHER_SUBAGENT: '1', ...roleManifestEnv, ...delegationEnvPatch },

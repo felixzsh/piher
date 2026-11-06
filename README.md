@@ -30,8 +30,9 @@ its own rules.
   call. Core starts the program; the app adopts that terminal as an unfocused pane of the caller's
   tab. A **new** `herdr.tab` id makes the app create a new tab — piher never does placement math. A
   spawn that asks for a `worktree` is the one exception on the app side: piher creates the checkout,
-  then places the worker in the tab of its checkout. piher never calls `herdr-app`: the app's
-  `Open worktree` lists `git worktree list`, so a checkout made here shows up there by itself.
+  then places the worker in a tab of its checkout's own space. Opening that space costs no app call:
+  the terminal carries a `herdr.space` label and the app creates the space from it, with the checkout
+  as folder and without moving the person's focus.
 - A worker's process ends with its parent; piher closes terminals through `terminal.kill` +
   `terminal.rm`.
 - **Status comes only from pi's native OSC 7501 report**, which core stores and the app renders.
@@ -69,9 +70,11 @@ combined `slug@paneId`.
 
 `worktree: "<name>"` makes piher create `~/.herdr/worktrees/<repo>/<slug>` on branch `<name>` from
 the caller's HEAD and record the checkout in the ledger; repeating it reuses the checkout that
-already sits on that branch. The path follows the app mod's convention, so the person opens it with
-the app's `Open worktree` button and piher never talks to the app. `close` removes what a spawn
-created — the worktree goes, the branch survives. A dirty worktree is refused, naming the files. `cwd` is the other way round: a checkout the caller already has stays the caller's
+already sits on that branch. The worker then opens in its own app space, the same window the app's
+worktree button makes. `close` ends it: the space closes and the checkout is removed, the branch
+survives, and a dirty checkout is refused naming the files. A **one-shot closes only its space** —
+the checkout stays, because merging is the master's decision. Closing a space is the one thing that
+needs `herdr-app`, and it is best effort: an unreachable window leaves an empty space, never lost work. `cwd` is the other way round: a checkout the caller already has stays the caller's
 to remove.
 
 A role that declares `lifecycle: "one-shot"` is reclaimed automatically once its verdict is consumed,

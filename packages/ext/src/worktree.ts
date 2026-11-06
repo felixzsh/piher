@@ -7,6 +7,7 @@
  * created here appears there by itself; the path convention is shared with its mod so both agree on
  * where a checkout of a given name lives, and that agreement is the whole integration.
  */
+import { createHash } from 'node:crypto';
 import { basename, join } from 'node:path';
 
 /** What a spawn recorded, and the only thing that authorises a later removal (S71). */
@@ -30,6 +31,18 @@ export function foldWorktree(raw: unknown): WorktreeRecord | undefined {
   if (typeof rec.path !== 'string' || !rec.path) return undefined;
   if (typeof rec.branch !== 'string' || !rec.branch) return undefined;
   return { path: rec.path, branch: rec.branch };
+}
+
+/**
+ * The app space a checkout lives in. Opening it needs no app call: the worker terminal carries this
+ * id as its `herdr.space` label and the app creates the space from the label, with the checkout as
+ * its folder and without moving the person's focus (`adopt` in the app creates an unknown space).
+ * Keyed by the absolute path so two checkouts of the same name never share a space.
+ */
+export function checkoutSpaceId(path: string): string {
+  const slug = slugifyWorktree(basename(path)) || 'worktree';
+  const digest = createHash('sha1').update(path).digest('hex').slice(0, 8);
+  return `piher-wt-${slug}-${digest}`;
 }
 
 /** Everything outside `[A-Za-z0-9._-]` becomes `-`, and leading/trailing dashes go — the same rule
@@ -89,6 +102,12 @@ export function invalidBranchText(name: string): string {
 /* ── port types ─────────────────────────────────────────────────── */
 
 /** git plumbing for the checkout piher may create or remove. */
+/** Closing a space is the app's: piher opens one by label, so only a call can end it. */
+export interface CheckoutSpace {
+  /** null when it closed or was already gone; a message when the app could not do it. */
+  close(spaceId: string): Promise<string | null>;
+}
+
 export interface CheckoutIo {
   /** `git worktree list --porcelain` in `cwd`'s repository: path → branch it holds (null: detached). */
   worktrees(cwd: string): Promise<Map<string, string | null>>;
@@ -184,6 +203,7 @@ export function dirtyCheckoutText(record: Pick<WorktreeRecord, 'path' | 'branch'
 export async function releaseCheckout(
   io: CheckoutIo,
   record: WorktreeRecord,
+  space?: CheckoutSpace,
 ): Promise<ReleaseOutcome> {
   const present = await io.exists(record.path);
   if (present) {
@@ -196,7 +216,10 @@ export async function releaseCheckout(
     }
     if (dirty.length > 0) return { ok: false, text: dirtyCheckoutText(record, dirty) };
   }
-  if (!present) return { ok: true, removed: false };
+  if (!present) {
+    await closeSpace(space, record);
+    return { ok: true, removed: false };
+  }
   try {
     await io.remove(record.path);
   } catch (err) {
@@ -205,7 +228,26 @@ export async function releaseCheckout(
       text: `Error: could not remove the worktree ${record.path} (branch ${record.branch} survived): ${message(err)}`,
     };
   }
+  await closeSpace(space, record);
   return { ok: true, removed: true };
+}
+
+/** Best effort in one direction only: a space that will not close is a window, not lost work. */
+async function closeSpace(space: CheckoutSpace | undefined, record: WorktreeRecord): Promise<void> {
+  if (!space) return;
+  try {
+    await space.close(checkoutSpaceId(record.path));
+  } catch {
+    /* An unreachable app leaves an empty space the person can close. */
+  }
+}
+
+/**
+ * A one-shot keeps its checkout: the master decides whether to merge, and a working tree is what it
+ * reviews. Its space still closes, because a finished worker has nothing to show any more.
+ */
+export async function closeCheckoutSpace(space: CheckoutSpace | undefined, record: WorktreeRecord): Promise<void> {
+  await closeSpace(space, record);
 }
 
 /* ── texts ──────────────────────────────────────────────────────── */

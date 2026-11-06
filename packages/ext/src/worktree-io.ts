@@ -9,7 +9,7 @@ import { execFile as nodeExecFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { runtimePolicy } from './runtime-policy.ts';
-import type { CheckoutIo } from './worktree.ts';
+import type { CheckoutIo, CheckoutSpace } from './worktree.ts';
 
 const execFile = promisify(nodeExecFile);
 const MAX_BUFFER = 8 * 1024 * 1024;
@@ -118,4 +118,60 @@ export function parsePorcelain(out: string): Map<string, string | null> {
 
 export function createCheckoutIo(): CheckoutIo {
   return new NodeCheckoutIo();
+}
+
+/** The app is a UI: a window that does not answer must not hold a close for long. */
+const APP_TIMEOUT_MS = 5000;
+
+/**
+ * Closing a space, which only the app can do. Opening one costs nothing (the label makes the app
+ * create it), so this is the single place piher talks to `herdr-app`, and only when a worker that
+ * opened a space is done with it.
+ */
+export class HerdrAppSpaceCloser implements CheckoutSpace {
+  private readonly bin: string;
+  private readonly timeoutMs: number;
+  private readonly exec: Exec;
+
+  constructor(bin = 'herdr-app', timeoutMs = APP_TIMEOUT_MS, exec: Exec = execFile as unknown as Exec) {
+    this.bin = bin;
+    this.timeoutMs = timeoutMs;
+    this.exec = exec;
+  }
+
+  async close(spaceId: string): Promise<string | null> {
+    try {
+      const { stdout } = await this.exec(this.bin, ['do', 'space.close', '--id', spaceId, '--confirmed', 'true'], {
+        timeout: this.timeoutMs,
+        encoding: 'utf8',
+        maxBuffer: MAX_BUFFER,
+      });
+      const error = errorOf(stdout);
+      // Nothing left to close is a success: an idempotent close must not alarm every retry.
+      return error === null || /^no space\b/i.test(error) ? null : error;
+    } catch (err) {
+      // A non-zero exit still carries the app's answer: `no space …` arrives exactly that way.
+      const answered = errorOf((err as { stdout?: unknown } | null)?.stdout);
+      if (answered !== null) return /^no space\b/i.test(answered) ? null : answered;
+      const message = err instanceof Error ? err.message : String(err);
+      return /ENOENT/.test(message) ? 'herdr-app is not installed — the space stays open' : `herdr-app did not answer: ${message}`;
+    }
+  }
+}
+
+/** The `error` field of the app's one-line JSON answer, or null when it reported success. */
+function errorOf(stdout: unknown): string | null {
+  if (typeof stdout !== 'string' || stdout.trim() === '') return null;
+  try {
+    const parsed: unknown = JSON.parse(stdout.trim());
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const error = (parsed as Record<string, unknown>)['error'];
+    return typeof error === 'string' && error.trim() !== '' ? error.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+export function createCheckoutSpace(): CheckoutSpace {
+  return new HerdrAppSpaceCloser();
 }

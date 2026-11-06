@@ -407,6 +407,14 @@ export function tabNameForTask(description: string): string {
   return truncated || 'task';
 }
 
+/** A worker placed in its own app space carries no tab label of the master's (the app makes one). */
+export function withoutPlacement(labels: Readonly<Record<string, string>>): Record<string, string> {
+  const out = { ...labels };
+  delete out['herdr.space'];
+  delete out['herdr.tab'];
+  return out;
+}
+
 export interface TabPlacementPlan {
   /** Display name of the task tab; `main` when the worker shares the master's tab. */
   tabName: string;
