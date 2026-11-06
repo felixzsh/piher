@@ -231,9 +231,10 @@ test('spawn env: the worker gets the spawn contract on top of the caller environ
     assert.equal(delegation.description, 'probe');
     assert.equal(typeof delegation.taskId, 'string');
     assert.equal(delegation.role, 'worker-default');
-    // A worker in the master's checkout joins the master's app tab instead of creating one.
-    assert.equal(env.spawnLabels[0]!['herdr.tab'], 'tb0');
-    assert.equal(env.spawnLabels[0]!['herdr.space'], 'sp0');
+    // A worker opens no pane: no placement label, so the app never adopts it. Its parent is still
+    // this terminal, which is what makes the agents view nest it under the master.
+    assert.equal('herdr.space' in env.spawnLabels[0]!, false);
+    assert.equal('herdr.tab' in env.spawnLabels[0]!, false);
   });
 });
 

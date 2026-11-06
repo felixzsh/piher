@@ -30,9 +30,10 @@ its own rules.
   call. Core starts the program; the app adopts that terminal as an unfocused pane of the caller's
   tab. A **new** `herdr.tab` id makes the app create a new tab — piher never does placement math. A
   spawn that asks for a `worktree` is the one exception on the app side: piher creates the checkout,
-  then places the worker in a tab of its checkout's own space. Opening that space costs no app call:
-  the terminal carries a `herdr.space` label and the app creates the space from it, with the checkout
-  as folder and without moving the person's focus.
+  and gives it no pane to live in: the app lists a pane-less worker under its parent in the agents
+  view, where a person can peek at it, so a spawn no longer opens a pane beside the master. A worker
+  in its own checkout is the exception — it carries a `herdr.space` label and the app creates that
+  space from it (the app's worktree button), with the checkout as folder and no focus steal.
 - A worker's process ends with its parent; piher closes terminals through `terminal.kill` +
   `terminal.rm`.
 - **Status comes only from pi's native OSC 7501 report**, which core stores and the app renders.

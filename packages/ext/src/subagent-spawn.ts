@@ -262,7 +262,13 @@ type ReadyOutcome = { ok: true } | { ok: false; message: string };
 
 export interface Spawner {
   spawnPaneInTaskTab(
-    placement: { desiredTab?: string | null; description: string; zone?: WorktreeZone; spaceId?: string | null },
+    placement: {
+      desiredTab?: string | null;
+      description: string;
+      zone?: WorktreeZone;
+      spaceId?: string | null;
+      visible: boolean;
+    },
     cwd: string,
     envOver: Record<string, string>,
     argv: readonly string[],
@@ -356,13 +362,25 @@ export function createSpawner(h: SpawnerHost): Spawner {
   }
 
   /**
-   * Create the worker terminal where its labels say. A worker in its own checkout names a
-   * `herdr.space` and no tab: the app creates that space (folder = the checkout, no focus steal) and
-   * a tab inside it — the same thing its own worktree button does. Every other worker joins a tab of
-   * this master's space.
+   * Create the worker terminal where its labels say.
+   *
+   * A worker opens no pane at all unless asked: with no placement label the app never adopts it, so
+   * it lives in core alone. The app's agents view still lists it — that view walks the core's
+   * terminals and nests pane-less children under their parent (`mods/agents/main.js:176`), with
+   * `peek` to watch one on demand. A pane beside the master was noise nobody asked for.
+   *
+   * Two cases do ask for a pane: a worker in its own checkout names the checkout's `herdr.space`
+   * (the app's worktree button), and an explicit `tab` joins a tab of this master's space.
    */
   async function spawnPaneInTaskTab(
-    placement: { desiredTab?: string | null; description: string; zone?: WorktreeZone; spaceId?: string | null },
+    placement: {
+      desiredTab?: string | null;
+      description: string;
+      zone?: WorktreeZone;
+      spaceId?: string | null;
+      /** Only an explicit `tab` puts the worker in this master's space. */
+      visible: boolean;
+    },
     cwd: string,
     envOver: Record<string, string>,
     argv: readonly string[],
@@ -375,7 +393,9 @@ export function createSpawner(h: SpawnerHost): Spawner {
     const placementLabels = await h.client.placementLabels();
     const labels = placement.spaceId
       ? { ...withoutPlacement(placementLabels), 'herdr.space': placement.spaceId }
-      : plan.tabId ? { ...placementLabels, 'herdr.tab': plan.tabId } : placementLabels;
+      : !placement.visible
+        ? withoutPlacement(placementLabels)
+        : plan.tabId ? { ...placementLabels, 'herdr.tab': plan.tabId } : placementLabels;
     const terminal = await h.client.run({
       argv: [...argv],
       cwd,
@@ -383,7 +403,7 @@ export function createSpawner(h: SpawnerHost): Spawner {
       labels,
       noNotify: true,
     });
-    return placement.spaceId
+    return placement.spaceId || !placement.visible
       ? { tabId: '', paneId: terminal.id, tabName: '' }
       : {
         tabId: plan.tabId ?? placementLabels['herdr.tab'] ?? '',
@@ -559,7 +579,14 @@ export function createSpawnAction(h: SpawnActionHost) {
       // The slot covers pane creation only: the readiness wait and the prompt injection run off this
       // call's turn (S50), so they must never hold a slot a spawn would have to queue behind.
       const spawned = await withAdmission(h.subSemaphore, () => spawnPaneInTaskTab(
-        { desiredTab: tab, description: spec.description, zone, spaceId },
+        {
+          desiredTab: tab,
+          description: spec.description,
+          zone,
+          spaceId,
+          // An explicit `tab` is the only reason to give a worker a pane in this master's space.
+          visible: tab != null && String(tab).trim() !== '',
+        },
         cwd,
         // Status comes ONLY from pi's native OSC 7501 reporter; piher never writes it.
         { PIHER_SUBAGENT: '1', ...roleManifestEnv, ...delegationEnvPatch },

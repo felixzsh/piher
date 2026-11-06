@@ -44,7 +44,7 @@ duplicate-completion suppression is deliberately absent, so that is your bug, no
 - **what to report back**: the diff summary, failing test names, the commit shas, the
   decision it could not make. A report is all you get, so name the shape you want to read.
 
-`description` labels the pane and the ledger row, so make it the task in a few words. `cwd`
+`description` labels the worker and the ledger row, so make it the task in a few words. `cwd`
 must already exist — the checkout is yours. `worktree` is the other way round: give a name,
 never a path, and piher makes `~/.herdr/worktrees/<repo>/<slug>` on branch `<name>` from your
 HEAD, so you write no `git worktree add`. The worker opens in its own space of the app, as the
@@ -52,7 +52,8 @@ app's worktree button would: piher labels the terminal and the app creates the s
 is the name with anything outside `[A-Za-z0-9._-]` turned into `-`. The two parameters are
 mutually exclusive. `role` picks a profile (unknown names are display labels only), and
 `allowed_tools` only *adds* tools on top of the role baseline; a role's deny rules still win.
-`tab` joins or creates a named task tab when the default worktree grouping is wrong.
+A worker has no pane of its own: it appears under you in the app's agents view, and `tab` is the
+only way to ask for a real tab when a person wants to watch it in the main layout.
 
 Spawn is asynchronous: it returns an acknowledgement and a handle, and several `spawn`
 calls in one message run in parallel (cap four). Never sleep or poll — the notice arrives
