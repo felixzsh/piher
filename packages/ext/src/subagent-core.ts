@@ -478,9 +478,18 @@ function placementFor(tabName: string): TabPlacementPlan {
  * not on disk is not a script; an interpreter's real file is. The caller supplies `exists` so this
  * stays a decision, not I/O.
  */
+/** bun's embedded filesystem root: a compiled binary reports it as `argv[1]` (Windows: `B:\~BUN\`). */
+export function isEmbeddedEntrypoint(path: string): boolean {
+  return /^\/(?:\$bunfs|bunfs)\//.test(path) || /^[A-Za-z]:\\~BUN\\/i.test(path);
+}
+
 export function entryScript(argv1: string | undefined, exists: (path: string) => boolean): string {
   const path = argv1 ?? '';
-  return path !== '' && exists(path) ? path : '';
+  // The embedded root is rejected before the filesystem is consulted, because bun answers `exists` for
+  // its own virtual paths: `existsSync('/$bunfs/root/pi')` is true inside the binary and false in any
+  // shell. Only a real path makes existence the right question.
+  if (path === '' || isEmbeddedEntrypoint(path)) return '';
+  return exists(path) ? path : '';
 }
 
 export function buildLaunchParts(

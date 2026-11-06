@@ -84,8 +84,13 @@ test('entryScript: an embedded bun path is not a script, a real file is', () => 
   // A compiled pi reports argv[1] as /$bunfs/root/pi, which no filesystem has. Passing it made it the
   // worker's first prompt: the child greeted "/$bunfs/root/pi" and then answered its real task, so
   // the launch looked like the message was injected twice.
-  assert.equal(entryScript('/$bunfs/root/pi', () => false), '');
+  // The predicate lies inside a compiled binary: bun's fs answers for its own virtual root. The rule
+  // must not ask it.
+  assert.equal(entryScript('/$bunfs/root/pi', () => true), '');
+  assert.equal(entryScript('/bunfs/root/pi', () => true), '');
+  assert.equal(entryScript('B:\\~BUN\\root\\pi', () => true), '');
   assert.equal(entryScript('/opt/pi/cli.js', () => true), '/opt/pi/cli.js');
+  assert.equal(entryScript('/opt/gone/cli.js', () => false), '');
   assert.equal(entryScript(undefined, () => true), '');
   assert.equal(entryScript('', () => true), '');
   // With no script, the relaunch line carries no positional prompt at all.
