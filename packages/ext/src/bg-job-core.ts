@@ -44,9 +44,13 @@ export interface JobRecord {
   error?: string;
 }
 
-/** `job-1`, `job-2`, …: short enough to paste, unique within the session. */
-export function nextJobId(sequence: number): string {
-  return `job-${sequence}`;
+/**
+ * `job-1`, `job-2`, …: short enough to paste. `tag` makes an id unique across reloads, which matters
+ * because the plugin's registry is in memory: after an HMR reload the counter starts again, and a
+ * `job-1` that names a different job in the same transcript is a silently wrong answer to `status`.
+ */
+export function nextJobId(sequence: number, tag = ''): string {
+  return `job-${sequence}${tag}`;
 }
 
 /**
@@ -198,7 +202,8 @@ export function formatJobCheckIn(job: JobRecord, now: number, tail: string, logB
   const elapsed = formatDuration(now - job.startedAt);
   const size = logBytes === null ? '' : `, ${Math.max(1, Math.round(logBytes / 1024))} KB of log`;
   const lines = [
-    `Background job ${jobName(job)} is still running after ${elapsed}${size}. It was NOT stopped and needs no retry.`,
+    `Background job ${jobName(job)} was still running after ${elapsed}${size} (checked at ${clock(now)}). `
+      + 'It was NOT stopped and needs no retry. If its exit notice has arrived since, this check-in is already history.',
     `Command: ${job.command}`,
   ];
   if (tail.trim() !== '') lines.push('Last output:', tail);
@@ -208,6 +213,14 @@ export function formatJobCheckIn(job: JobRecord, now: number, tail: string, logB
       + `bg_job {action: "stop", job_id: "${job.id}"}.`,
   );
   return lines.join('\n');
+}
+
+/** `16:55:14`: the moment a check-in observed the job, so a late delivery cannot be mistaken for now. */
+export function clock(ms: number): string {
+  const d = new Date(ms);
+  return [d.getHours(), d.getMinutes(), d.getSeconds()]
+    .map((part) => String(part).padStart(2, '0'))
+    .join(':');
 }
 
 /** `status` for one job: the same facts as the notice, with the pane's address while it is live. */

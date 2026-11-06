@@ -120,6 +120,8 @@ export default function bgJobPlugin(ctx: Context): void {
   const watches = new Map<string, { cancel: () => void }>();
   const timers = new Map<string, NodeJS.Timeout>();
   let sequence = 0;
+  /** Two base-36 characters per plugin instance: unique ids and core names across a reload. */
+  const instanceTag = Math.floor(Math.random() * 36 ** 2).toString(36).padStart(2, '0');
 
   const logDir = optionValue('PIHER_JOBS_DIR') ?? join(tmpdir(), 'piher-jobs');
 
@@ -142,9 +144,12 @@ export default function bgJobPlugin(ctx: Context): void {
   function sendNotice(content: string, details: Record<string, unknown>, wake: boolean): void {
     try {
       // The card is the same content for a human; `details` never repeats the whole text.
+      // A settle wakes an idle session; a check-in does not. Both steer, so neither is held behind
+      // the end of the turn: a check-in delivered minutes later says "still running" about a job
+      // that has since exited, and reads as a contradiction.
       pi.sendMessage?.(
         { customType: JOB_NOTICE_CUSTOM_TYPE, content, display: true, details },
-        wake ? { deliverAs: 'steer', triggerTurn: true } : { deliverAs: 'followUp' },
+        wake ? { deliverAs: 'steer', triggerTurn: true } : { deliverAs: 'steer' },
       );
     } catch {
       /* A host without custom messages keeps the job; only the notice is lost. */
@@ -272,7 +277,7 @@ export default function bgJobPlugin(ctx: Context): void {
       ? params.name.trim().slice(0, 80)
       : null;
     const timeoutS = clampTimeoutS(params?.timeout_s);
-    const id = nextJobId(++sequence);
+    const id = nextJobId(++sequence, instanceTag);
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const logPath = join(logDir, `${id}-${stamp}.log`);
     try {

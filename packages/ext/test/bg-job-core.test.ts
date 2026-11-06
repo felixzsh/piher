@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   DEFAULT_TIMEOUT_S,
   chooseTail,
+  clock,
   MAX_LOG_LINES,
   MAX_TIMEOUT_S,
   MIN_TIMEOUT_S,
@@ -45,6 +46,10 @@ function job(overrides: Partial<JobRecord> = {}): JobRecord {
 test('a job id is short and pasteable', () => {
   assert.equal(nextJobId(1), 'job-1');
   assert.equal(nextJobId(42), 'job-42');
+  // A reload restarts the counter, so the instance tag is what keeps `job-1` from naming a
+  // different job in the same transcript.
+  assert.equal(nextJobId(1, 'k3'), 'job-1k3');
+  assert.match(jobCoreName(nextJobId(1, 'k3'), 'build release'), /^job-1k3-build-release$/);
 });
 
 test('the pane name leads with the job id and stays inside core limits', () => {
@@ -170,9 +175,17 @@ test('a job that never started reports why, not an exit code', () => {
 
 test('a check-in says the job is alive first, so it cannot be read as a failure', () => {
   const notice = formatJobCheckIn(job({ status: 'running', exitCode: null, endedAt: null }), 181_000, 'still going', 8_192);
-  assert.match(notice, /is still running after 3m 00s, 8 KB of log\./);
+  assert.match(notice, /was still running after 3m 00s, 8 KB of log \(checked at \d\d:\d\d:\d\d\)\./);
   assert.match(notice, /It was NOT stopped and needs no retry\./);
+  assert.match(notice, /If its exit notice has arrived since, this check-in is already history\./);
   assert.match(notice, /action: "stop"/);
+});
+
+test('a check-in dates itself, so a late delivery cannot read as the present', () => {
+  const at = new Date(2026, 10, 6, 16, 55, 14).getTime();
+  const notice = formatJobCheckIn(job({ status: 'running', exitCode: null, endedAt: null, startedAt: at - 5_000 }), at, '', null);
+  assert.match(notice, /\(checked at 16:55:14\)/);
+  assert.equal(clock(at), '16:55:14');
 });
 
 test('a check-in with no output yet still shows the command', () => {
