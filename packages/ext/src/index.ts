@@ -215,11 +215,14 @@ export default async function (pi: ExtensionAPI) {
         const entries = readSessionFile(ownFile);
         // Same derivation the master's poller uses, so the two paths can never disagree about whether
         // the worker said anything: a turn that ended by token cap or abort still has words.
-        if (entries) text = deriveSubSessionState(entries, req.sinceTs).text;
+        if (entries) {
+          const state = deriveSubSessionState(entries, req.sinceTs);
+          // A turn that ended with nothing to say but a reason — a refused tool, an error — must say
+          // it: staying silent left the master waiting the whole vacuum budget for a report that was
+          // never coming. A worker still thinking has no reason, and its push stays withheld.
+          text = state.text ?? state.why ?? null;
+        }
       }
-      // A reply with no words would burn the master's claim latch and print "left no closing message"
-      // for a worker that is about to speak. Keep the request armed and let the master's poller read
-      // the same transcript once the message is finalized.
       if (text === null) return false;
       await pipeRequest(req.from, {
         type: 'reply',

@@ -146,12 +146,42 @@ export function hasPendingToolCall(entries: readonly SessionEntryLike[], sinceTs
   return depth > 0;
 }
 
+/**
+ * Why a turn ended with nothing to say, in words the master can act on. A refused tool is the case
+ * that matters: piher's gate refuses it, the model stops, and without this the master waited the whole
+ * vacuum budget for a report that was never coming.
+ */
+export function explainSilentEnd(
+  entries: readonly SessionEntryLike[],
+  sinceTs: number,
+): string | null {
+  let refusal: string | null = null;
+  let failed = false;
+  for (const entry of entries) {
+    const m = messageOf(entry);
+    if (!m) continue;
+    const ts = typeof m.timestamp === 'number' ? m.timestamp : 0;
+    if (ts < sinceTs) continue;
+    if (m.role === 'toolResult') {
+      const hit = /role "([^"]+)" does not permit tool "([^"]+)"/.exec(textOf(m));
+      if (hit) refusal = `the \`${hit[1]}\` manifest does not permit \`${hit[2]}\``;
+    }
+    if (m.role === 'assistant' && m.stopReason === 'error') failed = true;
+  }
+  if (refusal) {
+    return `It stopped after a refused tool call: ${refusal}. Fix the role profile or the task, then continue it.`;
+  }
+  return failed ? 'Its turn ended with an error and no message.' : null;
+}
+
 /** Derived settlement state of one child session, from the inject point onward. */
 export interface SubSessionState {
   text: string | null;
   pendingTool: boolean;
   activity: boolean;
   turnEnded: boolean;
+  /** Nothing to say, but there is a reason the master can act on: a refused tool, an errored turn. */
+  why?: string | null;
 }
 
 /** Closing text is terminal by construction (lastAssistantText requires stopReason 'stop'); an
@@ -161,18 +191,18 @@ export function deriveSubSessionState(
   sinceTs: number,
 ): SubSessionState {
   const r = lastAssistantText(entries, { sinceTs });
-  if (r?.text) return { text: r.text, pendingTool: false, activity: true, turnEnded: true };
-  if (hasPendingToolCall(entries, sinceTs)) return { text: null, pendingTool: true, activity: true, turnEnded: false };
+  if (r?.text) return { text: r.text, pendingTool: false, activity: true, turnEnded: true, why: null };
+  if (hasPendingToolCall(entries, sinceTs)) return { text: null, pendingTool: true, activity: true, turnEnded: false, why: null };
   if (hasAssistantAfter(entries, sinceTs)) {
     const turnEnded = lastAssistantTurnEnded(entries, sinceTs);
     // An ended turn always has words to deliver, even when they did not come from a clean 'stop'
     // (token cap, abort). Without this the poller saw "turn ended, no text" and announced
     // "It left no closing message" for a worker that had answered.
     const any = turnEnded ? lastAssistantAnyText(entries, sinceTs) : null;
-    if (any) return { text: any, pendingTool: false, activity: true, turnEnded: true };
-    return { text: null, pendingTool: false, activity: true, turnEnded };
+    if (any) return { text: any, pendingTool: false, activity: true, turnEnded: true, why: null };
+    return { text: null, pendingTool: false, activity: true, turnEnded, why: explainSilentEnd(entries, sinceTs) };
   }
-  return { text: null, pendingTool: false, activity: false, turnEnded: false };
+  return { text: null, pendingTool: false, activity: false, turnEnded: false, why: null };
 }
 
 /** Newest `limit` session files under cwd's session dir (pi core's name first, then piher's old encodings). */

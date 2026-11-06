@@ -66,15 +66,22 @@ export function planVacuumTick(input: {
  * Closing text (only a terminal assistant message produces it) OR an ENDED turn settles; a mere
  * assistant message — the state between tool calls — must NOT qualify, or live workers get announced
  * as finished.
+ *
+ * The exception is an idle terminal with no tool in flight: a worker that stopped between calls is not
+ * "between calls". Without it, a run that ended on a refused tool call (last message `toolUse`, result
+ * already returned, nothing after) stayed invisible for the whole vacuum budget.
  */
 export function isSettlementCandidate(input: {
   text: string | null;
   pendingTool: boolean;
   activity: boolean;
   turnEnded?: boolean;
+  /** The pane itself is idle: nothing is being executed right now. */
+  terminalIdle?: boolean;
 }): boolean {
   if (input.text) return true;
-  return !input.pendingTool && input.turnEnded === true;
+  if (!input.pendingTool && input.turnEnded === true) return true;
+  return !input.pendingTool && input.activity === true && input.terminalIdle === true;
 }
 
 export function buildSettlementNoticeText(
@@ -286,8 +293,9 @@ export function createPoller(h: PollerHost): Poller {
           const s = await h.session.subSessionState(paneId, cwd, current.injectTs, entry.sessionFile);
           pollTrace?.(`state=${state} text=${s.text ? s.text.length : 'null'} pend=${s.pendingTool} act=${s.activity} window=${String(entry.settleWindowStartedAt ?? null)}`);
 
-          if (isSettlementCandidate(s)) {
-            const closing = s.text;
+          if (isSettlementCandidate({ ...s, terminalIdle: state === 'idle' || state === 'done' || state === 'error' })) {
+            // With no closing words, a stated reason (refused tool, errored turn) IS the report.
+            const closing = s.text ?? s.why ?? null;
             const tick = planSettleWindowTick({
               settleWindowStartedAt: entry.settleWindowStartedAt,
               now: now(),

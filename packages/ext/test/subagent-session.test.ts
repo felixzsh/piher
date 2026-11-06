@@ -21,7 +21,7 @@ import {
 
 const TS = 1_800_000_000_000;
 const sessions = () => mkdtempSync(join(tmpdir(), 'piher-session-'));
-const NO_STATE = { text: null, pendingTool: false, activity: false, turnEnded: false };
+const NO_STATE = { text: null, pendingTool: false, activity: false, turnEnded: false, why: null };
 
 /** Terminal id used by the single-worker session fixtures. */
 const PANE = 'tW';

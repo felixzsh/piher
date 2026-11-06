@@ -395,7 +395,7 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
       stateCache.set(file, stamp, sinceTs, state);
       return state;
     }
-    return { text: null, pendingTool: false, activity: false, turnEnded: false };
+    return { text: null, pendingTool: false, activity: false, turnEnded: false, why: null };
   }
 
   return {

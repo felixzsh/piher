@@ -44,6 +44,13 @@ test('isSettlementCandidate: final text or an ENDED turn without a pending tool'
   assert.equal(isSettlementCandidate({ text: null, pendingTool: false, activity: true, turnEnded: true }), true);
   assert.equal(isSettlementCandidate({ text: null, pendingTool: true, activity: true, turnEnded: true }), false);
   assert.equal(isSettlementCandidate({ text: null, pendingTool: false, activity: false }), false);
+  // A run that ended on a refused tool call: last message `toolUse`, its result already returned, so
+  // nothing is in flight — and the pane is idle. Without this it stayed invisible for the vacuum
+  // budget (10 minutes by default) and its master waited for a report that never came.
+  assert.equal(isSettlementCandidate({ text: null, pendingTool: false, activity: true, turnEnded: false, terminalIdle: true }), true);
+  assert.equal(isSettlementCandidate({ text: null, pendingTool: false, activity: true, turnEnded: false, terminalIdle: false }), false);
+  assert.equal(isSettlementCandidate({ text: null, pendingTool: true, activity: true, turnEnded: false, terminalIdle: true }), false);
+  assert.equal(isSettlementCandidate({ text: null, pendingTool: false, activity: false, terminalIdle: true }), false);
   // Between tool calls (toolResult written, next assistant streaming) the turn has NOT ended.
   assert.equal(isSettlementCandidate({ text: null, pendingTool: false, activity: true }), false);
   assert.equal(isSettlementCandidate({ text: null, pendingTool: false, activity: true, turnEnded: false }), false);
