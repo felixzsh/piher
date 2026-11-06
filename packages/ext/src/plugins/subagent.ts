@@ -773,9 +773,21 @@ export default function subagentPlugin(ctx: Context): void {
   async function executeSubagentClose(params: ToolParams, toolCtx: unknown) {
     const { entry } = targetOf(params, toolCtx);
     if (entry.status === 'running') {
-      return toolError(
-        `Error: subagent ${subRef(entry)} is still running — close only reclaims a worker that already finished, and a task must not disappear without a report. Use action "interrupt" to stop its current turn (the pane and its session stay), then close it once it settles.`,
-      );
+      // A task must not disappear while someone could still report it. A pane that is provably gone
+      // cannot report anything, though — its row is a zombie the ledger would keep forever (a worker
+      // that stopped without a notice, seen from a session that was not the one that spawned it).
+      let live = true;
+      try {
+        live = (await probeAlive(entry.paneId, entry.cwd)).paneExists;
+      } catch {
+        live = true; // a failed probe must not authorise the removal of a task
+      }
+      if (live) {
+        return toolError(
+          `Error: subagent ${subRef(entry)} is still running — close only reclaims a worker that already finished, and a task must not disappear without a report. Use action "interrupt" to stop its current turn (the pane and its session stay), then close it once it settles.`,
+        );
+      }
+      // Nothing to reclaim: fall through and record the decision, so `list` stops offering it.
     }
     if (entry.status === 'closed') {
       return {
@@ -830,13 +842,25 @@ export default function subagentPlugin(ctx: Context): void {
       && !(sub.status === 'consumed' && sub.lifecycle === 'one-shot');
     const byTask = newestPerTaskId([...subs.values()].filter(visible));
     const registered = new Set(byTask.keys());
-    for (const row of readLedger(cwd)) {
-      if (registered.has(row.taskId)) continue;
-      const prev = byTask.get(row.taskId);
+    // The ledger is append-only, so its LAST row for a task is the newest word on it — newer than the
+    // branch snapshot this session restored, which is how a worker closed in another session kept
+    // showing up here as settled. `close` is final: a closed row wins over any registry copy.
+    const lastRow = new Map<string, HistoryEntry>();
+    for (const row of readLedger(cwd)) lastRow.set(row.taskId, row);
+    for (const [taskId, row] of lastRow) {
+      const prev = byTask.get(taskId);
+      // A live row outranks a stale copy (a ledger row older than the spawn it describes), while a
+      // close that happened after the snapshot this session restored outranks the snapshot.
+      if (row.status === 'closed' && (!prev || (row.closedAt ?? row.createdAt ?? 0) >= prev.createdAt)) {
+        byTask.delete(taskId);
+        continue;
+      }
+      if (row.status === 'closed') continue;
+      if (registered.has(taskId)) continue;
       if (prev && prev.createdAt >= (row.createdAt ?? 0)) continue;
       const entry = entryFromHistory(row, {});
       if (!visible(entry)) continue;
-      byTask.set(row.taskId, entry);
+      byTask.set(taskId, entry);
     }
     if (byTask.size === 0) {
       return { content: [{ type: 'text', text: 'No subagents started (from this session branch).' }], details: {} };

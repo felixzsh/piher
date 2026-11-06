@@ -585,11 +585,59 @@ test('subagent plugin: help returns the manual, and a missing action normalizes 
   await root.fiber.dispose();
 });
 
+test('subagent plugin: a task closed in another session does not come back as settled', async () => {
+  // The branch snapshot a session restores can be older than the ledger; the ledger is append-only, so
+  // its last row is the newest word. Without this the row a master closed yesterday keeps offering
+  // `action send revives` in every new session of that project.
+  const cwd = mkdtempSync(join(tmpdir(), 'piher-closed-ledger-'));
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  appendLedger(cwd, {
+    taskId: 'task-closed', description: 'already handled', status: 'closed', paneId: 'pGone',
+    createdAt: Date.now() - 60_000, closedAt: Date.now() - 30_000, via: 'close', kind: 'worker',
+    cwd, tabId: 't1', tabName: 'w', lifecycle: 'persistent',
+  } as unknown as HistoryEntry);
+  const { root, pi } = await mountSubagent({
+    client: { listTerminals: async () => [] },
+    // The session restored a settled copy of the same task from its branch.
+    subs: [subEntry({ paneId: 'pGone', taskId: 'task-closed', tabId: 't1', tabName: 'w', status: 'settled' })],
+  });
+  try {
+    const res = await runSubagent(pi, { action: 'list' }, cwd);
+    assert.doesNotMatch(res.content[0]!.text, /already handled/, 'a closed task is not offered again');
+  } finally {
+    await root.fiber.dispose();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('subagent plugin: close reclaims a running row whose pane is already gone', async () => {
+  // A worker that stopped without a report leaves its row `running`. From a session that did not spawn
+  // it there is no pane to probe alive, so refusing the close would keep that row forever.
+  const retired: string[] = [];
+  const { root, pi } = await mountSubagent({
+    client: {
+      getTerminal: async () => null,
+      kill: async (id: string) => { retired.push(id); },
+      remove: async (id: string) => { retired.push(id); },
+    },
+    subs: [subEntry({ paneId: 'pZombie', taskId: 'task-zombie', tabId: 't1', tabName: 'w', status: 'running' })],
+  });
+  try {
+    const res = await runSubagent(pi, { action: 'close', agentId: 'pZombie' });
+    assert.match(res.content[0]!.text, /closed — pane and tab gone/);
+    assert.deepEqual(retired, ['pZombie', 'pZombie'], 'the dead pane is still retired best-effort');
+  } finally {
+    await root.fiber.dispose();
+  }
+});
+
 test('subagent plugin: close refuses a running worker with a pointer at interrupt', async () => {
   const retired: string[] = [];
   const { root, pi } = await mountSubagent({
     client: {
       available: false, // no pipe, no pollers: the refusal happens before anything touches core
+      // The refusal is about a pane that could still report: a live one.
+      getTerminal: async (id: string) => terminalInfo({ id, state: 'live' }),
       kill: async (id: string) => { retired.push(`kill:${id}`); },
       remove: async (id: string) => { retired.push(`remove:${id}`); },
     },
