@@ -790,6 +790,14 @@ export default function subagentPlugin(ctx: Context): void {
       // Nothing to reclaim: fall through and record the decision, so `list` stops offering it.
     }
     if (entry.status === 'closed') {
+      // The registry can be closed while the ledger still holds no such row (a close that happened
+      // elsewhere, or a sweep). Record the decision here too, so the project's history says who ended
+      // it instead of trailing off at `consumed`.
+      const ledgerCwd = mainWorktreeRoot(entry.cwd) ?? entry.cwd;
+      const latest = latestGeneration(readLedger(ledgerCwd), entry.taskId);
+      if (latest && latest.status !== 'closed') {
+        writeHistory(entry, { status: 'closed', closedAt: Date.now() }, 'close', ledgerCwd);
+      }
       return {
         content: [{ type: 'text', text: `Subagent ${subRef(entry)} is already closed (pane and tab gone); action resume with taskId ${entry.taskId} revives its session.` }],
         details: { paneId: entry.paneId, taskId: entry.taskId, alreadyClosed: true },

@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DisposeLedger } from '../src/ledger.ts';
-import { appendLedger, type HistoryEntry } from '../src/history-store.ts';
+import { appendLedger, readLedger, type HistoryEntry } from '../src/history-store.ts';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -583,6 +583,31 @@ test('subagent plugin: help returns the manual, and a missing action normalizes 
   assert.deepEqual(def.prepareArguments?.({ action: 'list' }), { action: 'list' });
   assert.deepEqual(def.prepareArguments?.(undefined), { action: 'spawn' });
   await root.fiber.dispose();
+});
+
+test('subagent plugin: close records the decision even when the registry is already closed', async () => {
+  // A registry row can be closed while the ledger trails off at `consumed`: the project's history
+  // should still say who ended it, or the row looks like work that stopped by itself.
+  const repo = mkdtempSync(join(tmpdir(), 'piher-close-idem-'));
+  mkdirSync(join(repo, '.git'), { recursive: true });
+  appendLedger(repo, {
+    taskId: 'task-idem', description: 'already closed', status: 'consumed', paneId: 'pGone',
+    createdAt: 1, consumedAt: 2, via: 'pipe-reply', kind: 'worker', cwd: repo,
+    tabId: 't1', tabName: 'w', lifecycle: 'persistent',
+  } as unknown as HistoryEntry);
+  const { root, pi } = await mountSubagent({
+    client: { listTerminals: async () => [] },
+    subs: [subEntry({ paneId: 'pGone', taskId: 'task-idem', cwd: repo, status: 'closed' })],
+  });
+  try {
+    const res = await runSubagent(pi, { action: 'close', agentId: 'task-idem' }, repo);
+    assert.match(res.content[0]!.text, /already closed/);
+    const rows = readLedger(repo).filter((row) => row.taskId === 'task-idem');
+    assert.equal(rows.at(-1)!.status, 'closed', 'the ledger now records the decision');
+  } finally {
+    await root.fiber.dispose();
+    rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 test('subagent plugin: a task closed in another session does not come back as settled', async () => {
