@@ -223,6 +223,17 @@ export default function subagentPlugin(ctx: Context): void {
   const checkout = d.checkoutIo ?? createCheckoutIo();
   const checkoutSpace = d.checkoutSpace ?? createCheckoutSpace();
 
+  /** True while another row of this session still works in the checkout at `path`. The app space is
+   *  the checkout's, not the worker's: a reviewer and the worker it reads share one, and closing it
+   *  under the survivor takes its tab away while the worker keeps running in it. */
+  function checkoutInUseByAnother(entry: SubEntry, path: string): boolean {
+    for (const other of subs.values()) {
+      if (other === entry || other.status === 'closed') continue;
+      if (other.worktree?.path === path) return true;
+    }
+    return false;
+  }
+
   /** S54/S71: a role-declared one-shot reclaims its pane and the checkout its spawn created. */
   function reclaim(entry: SubEntry): void {
     void (async () => {
@@ -231,7 +242,11 @@ export default function subagentPlugin(ctx: Context): void {
         // the working tree is what it reviews. Removing it here would leave only the branch behind.
         const record = entry.worktree;
         const ledgerCwd = mainWorktreeRoot(entry.cwd) ?? entry.cwd;
-        await closeCheckoutSpace(checkoutSpace, record).catch(() => null);
+        // A checkout can host more than one worker (a reviewer reading its worker's tree), so the
+        // space goes only with the last row that works in it — never under a live sibling.
+        if (!checkoutInUseByAnother(entry, record.path)) {
+          await closeCheckoutSpace(checkoutSpace, record).catch(() => null);
+        }
         writeHistory(entry, { worktree: record }, 'one-shot-reclaim', ledgerCwd);
       }
       await retirePane(client, entry.paneId);

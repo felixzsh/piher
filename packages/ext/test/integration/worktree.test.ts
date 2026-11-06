@@ -487,3 +487,28 @@ test('one-shot: its settlement closes the space and keeps the checkout for the m
     assert.notEqual(reclaimed.status, 'running');
   });
 });
+
+test('one-shot: a checkout still used by another worker keeps its space', async () => {
+  await withHarness(async (h) => {
+    mkdirSync(join(h.repo, '.piher', 'roles'), { recursive: true });
+    writeFileSync(
+      join(h.repo, '.piher', 'roles', 'sweeper.json'),
+      JSON.stringify({ role: 'sweeper', version: '1.0.0', lifecycle: 'one-shot', manifest: { tools: ['bash'] } }),
+    );
+    // The worker of the checkout and the reviewer that reads it share one app space.
+    const worker = await runSubagent(h.pi, { description: 'sweep run', prompt: PROMPT, worktree: 'shot' }, h.repo);
+    const reviewer = await runSubagent(
+      h.pi,
+      { description: 'sweep review', prompt: PROMPT, role: 'sweeper', worktree: 'shot' },
+      h.repo,
+    );
+    const path = checkoutPath(h, 'shot');
+    assert.equal((worker.details?.paneId as string) !== (reviewer.details?.paneId as string), true);
+    await waitFor(() => h.port.current !== null);
+
+    h.port.current!.consumeReply(reviewer.details?.paneId as string, 'REPORT: swept');
+    await waitFor(() => ledgerRows(h.repo).some((r) => r.via === 'one-shot-reclaim'));
+    assert.deepEqual(h.spaces.closed, [], 'the worker is still in that space, so its tab stays');
+    assert.ok(existsSync(path), 'the checkout stays for the master either way');
+  });
+});
