@@ -793,7 +793,8 @@ export default function subagentPlugin(ctx: Context): void {
       // The registry can be closed while the ledger still holds no such row (a close that happened
       // elsewhere, or a sweep). Record the decision here too, so the project's history says who ended
       // it instead of trailing off at `consumed`.
-      const ledgerCwd = mainWorktreeRoot(entry.cwd) ?? entry.cwd;
+      const toolCwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
+      const ledgerCwd = mainWorktreeRoot(entry.cwd) ?? mainWorktreeRoot(toolCwd) ?? toolCwd;
       const latest = latestGeneration(readLedger(ledgerCwd), entry.taskId);
       if (latest && latest.status !== 'closed') {
         writeHistory(entry, { status: 'closed', closedAt: Date.now() }, 'close', ledgerCwd);
@@ -807,7 +808,10 @@ export default function subagentPlugin(ctx: Context): void {
     // S71: close is terminal for what piher created. The checkout goes first, because a dirty one is
     // a refusal that must leave the worker reachable. The ledger row is written through the
     // repository root, since the checkout it records is about to disappear.
-    const ledgerCwd = mainWorktreeRoot(entry.cwd) ?? entry.cwd;
+    const toolCwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
+    // The checkout a job/worker named can be gone (a removed worktree), and `mainWorktreeRoot` cannot
+    // resolve a repository from a path that no longer exists: the decision would be written nowhere.
+    const ledgerCwd = mainWorktreeRoot(entry.cwd) ?? mainWorktreeRoot(toolCwd) ?? toolCwd;
     let checkoutLine = '';
     if (entry.worktree) {
       const released = await releaseCheckout(checkout, entry.worktree, checkoutSpace);
@@ -848,8 +852,11 @@ export default function subagentPlugin(ctx: Context): void {
     // verdict — listing either would spend the master's context on something it already handled.
     const visible = (sub: SubEntry): boolean => sub.status !== 'closed'
       && !(sub.status === 'consumed' && sub.lifecycle === 'one-shot');
-    const byTask = newestPerTaskId([...subs.values()].filter(visible));
-    const registered = new Set(byTask.keys());
+    const allRegistry = newestPerTaskId(subs.values());
+    const byTask = new Map([...allRegistry].filter(([, sub]) => visible(sub)));
+    // Everything the registry knows — closed rows included — so the ledger cannot resurrect a task
+    // the master already ended (the row it would bring back is older than that decision).
+    const registered = new Set(allRegistry.keys());
     // The ledger is append-only, so its LAST row for a task is the newest word on it — newer than the
     // branch snapshot this session restored, which is how a worker closed in another session kept
     // showing up here as settled. `close` is final: a closed row wins over any registry copy.

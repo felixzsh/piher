@@ -768,3 +768,26 @@ test('foldSubsRegistry: slug parses, survives replay, and old rows without it st
   assert.equal(registry.subs.find((s) => s.paneId === 'p2')?.slug, 'fix-auth');
   assert.equal(registry.subs.find((s) => s.paneId === 'p3')?.slug, undefined);
 });
+
+test('subagent plugin: a closed registry row is not resurrected from the ledger', async () => {
+  // The merge used to drop closed rows before it looked for registry knowledge, so the ledger brought
+  // the task straight back as `consumed` — a close that never took effect on screen.
+  const repo = mkdtempSync(join(tmpdir(), 'piher-no-resurrect-'));
+  mkdirSync(join(repo, '.git'), { recursive: true });
+  appendLedger(repo, {
+    taskId: 'task-ended', description: 'ended worker', status: 'consumed', paneId: 'pGone',
+    createdAt: 10, consumedAt: 20, via: 'pipe-reply', kind: 'worker', cwd: repo,
+    tabId: 't1', tabName: 'w', lifecycle: 'persistent',
+  } as unknown as HistoryEntry);
+  const { root, pi } = await mountSubagent({
+    client: { listTerminals: async () => [] },
+    subs: [subEntry({ paneId: 'pGone', taskId: 'task-ended', cwd: repo, status: 'closed' })],
+  });
+  try {
+    const text = (await runSubagent(pi, { action: 'list' }, repo)).content[0]!.text;
+    assert.doesNotMatch(text, /ended worker/, 'closed is closed, whatever the ledger still holds');
+  } finally {
+    await root.fiber.dispose();
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
