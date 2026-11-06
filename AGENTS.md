@@ -45,9 +45,10 @@ interrupted pi session, send ESC to the pane (`pane.send_keys {keys:["escape"]}`
 
 ## Long commands
 
-Anything that compiles, builds, installs dependencies or runs a test suite belongs in a background
-terminal (`hc run --bg …`, then `hc wait`), not in a blocking shell call. `bash` is for short,
-interactive or order-dependent commands.
+Anything that compiles, builds, installs dependencies or runs a test suite goes to `bg_job` — or, when
+the role forbids it (a worker's manifest denies `bg_job`), to an `hc` terminal (`hc run --bg …`, then
+`hc wait`) — never to a blocking shell call. `bash` is for short, interactive or order-dependent
+commands.
 
 ## Tests: two tiers, and the rule for when to run which
 
@@ -57,9 +58,9 @@ after a one-line edit wastes the most expensive resource in the loop.
 | Command | What runs | Time |
 |---|---|---|
 | `node --test --test-force-exit test/<file>.test.ts` | one suite you know you touched | ~1 s |
-| `npm run test:fast` | `packages/ext/test/*.test.ts` — pure planners, roles, config catalog, renderers, transcript folding (296 tests) | ~4 s |
-| `npm run test:integration` | `packages/ext/test/integration/*.test.ts` — boots the extension, real git worktrees, installer subprocesses, core-client sockets (153 tests) | ~9 s |
-| `npm test` | `tsc --noEmit` + both tiers (449 tests) | ~20 s |
+| `npm run test:fast` | `packages/ext/test/*.test.ts` — pure planners, roles, config catalog, renderers, transcript folding (318 tests) | ~4 s |
+| `npm run test:integration` | `packages/ext/test/integration/*.test.ts` — boots the extension, real git worktrees, installer subprocesses, core-client sockets (121 tests) | ~9 s |
+| `npm test` | `tsc --noEmit` + both tiers (439 tests) | ~20 s |
 
 Rules:
 
@@ -77,5 +78,5 @@ Rules:
   blocked terminal.
 - Do not add real sleeps to a test to satisfy a timer. Set the budget the code reads
   (`PIHER_SETTLE_WINDOW_MS`, `PIHER_READY_TIMEOUT_MS`, …) to something small in the harness instead.
-- Anything long goes to a background terminal (`hc run --bg …`, then `hc wait`), not to a blocking
+- Anything long goes to `bg_job` (or an `hc` terminal when the role forbids it), never to a blocking
   shell call.
