@@ -37,6 +37,9 @@ and pi rejects the duplicate provider at launch, so `pi remove` the other source
 If `hc` is missing, piher still loads but both tools answer with the core install command instead of
 running anything — the preflight is in the tool result, not in a separate installer.
 
+The old one-shot installer (`piher-setup`) is retired and no longer published: it only wrapped the
+commands in the table above, and the `hc` preflight now travels with the package itself.
+
 Hot reload while developing needs node's `--expose-internals` flag before pi's own entry point and
 `PIHER_HMR=1`; without both there is no watcher.
 
