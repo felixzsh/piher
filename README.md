@@ -30,7 +30,8 @@ its own rules.
   call. Core starts the program; the app adopts that terminal as an unfocused pane of the caller's
   tab. A **new** `herdr.tab` id makes the app create a new tab — piher never does placement math. A
   spawn that asks for a `worktree` is the one exception on the app side: piher creates the checkout,
-  then asks `herdr-app` for a space (`space.new`) that shows it, and places the worker there.
+  then places the worker in the tab of its checkout. piher never calls `herdr-app`: the app's
+  `Open worktree` lists `git worktree list`, so a checkout made here shows up there by itself.
 - A worker's process ends with its parent; piher closes terminals through `terminal.kill` +
   `terminal.rm`.
 - **Status comes only from pi's native OSC 7501 report**, which core stores and the app renders.
@@ -67,10 +68,10 @@ A task is addressed by `agentId`: the slug printed by `spawn`/`list`, the bare p
 combined `slug@paneId`.
 
 `worktree: "<name>"` makes piher create `~/.herdr/worktrees/<repo>/<slug>` on branch `<name>` from
-the caller's HEAD, ask the app for a space named after it, and record the checkout in the ledger;
-repeating it reuses the checkout that already sits on that branch. `close` removes what a spawn
-created — the space goes, the worktree is removed, the branch survives. A dirty worktree is refused,
-naming the files. `cwd` is the other way round: a checkout the caller already has stays the caller's
+the caller's HEAD and record the checkout in the ledger; repeating it reuses the checkout that
+already sits on that branch. The path follows the app mod's convention, so the person opens it with
+the app's `Open worktree` button and piher never talks to the app. `close` removes what a spawn
+created — the worktree goes, the branch survives. A dirty worktree is refused, naming the files. `cwd` is the other way round: a checkout the caller already has stays the caller's
 to remove.
 
 A role that declares `lifecycle: "one-shot"` is reclaimed this way automatically at its settlement.
@@ -136,7 +137,8 @@ hand-written body, and an integration test fails when the two disagree — the d
 
 Every spawn, settlement, reclaim and close appends one row to `<repo>/.piher/history/history.jsonl`
 in the **main** checkout — a worker in a linked worktree records into the repository, never into the
-worktree. `resume` reads it, and at session start piher closes the spaces whose checkout is gone.
+worktree. `resume` reads it and refuses a task whose checkout is gone, naming the `git worktree add`
+that brings it back.
 Outside a git repository nothing is recorded and `resume` says so.
 
 On the parent side, a settled worker's result arrives as a notice that names the worker and marks its

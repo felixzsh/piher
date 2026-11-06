@@ -33,6 +33,7 @@ or at a file that no longer exists, fails the suite.
 | D96 | When the caller settles while workers still run, one reminder is injected per run set (de-duplicated, cooled down, suppressed by an abort) | `packages/ext/src/settle-wake-core.ts:1` |
 | D97 | Fullscreen TUI mode is what turns a pane into a static frame the caller can read without ANSI reflow | `packages/ext/src/subagent-core.ts:474` |
 | D98 | Execution is a program, not a typed shell line: `bg_job` runs an argv and core reports the child's exit, so no sentinel is parsed from a screen | `packages/ext/src/bg-job-core.ts:1` |
+| D100 | piher never calls `herdr-app`: its `Open worktree` lists `git worktree list`, so the shared path convention is the whole integration | `packages/ext/src/worktree.ts:1` |
 | D99 | There is no `terminal` tool: an interactive shell is `hc`'s business through the bundled skill, so the extension never re-implements a PTY CLI | `packages/ext/skills/piher-tools/SKILL.md:1` |
 | D104 | The config catalog is one plane map: roles are per file, env is per process, and every value reports its source | `packages/ext/src/config-catalog-core.ts:1` |
 | D113 | The delegation tree (running workers plus the settled nodes still resumable) renders inside pi as an overlay; the resident widget stays one line per running worker | `packages/ext/src/tree-view.ts:1` |
@@ -44,7 +45,6 @@ or at a file that no longer exists, fails the suite.
 | S21 | The catalog rides the prompt: an action would spend a round trip on text that fits in the request for free | `packages/ext/src/role-catalog.ts:1` |
 | S22 | A role switch is the one recompute point for the visible tool set; a widen from a human asks first | `packages/ext/src/role-state.ts:1` |
 | S41 | One ledger per repository: a resume asked from a linked worktree resolves the main checkout's file, not its own | `packages/ext/src/storage-layout.ts:1` |
-| S43 | A `herdr-app` that cannot be reached is reported, never raised: the app is optional, the spawn is not | `packages/ext/src/worktree-io.ts:1` |
 | S50 | The admission slot covers pane creation only, so a resume waiting for its pipe cannot starve a spawn behind it | `packages/ext/src/subagent-core.ts:1` |
 | S52 | An interrupted turn reports nothing: the settlement notice hangs off the push that carries the report, never off an aborted turn | `packages/ext/src/index.ts:1` |
 | S53 | `close` reclaims a worker that already finished — `terminal.kill` then `terminal.rm`, the app closes the pane, the session and ledger row stay | `packages/ext/src/plugins/subagent.ts:1` |
@@ -54,5 +54,5 @@ or at a file that no longer exists, fails the suite.
 | S69 | Nothing under the per-session root is the extension's to prune; the transcript and the ledger are the record | `packages/ext/src/index.ts:1` |
 | S70 | The three texts that describe `subagent` (tool description, manual, skill) cannot diverge: a test extracts the actions and parameters and fails on a gap | `packages/ext/test/skill-coverage.test.ts:1` |
 | S71 | A persisted checkout record is trusted only when its path and branch are readable; an occupied path fails naming both | `packages/ext/src/worktree.ts:1` |
-| S72 | At session start the extension closes the spaces whose checkout is gone, and only rows it wrote itself | `packages/ext/src/subagent-spawn.ts:1` |
+| S72 | The checkout's ledger row is what `resume` and `close` read, so a restart finds the worktree without listing or pattern-matching | `packages/ext/src/subagent-spawn.ts:1` |
 | S73 | The persisted registry keeps running workers and a bounded tail of settled ones; the ledger holds every row, which is why `list` and `resume` still answer for a pruned one | `packages/ext/src/subagent-core.ts:1` |

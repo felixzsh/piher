@@ -1,7 +1,11 @@
 /**
  * S71: a spawn may ask for a checkout by name, and piher owns none of it. This module plans that
  * checkout (`<home>/.herdr/worktrees/<repo>/<slug>`, branch `<name>`), keeps creation idempotent
- * and releases what piher created — the app space first, then the worktree, never with `--force`.
+ * and releases what piher created — the worktree, never with `--force`.
+ *
+ * The app is not involved. Its `Open worktree` button lists `git worktree list`, so a checkout
+ * created here appears there by itself; the path convention is shared with its mod so both agree on
+ * where a checkout of a given name lives, and that agreement is the whole integration.
  */
 import { basename, join } from 'node:path';
 
@@ -9,8 +13,6 @@ import { basename, join } from 'node:path';
 export interface WorktreeRecord {
   path: string;
   branch: string;
-  /** The app space piher asked for; null when `herdr-app` could not be reached. */
-  spaceId: string | null;
 }
 
 export interface WorktreePlan {
@@ -27,11 +29,7 @@ export function foldWorktree(raw: unknown): WorktreeRecord | undefined {
   const rec = raw as Record<string, unknown>;
   if (typeof rec.path !== 'string' || !rec.path) return undefined;
   if (typeof rec.branch !== 'string' || !rec.branch) return undefined;
-  return {
-    path: rec.path,
-    branch: rec.branch,
-    spaceId: typeof rec.spaceId === 'string' && rec.spaceId ? rec.spaceId : null,
-  };
+  return { path: rec.path, branch: rec.branch };
 }
 
 /** Everything outside `[A-Za-z0-9._-]` becomes `-`, and leading/trailing dashes go — the same rule
@@ -107,17 +105,7 @@ export interface CheckoutIo {
   exists(path: string): Promise<boolean>;
 }
 
-/** The app's spaces: best effort in both directions, so the UI never blocks the work (S71). */
-export interface SpaceIo {
-  create(name: string, folder: string): Promise<{ spaceId: string } | null>;
-  /** null on success, otherwise what failed — the checkout is removed either way. */
-  close(spaceId: string): Promise<string | null>;
-}
 
-export interface WorktreeIo {
-  checkout: CheckoutIo;
-  space: SpaceIo;
-}
 
 /* ── creation ───────────────────────────────────────────────────── */
 
@@ -174,7 +162,7 @@ export async function ensureCheckout(
 /* ── release ────────────────────────────────────────────────────── */
 
 export type ReleaseOutcome =
-  | { ok: true; removed: boolean; spaceError: string | null }
+  | { ok: true; removed: boolean }
   | { ok: false; text: string };
 
 /** Uncommitted files named in a refusal; enough to act on, never a whole `git status`. */
@@ -190,14 +178,16 @@ export function dirtyCheckoutText(record: Pick<WorktreeRecord, 'path' | 'branch'
   ].join(' ');
 }
 
-/** Close is terminal for the checkout: the space goes first, the worktree second, the branch never (S71). */
+/** Close is terminal for the checkout: the worktree goes, the branch never (S71). Nothing forces a
+ *  removal: a dirty checkout is refused, and the removal itself is `git worktree remove` without
+ *  `--force`. */
 export async function releaseCheckout(
-  io: WorktreeIo,
+  io: CheckoutIo,
   record: WorktreeRecord,
 ): Promise<ReleaseOutcome> {
-  const present = await io.checkout.exists(record.path);
+  const present = await io.exists(record.path);
   if (present) {
-    const dirty = await io.checkout.dirtyFiles(record.path).catch(() => null);
+    const dirty = await io.dirtyFiles(record.path).catch(() => null);
     if (dirty === null) {
       return {
         ok: false,
@@ -206,94 +196,27 @@ export async function releaseCheckout(
     }
     if (dirty.length > 0) return { ok: false, text: dirtyCheckoutText(record, dirty) };
   }
-  const spaceError = record.spaceId ? await io.space.close(record.spaceId) : null;
-  if (!present) return { ok: true, removed: false, spaceError };
+  if (!present) return { ok: true, removed: false };
   try {
-    await io.checkout.remove(record.path);
+    await io.remove(record.path);
   } catch (err) {
     return {
       ok: false,
       text: `Error: could not remove the worktree ${record.path} (branch ${record.branch} survived): ${message(err)}`,
     };
   }
-  return { ok: true, removed: true, spaceError };
-}
-
-/* ── reconciliation ─────────────────────────────────────────────── */
-
-/** What the sweep may read from a ledger row: piher's own record of a checkout, and nothing else. */
-export interface ReconcileRow {
-  taskId: string;
-  status: string;
-  worktree?: WorktreeRecord | null;
-}
-
-export type ReconcileOutcome<R extends ReconcileRow> =
-  | { kind: 'closed'; row: R; record: WorktreeRecord; spaceId: string; spaceError: string | null }
-  /** A space was asked for and its id never reached the ledger: there is nothing to name. */
-  | { kind: 'unnamed'; row: R; record: WorktreeRecord };
-
-/**
- * S72: close the spaces piher's own past left behind, because a space can outlive its checkout.
- *
- * The ledger row is the whole input, read one way only: the last row of a taskId is that task's
- * state (the ledger is append-only), a row without a `worktree` was not written by piher, and an
- * existing path is a checkout still in use. Nothing is listed, matched by pattern, or inferred from
- * a branch name, and only the exact recorded `spaceId` is closed — once per pass, at most.
- */
-export async function reconcileCheckouts<R extends ReconcileRow>(
-  io: Pick<WorktreeIo, 'checkout' | 'space'>,
-  rows: readonly R[],
-): Promise<Array<ReconcileOutcome<R>>> {
-  const latest = new Map<string, R>();
-  for (const row of rows) latest.set(row.taskId, row);
-  const closedSpaces = new Set<string>();
-  const out: Array<ReconcileOutcome<R>> = [];
-  for (const row of latest.values()) {
-    const record = row.worktree;
-    if (!record) continue;
-    if (await io.checkout.exists(record.path)) continue;
-    // No id, nothing to close. Only a row that was still running can be the crash between the two
-    // writes; a row piher closed out itself says the space is already gone.
-    if (!record.spaceId) {
-      if (row.status === 'running') out.push({ kind: 'unnamed', row, record });
-      continue;
-    }
-    if (closedSpaces.has(record.spaceId)) continue;
-    closedSpaces.add(record.spaceId);
-    const spaceId = record.spaceId;
-    out.push({ kind: 'closed', row, record, spaceId, spaceError: await io.space.close(spaceId) });
-  }
-  return out;
-}
-
-/** One line per finding, so a clean start stays silent and a real one is readable. */
-export function reconcileLines(outcomes: ReadonlyArray<ReconcileOutcome<ReconcileRow>>): string[] {
-  return outcomes.map((o) => {
-    if (o.kind === 'unnamed') {
-      return `Ledger: task ${o.row.taskId} recorded the worktree ${o.record.path} (branch ${o.record.branch})`
-        + ' without a space id, so a space it may have left cannot be named — check the app\'s spaces by hand.';
-    }
-    const space = o.spaceError
-      ? `space ${o.spaceId} was not closed (${o.spaceError})`
-      : `closed its space ${o.spaceId}`;
-    return `Ledger: the worktree ${o.record.path} of task ${o.row.taskId} is gone; ${space}.`;
-  });
+  return { ok: true, removed: true };
 }
 
 /* ── texts ──────────────────────────────────────────────────────── */
 
 export function checkoutAckLine(record: WorktreeRecord, outcome: 'created' | 'reused'): string {
-  const space = record.spaceId
-    ? `space ${record.spaceId}`
-    : 'no app space (herdr-app was unreachable; the checkout still works)';
   const how = outcome === 'reused' ? 'reusing the existing worktree' : 'created the worktree';
-  return `in worktree ${record.path} (branch ${record.branch}, ${how}, ${space})`;
+  return `in worktree ${record.path} (branch ${record.branch}, ${how}; open it with the app's Open worktree)`;
 }
 
-export function releasedCheckoutLine(record: WorktreeRecord, removed: boolean, spaceError: string | null): string {
+export function releasedCheckoutLine(record: WorktreeRecord, removed: boolean): string {
   const parts = [removed ? `worktree ${record.path} removed` : `worktree ${record.path} was already gone`];
-  if (record.spaceId) parts.push(spaceError ? `its space ${record.spaceId} was not closed (${spaceError})` : `space ${record.spaceId} closed`);
   parts.push(`branch ${record.branch} survives`);
   return parts.join('; ');
 }

@@ -13,7 +13,7 @@ import { childEnvironment, type CoreClientLike, type CoreEnv } from './core-clie
 import { delegationEnv } from './delegation-core.ts';
 import { bareSessionId } from './session-tail.ts';
 import { mainWorktreeRoot } from './storage-layout.ts';
-import { checkoutAckLine, ensureCheckout, planWorktree, releaseCheckout, type WorktreeIo, type WorktreeRecord } from './worktree.ts';
+import { checkoutAckLine, ensureCheckout, planWorktree, releaseCheckout, type CheckoutIo, type WorktreeRecord } from './worktree.ts';
 import { pipeNameCandidates, pipeNameFor, pipeRequest, pipeRequestTo } from './pipe-channel.ts';
 import { composeForRole } from './manifest-compose.ts';
 import type { Lifecycle } from './role-manifest.ts';
@@ -33,7 +33,6 @@ import {
   sleep,
   subRef,
   withAdmission,
-  withoutPlacement,
   type SubEntry,
   type WorktreeZone,
 } from './subagent-core.ts';
@@ -53,9 +52,8 @@ interface CheckoutRowBase {
 }
 
 /**
- * S72: the row is persisted *before* the app is asked for a space, with `spaceId: null`, and written
- * again once the id is known, so a crash in between leaves evidence instead of a ghost nobody can
- * name. `paneId` is empty on purpose: no pane exists yet, and this row's job is the checkout.
+ * S72: the row names the checkout a spawn created, so `resume` and `close` can find it after a
+ * restart. `paneId` is empty on purpose: no pane exists yet, and this row's job is the checkout.
  */
 function appendCheckoutRow(
   ledgerCwd: string,
@@ -357,10 +355,9 @@ export function createSpawner(h: SpawnerHost): Spawner {
   }
 
   /** Create the worker terminal in the planned tab. The app adopts it as an unfocused pane; a new
-   *  `herdr.tab` id makes the app create that tab, so no layout math is needed here. A `spaceId`
-   *  places it in that space instead (S71): no tab label, so the app opens a tab of its own there. */
+   *  `herdr.tab` id makes the app create that tab, so no layout math is needed here. */
   async function spawnPaneInTaskTab(
-    placement: { desiredTab?: string | null; description: string; zone?: WorktreeZone; spaceId?: string | null },
+    placement: { desiredTab?: string | null; description: string; zone?: WorktreeZone },
     cwd: string,
     envOver: Record<string, string>,
     argv: readonly string[],
@@ -371,9 +368,7 @@ export function createSpawner(h: SpawnerHost): Spawner {
       zone: placement.zone,
     });
     const placementLabels = await h.client.placementLabels();
-    const labels = placement.spaceId
-      ? { ...withoutPlacement(placementLabels), 'herdr.space': placement.spaceId }
-      : plan.tabId ? { ...placementLabels, 'herdr.tab': plan.tabId } : placementLabels;
+    const labels = plan.tabId ? { ...placementLabels, 'herdr.tab': plan.tabId } : placementLabels;
     const terminal = await h.client.run({
       argv: [...argv],
       cwd,
@@ -381,9 +376,7 @@ export function createSpawner(h: SpawnerHost): Spawner {
       labels,
       noNotify: true,
     });
-    return placement.spaceId
-      ? { tabId: '', paneId: terminal.id, tabName: '' }
-      : {
+    return {
         tabId: plan.tabId ?? placementLabels['herdr.tab'] ?? '',
         paneId: terminal.id,
         tabName: plan.tabName,
@@ -432,8 +425,8 @@ interface SpawnActionHost {
   /** A spawn whose pane never came up: the only report a failed start can make off the turn. */
   notifySpawnFailed: (content: string) => Promise<void>;
   git: GitIo;
-  /** S71: the checkout piher may create on request, and the app space that shows it. */
-  worktree: WorktreeIo;
+  /** S71: the checkout piher may create on request. The app is not involved. */
+  checkout: CheckoutIo;
   session: SessionIo;
   spawn: Spawner;
   poller: Poller;
@@ -509,14 +502,8 @@ export function createSpawnAction(h: SpawnActionHost) {
       const base = checkoutBase;
       if (!createdCheckout || !record || !base) return;
       void (async (): Promise<void> => {
-        const released = await releaseCheckout(h.worktree, record).catch(() => null);
-        // S72: close the row out as well, or the next start would report a checkout this spawn
-        // already removed. A space that would not close keeps its id, for that later attempt.
-        const ended = released !== null && released.ok && released.spaceError === null;
-        appendCheckoutRow(masterCwd, base, ended ? { ...record, spaceId: null } : record, {
-          status: 'closed',
-          via: 'spawn-failed',
-        });
+        await releaseCheckout(h.checkout, record).catch(() => null);
+        appendCheckoutRow(masterCwd, base, record, { status: 'closed', via: 'spawn-failed' });
       })();
     };
     if (worktreeParam) {
@@ -526,26 +513,16 @@ export function createSpawnAction(h: SpawnActionHost) {
       }
       const planned = planWorktree({ name: worktreeParam, repoRoot, home: homedir() });
       if (planned.kind === 'error') return toolError(planned.text);
-      const ensured = await ensureCheckout(h.worktree.checkout, { plan: planned.plan, cwd: masterCwd });
+      const ensured = await ensureCheckout(h.checkout, { plan: planned.plan, cwd: masterCwd });
       if (ensured.kind === 'error') return toolError(ensured.text);
       createdCheckout = ensured.kind === 'created';
       worktreeOutcome = ensured.kind;
       cwd = planned.plan.path;
       checkoutBase = { taskId, kind, path: planned.plan.path, description: spec.description };
-      // S72: the row lands first, naming the checkout with no space yet. A crash between this write
-      // and the app's answer then leaves a row with `spaceId: null` — evidence, not a ghost.
-      const named = { path: planned.plan.path, branch: planned.plan.branch, spaceId: null };
-      appendCheckoutRow(masterCwd, checkoutBase, named, { status: 'running', via: 'spawn-worktree' });
-      // Best effort: a window that does not answer costs the space, never the checkout.
-      const space = await h.worktree.space.create(planned.plan.branch, planned.plan.path);
-      worktreeRecord = { path: planned.plan.path, branch: planned.plan.branch, spaceId: space?.spaceId ?? null };
-      // The id is recorded the moment it exists, so no later failure can strand a space nobody names.
-      if (worktreeRecord.spaceId) {
-        appendCheckoutRow(masterCwd, checkoutBase, worktreeRecord, {
-          status: 'running',
-          via: 'spawn-space',
-        });
-      }
+      worktreeRecord = { path: planned.plan.path, branch: planned.plan.branch };
+      // S72: the ledger row names the checkout, so `resume` and `close` find it after a restart. The
+      // app opens it by listing worktrees, so there is nothing else to record.
+      appendCheckoutRow(masterCwd, checkoutBase, worktreeRecord, { status: 'running', via: 'spawn-worktree' });
     } else if (cwdParam) {
       cwd = pathResolve(masterCwd, cwdParam);
       try {
@@ -569,7 +546,7 @@ export function createSpawnAction(h: SpawnActionHost) {
       // The slot covers pane creation only: the readiness wait and the prompt injection run off this
       // call's turn (S50), so they must never hold a slot a spawn would have to queue behind.
       const spawned = await withAdmission(h.subSemaphore, () => spawnPaneInTaskTab(
-        { desiredTab: tab, description: spec.description, zone, spaceId: worktreeRecord?.spaceId ?? null },
+        { desiredTab: tab, description: spec.description, zone },
         cwd,
         // Status comes ONLY from pi's native OSC 7501 reporter; piher never writes it.
         { PIHER_SUBAGENT: '1', ...roleManifestEnv, ...delegationEnvPatch },

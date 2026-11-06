@@ -47,7 +47,8 @@ duplicate-completion suppression is deliberately absent, so that is your bug, no
 `description` labels the pane and the ledger row, so make it the task in a few words. `cwd`
 must already exist — the checkout is yours. `worktree` is the other way round: give a name,
 never a path, and piher makes `~/.herdr/worktrees/<repo>/<slug>` on branch `<name>` from your
-HEAD and asks the app for a space named after it, so you write no `git worktree add`. The slug
+HEAD, so you write no `git worktree add`. The person opens it with the app's `Open worktree`
+button, which lists every worktree; piher asks the app for nothing. The slug
 is the name with anything outside `[A-Za-z0-9._-]` turned into `-`. The two parameters are
 mutually exclusive. `role` picks a profile (unknown names are display labels only), and
 `allowed_tools` only *adds* tools on top of the role baseline; a role's deny rules still win.
@@ -95,8 +96,7 @@ the correction.
 **`close`** reclaims a worker that already finished: pane and tab go, session and ledger row
 stay. A worker that is still running is refused with a pointer at `interrupt` — a task must
 not disappear without a report. Close is housekeeping, never how you kill work. When the
-spawn asked for a `worktree`, close ends that too: the space goes, the worktree is removed,
-the branch survives. A dirty worktree is refused, naming the files, so commit first.
+spawn asked for a `worktree`, close ends that too: the worktree is removed, the branch survives. A dirty worktree is refused, naming the files, so commit first.
 
 **`resume`** takes `taskId` and revives a finished worker from the ledger in a new pane and
 its own session; a follow-up then goes with `send`. The ledger is append-only JSONL at

@@ -1,19 +1,18 @@
 /**
- * Adapters for the checkout piher may create (S71): `git worktree` plumbing, and the `herdr-app` space
- * that shows it. Both are injectable so the spawn paths stay testable without a real window.
+ * Adapter for the checkout piher may create (S71): `git worktree` plumbing, injectable so the spawn
+ * paths stay testable without a real repository.
+ *
+ * There is no app adapter. The app's `Open worktree` lists `git worktree list`, so a checkout made
+ * here shows up there by itself, and a space is the person's to open — piher never talks to the app.
  */
 import { execFile as nodeExecFile } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { runtimePolicy } from './runtime-policy.ts';
-import type { CheckoutIo, SpaceIo, WorktreeIo } from './worktree.ts';
+import type { CheckoutIo } from './worktree.ts';
 
 const execFile = promisify(nodeExecFile);
 const MAX_BUFFER = 8 * 1024 * 1024;
-/** The app is a UI: a window that does not answer must not hold a spawn for long. */
-const APP_TIMEOUT_MS = 5000;
 
 type Exec = (
   file: string,
@@ -117,111 +116,6 @@ export function parsePorcelain(out: string): Map<string, string | null> {
   return trees;
 }
 
-/** What the app said, or why it never spoke: the body is the answer even when the exit is non-zero. */
-type AppReply =
-  | { kind: 'reply'; body: Record<string, unknown> }
-  /** No body at all: `reason` names what stopped the app, so the report says what happened. */
-  | { kind: 'silent'; reason: string };
-
-/** A JSON object, or null when the text is empty or not one: the app's answers are all objects. */
-function jsonObject(text: unknown): Record<string, unknown> | null {
-  if (typeof text !== 'string') return null;
-  const trimmed = text.trim();
-  if (!trimmed) return null;
-  try {
-    const parsed: unknown = JSON.parse(trimmed);
-    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-/** `herdr-app` answers a close for a space that is already gone with exit 1 and this on stdout. */
-const GONE_SPACE = /^no space\b/i;
-
-/** Silence has three causes; naming the one that happened is what makes a report actionable (S72). */
-function silenceReason(err: unknown, timeoutMs: number): string {
-  const e = (err ?? {}) as { code?: unknown; killed?: unknown; signal?: unknown; message?: unknown };
-  const message = typeof e.message === 'string' ? e.message : String(err);
-  if (e.code === 'ENOENT' || /ENOENT/.test(message)) return 'is not installed — no `herdr-app` on PATH';
-  if (e.killed === true || (typeof e.signal === 'string' && e.signal !== '')) {
-    return `did not answer within ${timeoutMs} ms`;
-  }
-  if (typeof e.code === 'number') return `exited ${e.code} without answering`;
-  return `failed before answering: ${message}`;
-}
-
-/**
- * The app's spaces. Nothing here may throw: an unreachable window costs a spawn its space, and a
- * close its space, but never the work (S71).
- */
-export class HerdrAppSpaceIo implements SpaceIo {
-  private readonly bin: string;
-  private readonly timeoutMs: number;
-  private readonly exec: Exec;
-  private readonly home: string;
-
-  constructor(bin = 'herdr-app', timeoutMs = APP_TIMEOUT_MS, exec: Exec = execFile as unknown as Exec, home = homedir()) {
-    this.bin = bin;
-    this.timeoutMs = timeoutMs;
-    this.exec = exec;
-    this.home = home;
-  }
-
-  private async call(args: readonly string[]): Promise<AppReply> {
-    try {
-      const { stdout } = await this.exec(this.bin, args, {
-        timeout: this.timeoutMs,
-        encoding: 'utf8',
-        maxBuffer: MAX_BUFFER,
-      });
-      return { kind: 'reply', body: jsonObject(stdout) ?? {} };
-    } catch (err) {
-      // A non-zero exit is not silence: `execFile` rejects but still carries what was written, and
-      // an answer piher must read (`no space …`) comes exactly that way.
-      const body = jsonObject((err as { stdout?: unknown } | null)?.stdout);
-      if (body !== null) return { kind: 'reply', body };
-      return { kind: 'silent', reason: silenceReason(err, this.timeoutMs) };
-    }
-  }
-
-  /** `~/.herdr/space-ids/.active` names the space the person was looking at, when anything wrote it;
-   *  there is no `space.list`, and a missing file means there is nowhere to return to. */
-  private activeSpace(): string | null {
-    try {
-      const id = readFileSync(join(this.home, '.herdr', 'space-ids', '.active'), 'utf8').trim();
-      return id || null;
-    } catch {
-      return null;
-    }
-  }
-
-  async create(name: string, folder: string): Promise<{ spaceId: string } | null> {
-    const before = this.activeSpace();
-    const reply = await this.call(['do', 'space.new', '--folder', folder, '--name', name]);
-    // `space.new` activates the space it makes, and the person did not ask to be moved: put them back.
-    const raw = reply.kind === 'reply' ? reply.body['space'] : undefined;
-    const spaceId = typeof raw === 'string' && raw ? raw : null;
-    if (reply.kind === 'reply' && before && before !== spaceId) {
-      await this.call(['do', 'space.select', '--id', before]);
-    }
-    return spaceId ? { spaceId } : null;
-  }
-
-  async close(spaceId: string): Promise<string | null> {
-    const reply = await this.call(['do', 'space.close', '--id', spaceId, '--confirmed', 'true']);
-    if (reply.kind === 'silent') return `herdr-app ${reply.reason}`;
-    const error = reply.body['error'];
-    if (typeof error !== 'string' || !error) return null;
-    // Nothing left to close is a success, not an alarm: read as a failure, a space that is already
-    // gone would be re-reported by every start, forever.
-    if (GONE_SPACE.test(error.trim())) return null;
-    return error;
-  }
-}
-
-export function createWorktreeIo(): WorktreeIo {
-  return { checkout: new NodeCheckoutIo(), space: new HerdrAppSpaceIo() };
+export function createCheckoutIo(): CheckoutIo {
+  return new NodeCheckoutIo();
 }

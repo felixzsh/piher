@@ -50,16 +50,13 @@ import { bareSessionId, resolveSessionFileValue } from '../session-tail.ts';
 import { mainWorktreeRoot } from '../storage-layout.ts';
 import { settlementCard, type SettlementCard } from '../settlement-card.ts';
 import { DELEGATION_ENV, type DelegationContext } from '../delegation-core.ts';
-import { swallow } from '../swallow.ts';
 import { createGitIo, createSpawnAction, createSpawner } from '../subagent-spawn.ts';
-import { createWorktreeIo } from '../worktree-io.ts';
+import { createCheckoutIo } from '../worktree-io.ts';
 import {
   missingCheckoutText,
-  reconcileCheckouts,
-  reconcileLines,
   releaseCheckout,
   releasedCheckoutLine,
-  type WorktreeIo,
+  type CheckoutIo,
 } from '../worktree.ts';
 import { createPoller } from '../subagent-poller.ts';
 import { createGcController, createSubagentRegistry, retirePane } from '../subagent-gc.ts';
@@ -85,7 +82,7 @@ export interface SubagentDeps {
   /** Pane-owning plugins (background jobs) are exempt from subagent panes collection. */
   terminalState: PaneStateSlot;
   /** Test seam for the checkout piher may create and the app space that shows it (S71). */
-  worktreeIo?: WorktreeIo;
+  checkoutIo?: CheckoutIo;
 }
 
 /** Sent with every request: what a call needs. Details live in SUBAGENT_MANUAL (`action: "help"`). */
@@ -196,20 +193,17 @@ export default function subagentPlugin(ctx: Context): void {
   const registry = createSubagentRegistry({ pi, client, subs, writeHistory });
   const { persist: persistSubs } = registry;
   const git = createGitIo();
-  const worktree = d.worktreeIo ?? createWorktreeIo();
+  const checkout = d.checkoutIo ?? createCheckoutIo();
 
   /** S54/S71: a role-declared one-shot reclaims its pane and the checkout its spawn created. */
   function reclaim(entry: SubEntry): void {
     void (async () => {
       if (entry.worktree) {
-        // S72: the ledger row outlives the checkout, so record that the space went with it — otherwise
-        // the next start would report closing a space this reclaim already closed.
         const record = entry.worktree;
         const ledgerCwd = mainWorktreeRoot(entry.cwd) ?? entry.cwd;
-        const released = await releaseCheckout(worktree, record).catch(() => null);
+        const released = await releaseCheckout(checkout, record).catch(() => null);
         if (released !== null && released.ok) {
-          const spaceId = released.spaceError ? record.spaceId : null;
-          writeHistory(entry, { worktree: { ...record, spaceId } }, 'one-shot-reclaim', ledgerCwd);
+          writeHistory(entry, { worktree: record }, 'one-shot-reclaim', ledgerCwd);
         }
       }
       await retirePane(client, entry.paneId);
@@ -342,45 +336,10 @@ export default function subagentPlugin(ctx: Context): void {
     }
   }
 
-  /**
-   * S72: a master session closes the spaces its own past left behind. The ledger row is the whole
-   * input, so nothing is listed, pattern-matched or read out of the app's internal state, and only
-   * the exact recorded `spaceId` is closed. A start with nothing to do says nothing; an app that
-   * cannot be reached is reported, never raised (S43).
-   */
-  async function reconcilePast(eventCtx: unknown): Promise<void> {
-    // Without the session's cwd there is no way to know which repository's ledger is meant, and
-    // guessing would sweep a checkout this master is not running in.
-    const cwd = (eventCtx as { cwd?: string } | null)?.cwd;
-    if (!cwd) return;
-    try {
-      const outcomes = await reconcileCheckouts(worktree, readLedger(cwd));
-      if (outcomes.length === 0) return;
-      for (const o of outcomes) {
-        // A space that was closed is gone for good: record it in the shape `close` writes, so the
-        // next start finds nothing to do. One that would not close keeps its id, for that attempt.
-        if (o.kind !== 'closed' || o.spaceError !== null) continue;
-        appendLedger(cwd, {
-          ...o.row,
-          status: 'closed',
-          closedAt: Date.now(),
-          worktree: { ...o.record, spaceId: null },
-          via: 'reconcile',
-        });
-      }
-      try {
-        await injectNotice(reconcileLines(outcomes).join('\n'));
-      } catch { /* a missed notice must not fail the start */ }
-    } catch (err) {
-      swallow('subagent.reconcile', err);
-    }
-  }
-
   scoped.on('session_start', async (_event: unknown, eventCtx: unknown) => {
     registry.rebuild(eventCtx);
     await registry.sweepZombieRunning();
     await recoverRunningPollers('session_start');
-    await reconcilePast(eventCtx);
   });
   scoped.on('session_tree', async (_event: unknown, eventCtx: unknown) => {
     registry.rebuild(eventCtx);
@@ -437,7 +396,6 @@ export default function subagentPlugin(ctx: Context): void {
       {
         desiredTab: entry.tabName || latest.tabName || null,
         description: entry.description,
-        spaceId: (latest.worktree ?? entry.worktree)?.spaceId ?? null,
       },
       entry.cwd,
       {
@@ -734,17 +692,14 @@ export default function subagentPlugin(ctx: Context): void {
     }
     if (!client.available) return toolError('requires a herdr-core terminal.');
     // S71: close is terminal for what piher created. The checkout goes first, because a dirty one is
-    // a refusal that must leave the worker reachable and the space as it was. The ledger row is
-    // written through the repository root, since the checkout it records is about to disappear.
+    // a refusal that must leave the worker reachable. The ledger row is written through the
+    // repository root, since the checkout it records is about to disappear.
     const ledgerCwd = mainWorktreeRoot(entry.cwd) ?? entry.cwd;
     let checkoutLine = '';
     if (entry.worktree) {
-      const released = await releaseCheckout(worktree, entry.worktree);
+      const released = await releaseCheckout(checkout, entry.worktree);
       if (!released.ok) return toolError(released.text);
-      checkoutLine = ` ${releasedCheckoutLine(entry.worktree, released.removed, released.spaceError)};`;
-      // A space that was closed is gone for good; one that could not be closed keeps its id so a
-      // revived generation can still end it.
-      entry.worktree = { ...entry.worktree, spaceId: released.spaceError ? entry.worktree.spaceId : null };
+      checkoutLine = ` ${releasedCheckoutLine(entry.worktree, released.removed)};`;
     }
     await retirePane(client, entry.paneId);
     entry.status = 'closed';
@@ -830,7 +785,7 @@ export default function subagentPlugin(ctx: Context): void {
     boots,
     notifySpawnFailed: injectNotice,
     git,
-    worktree,
+    checkout,
     session,
     spawn,
     poller,
