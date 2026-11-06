@@ -53,8 +53,8 @@ test('a job id is short and pasteable', () => {
   assert.equal(nextJobId(42), 'job-42');
   // A reload restarts the counter, so the instance tag is what keeps `job-1` from naming a
   // different job in the same transcript.
-  assert.equal(nextJobId(1, 'k3'), 'job-1k3');
-  assert.match(jobCoreName(nextJobId(1, 'k3'), 'build release'), /^job-1k3-build-release$/);
+  assert.equal(nextJobId(1, 'k3'), 'job-1xk3', 'the tag never reads as part of the counter');
+  assert.match(jobCoreName(nextJobId(1, 'k3'), 'build release'), /^job-1xk3-build-release$/);
 });
 
 test('the pane name leads with the job id and stays inside core limits', () => {
@@ -264,13 +264,13 @@ test('adoption picks up a live job with its remaining check-in budget', () => {
   const now = 100_000;
   const meta = encodeJobMeta({ name: 'tests', log: '/tmp/j.log', started: now - 40_000, timeout: 300, command: 'npm test' });
   const plans = planAdoption([{
-    id: 't9', cwd: '/repo', labels: { [JOB_LABEL_KEY]: 'job-1k3', [JOB_META_LABEL]: meta },
+    id: 't9', cwd: '/repo', labels: { [JOB_LABEL_KEY]: 'job-1xk3', [JOB_META_LABEL]: meta },
     state: 'live', exitCode: null,
   }], new Set(), now);
   assert.equal(plans.length, 1);
   const plan = plans[0]!;
   assert.equal(plan.finished, false);
-  assert.equal(plan.job.id, 'job-1k3');
+  assert.equal(plan.job.id, 'job-1xk3');
   assert.equal(plan.job.label, 'tests');
   assert.equal(plan.job.paneId, 't9');
   assert.equal(plan.job.status, 'running');

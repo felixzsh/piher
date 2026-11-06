@@ -44,21 +44,21 @@ function jobTerminal(over: { id: string; jobId: string; started?: number; state?
 }
 
 test('mount: a job that exited during the reload is reported with its own exit code', withCleanup(async () => {
-  const terminals = [jobTerminal({ id: 't9', jobId: 'job-1k3', state: 'finished', exitCode: 101 })];
+  const terminals = [jobTerminal({ id: 't9', jobId: 'job-1xk3', state: 'finished', exitCode: 101 })];
   const { pi, root } = await mount({ listTerminals: async () => terminals });
   try {
     await fire(pi, 'session_start', {}, {});
     const notice = pi.sent.find((m) => m.msg.customType === JOB_NOTICE_CUSTOM_TYPE);
     assert.ok(notice, 'the owed exit notice is delivered on mount');
     assert.match(String(notice.msg.content), /exited with code 101/);
-    assert.equal((notice.msg.details as { jobId?: string }).jobId, 'job-1k3');
+    assert.equal((notice.msg.details as { jobId?: string }).jobId, 'job-1xk3');
   } finally {
     await root.fiber.dispose();
   }
 }));
 
 test('mount: a live job is adopted, listed, and keeps its watch', withCleanup(async () => {
-  const terminals = [jobTerminal({ id: 't9', jobId: 'job-2k3' })];
+  const terminals = [jobTerminal({ id: 't9', jobId: 'job-2xk3' })];
   const watched: string[] = [];
   const { pi, root } = await mount({
     listTerminals: async () => terminals,
@@ -79,7 +79,7 @@ test('mount: a live job is adopted, listed, and keeps its watch', withCleanup(as
     const list = await pi.tools.get('bg_job')!.execute!('tc', { action: 'list' }, undefined, undefined, {}) as {
       content: Array<{ text: string }>;
     };
-    assert.match(list.content[0]!.text, /job-2k3 · running · build/);
+    assert.match(list.content[0]!.text, /job-2xk3 · running · build/);
     assert.deepEqual(watched, ['t9'], 'the adopted job is watched through its pane');
     assert.equal(pi.sent.length, 0, 'a running job says nothing on mount');
   } finally {
@@ -88,7 +88,7 @@ test('mount: a live job is adopted, listed, and keeps its watch', withCleanup(as
 }));
 
 test('mount: adopting twice cannot double-count or re-report a job', withCleanup(async () => {
-  const terminals = [jobTerminal({ id: 't9', jobId: 'job-3k3', state: 'finished', exitCode: 0 })];
+  const terminals = [jobTerminal({ id: 't9', jobId: 'job-3xk3', state: 'finished', exitCode: 0 })];
   const { pi, root } = await mount({ listTerminals: async () => terminals });
   try {
     await fire(pi, 'session_start', {}, {});

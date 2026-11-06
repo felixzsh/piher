@@ -56,9 +56,10 @@ export interface JobRecord {
  * `job-1`, `job-2`, …: short enough to paste. `tag` makes an id unique across reloads, which matters
  * because the plugin's registry is in memory: after an HMR reload the counter starts again, and a
  * `job-1` that names a different job in the same transcript is a silently wrong answer to `status`.
+ * The `x` separator keeps the tag from reading as part of the counter: `job-1x39`, never `job-139`.
  */
 export function nextJobId(sequence: number, tag = ''): string {
-  return `job-${sequence}${tag}`;
+  return tag ? `job-${sequence}x${tag}` : `job-${sequence}`;
 }
 
 /**
