@@ -506,7 +506,7 @@ test('subagent plugin: list answers for a task the registry already pruned, from
     try {
       const text = (await runSubagent(pi, { action: 'list' }, repo)).content[0]!.text;
       assert.doesNotMatch(text, /pruned worker/, 'a closed task was a decision: it is not listed');
-      assert.match(text, /w1:p8 \[idle\] \(task, settled; action send revives\) settled worker/);
+      assert.match(text, /w1:p8 \[idle\] \(task · persistent, settled; action send revives\) settled worker/);
       assert.match(text, /w1:p4 \[running[^\n]*live worker/);
       assert.doesNotMatch(text, /stale ledger copy/, 'a row the registry still holds is not repeated from the ledger');
       assert.equal(text.split('\n').filter((line) => line.includes('live worker')).length, 1);
@@ -626,8 +626,8 @@ test('subagent plugin: list shows every row with its live state', async () => {
   });
   try {
     const lines = (await runSubagent(pi, { action: 'list' })).content[0]!.text.split('\n');
-    assert.equal(lines[0], 'p-1 [running working] (task) Worker 1');
-    assert.equal(lines[1], 'p-2 [running working] (task) Worker 2');
+    assert.equal(lines[0], 'p-1 [running working] (task · persistent) Worker 1');
+    assert.equal(lines[1], 'p-2 [running working] (task · persistent) Worker 2');
   } finally {
     await root.fiber.dispose();
   }

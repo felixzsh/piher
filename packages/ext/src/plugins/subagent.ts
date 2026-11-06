@@ -808,7 +808,9 @@ export default function subagentPlugin(ctx: Context): void {
     for (const sub of byTask.values()) {
       const tabTag = sub.tabName ? ` [tab: ${sub.tabName}]` : '';
       if (sub.status === 'consumed' || sub.status === 'settled') {
-        lines.push(`${subRef(sub)} [idle] (${sub.kind}, settled; action send revives)${tabTag} ${sub.description}`);
+        const life = sub.lifecycle === 'one-shot' ? 'one-shot' : 'persistent';
+        const advice = sub.lifecycle === 'one-shot' ? 'consumed at its next report' : 'action send revives';
+        lines.push(`${subRef(sub)} [idle] (${sub.kind} · ${life}, settled; ${advice})${tabTag} ${sub.description}`);
         continue;
       }
       const state = 'running';
@@ -820,7 +822,8 @@ export default function subagentPlugin(ctx: Context): void {
         const question = await readAskFlag(sub.paneId);
         gateTag = question ? ` — AWAITING HUMAN: "${question}"` : ' — AWAITING HUMAN decision';
       }
-      lines.push(`${subRef(sub)} [${state}${statusTag}${activityTag}${gateTag}] (${sub.kind})${tabTag} ${sub.description}`);
+      const life = sub.lifecycle === 'one-shot' ? 'one-shot' : 'persistent';
+      lines.push(`${subRef(sub)} [${state}${statusTag}${activityTag}${gateTag}] (${sub.kind} · ${life})${tabTag} ${sub.description}`);
     }
     return { content: [{ type: 'text', text: lines.join('\n') }], details: {} };
   }

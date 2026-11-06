@@ -179,7 +179,7 @@ test('spawn action: an acknowledgement now, the prompt later, the report as a no
       const result = await runSubagent(env.pi, { description: 'probe', prompt: PROMPT }, env.cwd);
       const elapsed = Date.now() - started;
       const text = result.content[0]!.text;
-      assert.match(text, /^started subagent [a-z0-9-]+@p2 \(task [0-9a-f-]+\)/);
+      assert.match(text, /^started subagent [a-z0-9-]+@p2 \(task [0-9a-f-]+, persistent — stays until you close it\)/);
       assert.match(text, /settlement notice/);
       assert.doesNotMatch(text, /REPORT:/, 'the acknowledgement is not the report');
       // The child takes ≥2s to answer here (readiness ping + prompt): a blocking spawn would show it.

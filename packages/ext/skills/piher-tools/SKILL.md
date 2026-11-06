@@ -52,6 +52,11 @@ app's worktree button would: piher labels the terminal and the app creates the s
 is the name with anything outside `[A-Za-z0-9._-]` turned into `-`. The two parameters are
 mutually exclusive. `role` picks a profile (unknown names are display labels only), and
 `allowed_tools` only *adds* tools on top of the role baseline; a role's deny rules still win.
+`lifecycle` is the role's, never a per-spawn choice: `one-shot` reports once and exits (its row is
+consumed with the verdict), and a role that omits it is `persistent` — it stays until you `close` it.
+The spawn acknowledgement and `list` both say which one you got, so read it before planning a
+follow-up.
+
 A worker has no pane of its own: it appears under you in the app's agents view, and `tab` is the
 only way to ask for a real tab when a person wants to watch it in the main layout.
 

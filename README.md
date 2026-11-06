@@ -78,7 +78,9 @@ the checkout stays, because merging is the master's decision. Closing a space is
 needs `herdr-app`, and it is best effort: an unreachable window leaves an empty space, never lost work. `cwd` is the other way round: a checkout the caller already has stays the caller's
 to remove.
 
-A role that declares `lifecycle: "one-shot"` is reclaimed automatically once its verdict is consumed,
+A role's `lifecycle` decides how long its worker lives — `one-shot` reports once and exits,
+`persistent` (the default) stays until the master closes it — and the spawn acknowledgement says
+which one was launched. A role that declares `lifecycle: "one-shot"` is reclaimed once its verdict is consumed,
 and leaves `list` with it: a one-shot is spent when its result arrives. `close` is the same decision
 for a persistent worker — after it, the worker is gone from `list` and cannot be resumed.
 

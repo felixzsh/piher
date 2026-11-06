@@ -341,7 +341,7 @@ test('spawn worktree: one name makes the checkout, and says where it is', async 
     const result = await runSubagent(h.pi, { description: 'probe run', prompt: PROMPT, worktree: 'probe' }, h.repo);
     const text = result.content[0]!.text;
     const path = checkoutPath(h, 'probe');
-    assert.match(text, /^started subagent [a-z0-9-]+@p2 \(task [0-9a-f-]+\) in worktree /);
+    assert.match(text, /^started subagent [a-z0-9-]+@p2 \(task [0-9a-f-]+, persistent — stays until you close it\) in worktree /);
     assert.ok(text.includes(path), `the reply names the checkout: ${text}`);
     assert.match(text, /branch probe, created the worktree; open it with the app's Open worktree/);
     assert.equal(result.details?.worktree !== undefined, true, 'the answer carries the record');
