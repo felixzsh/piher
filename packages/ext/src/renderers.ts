@@ -6,7 +6,7 @@
 import { SUBS_CUSTOM_TYPE, type SubsRegistry } from './subagent-core.ts';
 import { DELEGATION_CUSTOM_TYPE } from './delegation-core.ts';
 import { SETTLEMENT_CUSTOM_TYPE, formatElapsed, type SettlementCard } from './settlement-card.ts';
-import { JOB_NOTICE_CUSTOM_TYPE, formatDuration } from './background-core.ts';
+import { JOB_NOTICE_CUSTOM_TYPE, formatDuration } from './bg-job-core.ts';
 
 // Width handling lives in ansi-text.ts so the transcript cards need no pi-tui import.
 import { truncateStyled } from './ansi-text.ts';
@@ -148,7 +148,7 @@ function jobNoticeLines(message: unknown, theme: RenderTheme, expanded: boolean)
   const elapsed = typeof details.durationMs === 'number' && details.durationMs >= 0
     ? ` · ${formatDuration(details.durationMs)}`
     : '';
-  const head = `${icon} ${theme.fg('accent', theme.bold('bg-job'))} ${theme.bold(id)}${name} ${theme.fg('dim', `· ${outcome}${elapsed}`)}`;
+  const head = `${icon} ${theme.fg('accent', theme.bold('bg_job'))} ${theme.bold(id)}${name} ${theme.fg('dim', `· ${outcome}${elapsed}`)}`;
   const body = content.split('\n').slice(1).filter((line) => line.trim() !== '');
   if (body.length === 0) return [head];
   if (expanded) return [head, ...body.map((line) => theme.fg('dim', `  ${line}`))];

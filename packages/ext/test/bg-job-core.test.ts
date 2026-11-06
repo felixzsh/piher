@@ -1,4 +1,4 @@
-/** background-core: the command plan, names, log slices and the two notices a job can produce. */
+/** bg-job-core: the command plan, names, log slices and the two notices a job can produce. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -22,7 +22,7 @@ import {
   stripOutput,
   tailLines,
   type JobRecord,
-} from '../src/background-core.ts';
+} from '../src/bg-job-core.ts';
 
 function job(overrides: Partial<JobRecord> = {}): JobRecord {
   return {

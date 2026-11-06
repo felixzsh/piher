@@ -1,5 +1,5 @@
 /**
- * `bg-job`: one shell command as its own herdr terminal, reported once when it exits.
+ * `bg_job`: one shell command as its own herdr terminal, reported once when it exits.
  *
  * The execution model is a *program*, not a typed shell line: `terminal.run` starts an argv, so core
  * reports the child's `finished` state and its exit code. Nothing is typed into a shell, no marker is
@@ -44,7 +44,7 @@ import {
   tailLines,
   type JobRecord,
   type JobStatus,
-} from '../background-core.ts';
+} from '../bg-job-core.ts';
 
 /** Panes a job owns; the index GC must never reclaim a running job's terminal. */
 export interface PaneStateSlot {
@@ -250,13 +250,13 @@ export default function bgJobPlugin(ctx: Context): void {
 
   async function executeStart(params: ToolParams, ctx: unknown) {
     if (!client.available || !env) {
-      return fail('bg-job requires a herdr-core terminal (HC_TERMINAL_SOCKET/HC_TERMINAL_ID)');
+      return fail('bg_job requires a herdr-core terminal (HC_TERMINAL_SOCKET/HC_TERMINAL_ID)');
     }
     const command = typeof params?.command === 'string' ? params.command.trim() : '';
     if (command === '') return fail('command is required: the shell command to run in the background');
     if (runningCount() >= MAX_JOBS) {
       return fail(`${MAX_JOBS} background jobs are already running in this session; `
-        + 'finish or stop one with bg-job {action: "stop", job_id: "..."} first');
+        + 'finish or stop one with bg_job {action: "stop", job_id: "..."} first');
     }
     const cwd = typeof params?.cwd === 'string' && params.cwd
       ? params.cwd
@@ -396,7 +396,7 @@ export default function bgJobPlugin(ctx: Context): void {
   }
 
   scoped.registerTool({
-    name: 'bg-job',
+    name: 'bg_job',
     label: 'Background job',
     description: [
       'Run one shell command in the background as its own Herdr terminal and be told once when it exits.',
@@ -406,12 +406,12 @@ export default function bgJobPlugin(ctx: Context): void {
       'Actions: start (default), status, log, stop, list.',
       'The command runs under bash with pipefail, so the exit code is the pipeline\'s last failing command.',
     ].join(' '),
-    promptSnippet: 'bg-job: run a command in the background and be told once when it exits (exit code, last lines, log).',
+    promptSnippet: 'bg_job: run a command in the background and be told once when it exits (exit code, last lines, log).',
     promptGuidelines: [
-      'Prefer bg-job over bash for anything slow or of unknown duration (builds, test suites, CI, installs, deploys, servers, migrations); keep bash for short commands that finish in seconds.',
+      'Prefer bg_job over bash for anything slow or of unknown duration (builds, test suites, CI, installs, deploys, servers, migrations); keep bash for short commands that finish in seconds.',
       'After start, continue other work or end the turn: never poll status or log to wait for the end.',
       'When a check-in arrives the job is still running: look once with log, then keep waiting or stop it — never re-send the command.',
-      'Use bash for anything interactive: bg-job has no way to answer a prompt, and a command that asks for input just hangs.',
+      'Use bash for anything interactive: bg_job has no way to answer a prompt, and a command that asks for input just hangs.',
     ],
     parameters: Type.Object({
       action: Type.Optional(Type.Union(BG_JOB_ACTIONS.map((name) => Type.Literal(name)), {

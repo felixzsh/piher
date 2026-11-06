@@ -8,7 +8,7 @@ import {
 import { SUBS_CUSTOM_TYPE } from '../src/subagent-core.ts';
 import { DELEGATION_CUSTOM_TYPE } from '../src/delegation-core.ts';
 import { SETTLEMENT_CUSTOM_TYPE } from '../src/settlement-card.ts';
-import { JOB_NOTICE_CUSTOM_TYPE } from '../src/background-core.ts';
+import { JOB_NOTICE_CUSTOM_TYPE } from '../src/bg-job-core.ts';
 
 /** Plain theme: styling is identity, so expectations read as the raw text. */
 const plain: RenderTheme = { fg: (_c, t) => t, bold: (t) => t };

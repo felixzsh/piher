@@ -13,7 +13,7 @@ import extension from '../../src/index.ts';
 import { TempHome, fakePi, fire, withCleanup, type CleanupContext, type FakePi } from '../test-utils.ts';
 
 /** The whole tool surface piher registers: the delegation mechanics and nothing else. */
-const PIHER_TOOLS = ['subagent', 'bg-job'];
+const PIHER_TOOLS = ['subagent', 'bg_job'];
 
 /**
  * The registered set: the delegation pair and nothing else (S10).
@@ -57,7 +57,7 @@ async function withMaster(
   }
 }
 
-test('tool scope: piher registers exactly subagent and bg-job', withCleanup(async (cleanup) => {
+test('tool scope: piher registers exactly subagent and bg_job', withCleanup(async (cleanup) => {
   await withMaster(cleanup, 't-tool-scope-set', async (pi) => {
     // Exact set on purpose: any name outside it is surface growth, and this assertion is what
     // fails on the change that adds one (S10).

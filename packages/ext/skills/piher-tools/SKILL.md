@@ -13,7 +13,7 @@ license: MIT
 
 # piher tools
 
-piher registers exactly two tools, `subagent` and `bg-job`. Their schemas carry every
+piher registers exactly two tools, `subagent` and `bg_job`. Their schemas carry every
 parameter and `action: "help"` carries the reference; this file carries what a schema
 cannot: when to reach for them, and what a call must contain to be worth making. Everything
 else a terminal can do belongs to `hc` itself, not to a piher tool.
@@ -116,7 +116,7 @@ stays yours: you made it, you remove it, when you decide. A worker whose checkou
 cannot be resumed; the refusal names the branch and the `git worktree add` that brings the
 checkout back, so the work is one command away rather than lost.
 
-## bg-job
+## bg_job
 
 A command that outlives the turn is a background job, not a `bash` call: `bash` blocks the whole
 turn, so nothing else happens until it ends or the harness kills it.
@@ -159,7 +159,7 @@ hc interrupt db                              # stop the current job, keep the pr
   `hc attach <t>`, and the agent continues when the program moves on.
 - Prefer a non-interactive flag whenever it exists (`-y`, `--yes`, `--force`, `-c`, `--with-token`);
   typing into a prompt is the fallback, not the default.
-- `hc run --bg <cmd>` + `hc wait <t>` also works for a one-off long command, but `bg-job` reports
+- `hc run --bg <cmd>` + `hc wait <t>` also works for a one-off long command, but `bg_job` reports
   better: it delivers a card, wakes an idle session and keeps the output in a log.
 
 ## Roles and configuration

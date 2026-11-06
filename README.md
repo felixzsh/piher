@@ -6,7 +6,7 @@
 
 </div>
 
-`piher` is one pi extension. It gives a pi session two tools — `subagent` and `bg-job` — and runs
+`piher` is one pi extension. It gives a pi session two tools — `subagent` and `bg_job` — and runs
 what they start as real terminals through [herdr-core](https://herdr.dev/) (`hc`), which the optional
 **Herdr app** displays as spaces, tabs and panes. A subagent is a separate pi session in its own
 terminal: its own context, visible to the person watching, and attachable at any time.
@@ -18,7 +18,7 @@ its own rules.
 
 | Piece | Package | Role |
 |---|---|---|
-| **pi extension** | `packages/ext` (npm: [`piher`](https://www.npmjs.com/package/piher)) | Registers `subagent` and `bg-job`; starts, reads and reclaims their terminals through core; carries the role manifests and the delegation ledger |
+| **pi extension** | `packages/ext` (npm: [`piher`](https://www.npmjs.com/package/piher)) | Registers `subagent` and `bg_job`; starts, reads and reclaims their terminals through core; carries the role manifests and the delegation ledger |
 | **herdr-core** | `hc` ≥ 0.1.16 | Terminal server: `terminal.run/read/wait/send/keys/interrupt/label/kill/rm` plus status and events over `HC_TERMINAL_SOCKET` |
 | **Herdr app** | `herdr-app` (optional) | Displays core terminals as spaces, tabs and panes; its built-in sidebar shows agents and raises blocked notifications |
 
@@ -75,7 +75,7 @@ to remove.
 
 A role that declares `lifecycle: "one-shot"` is reclaimed this way automatically at its settlement.
 
-### `bg-job`
+### `bg_job`
 
 One shell command as its own core terminal, reported once when it exits. The command runs under
 `bash -o pipefail`, so any multiline script, pipe or heredoc works and the exit code is the
@@ -189,7 +189,7 @@ After install, piher is live in every pi session, not only inside a core termina
 
 | Surface | Bare `pi` | Inside a herdr-core terminal |
 |---|---|---|
-| `subagent`, `bg-job` | **not registered** | live |
+| `subagent`, `bg_job` | **not registered** | live |
 | Worker-terminal rules, write locks, pipe channel | off | live |
 | Role manifest and its visible-tool layer (`setActiveTools`) | off | on |
 | Session entries of the extension's own types | replayed from the transcript | live |

@@ -169,7 +169,7 @@ export function formatJobNotice(job: JobRecord, tail: string): string {
   else lines.push('No output.');
   lines.push(
     `Full output: ${job.logPath} — read a bounded slice with `
-      + `background {action: "log", job_id: "${job.id}", mode: "tail", lines: 200, grep: "..."}.`,
+      + `bg_job {action: "log", job_id: "${job.id}", mode: "tail", lines: 200, grep: "..."}.`,
   );
   return lines.join('\n');
 }
@@ -188,8 +188,8 @@ export function formatJobCheckIn(job: JobRecord, now: number, tail: string, logB
   if (tail.trim() !== '') lines.push('Last output:', tail);
   else lines.push('No output yet.');
   lines.push(
-    `Look once with background {action: "log", job_id: "${job.id}"}, keep working, or end it with `
-      + `background {action: "stop", job_id: "${job.id}"}.`,
+    `Look once with bg_job {action: "log", job_id: "${job.id}"}, keep working, or end it with `
+      + `bg_job {action: "stop", job_id: "${job.id}"}.`,
   );
   return lines.join('\n');
 }

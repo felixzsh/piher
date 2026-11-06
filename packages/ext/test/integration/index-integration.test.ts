@@ -53,7 +53,7 @@ async function mountIndex(
 test('index mount surface: worker and bare pi mount no core plugin', async (t) => {
   for (const mode of ['worker', 'bare'] as const) await t.test(mode, withCleanup(async (cleanup) => {
     const pi = await mountIndex(cleanup, mode);
-    for (const tool of ['subagent', 'bg-job', 'list_agents', 'terminal_open']) assert.ok(!pi.tools.has(tool), `${mode} must not register ${tool}`);
+    for (const tool of ['subagent', 'bg_job', 'list_agents', 'terminal_open']) assert.ok(!pi.tools.has(tool), `${mode} must not register ${tool}`);
     assert.ok(!pi.commands.has('piher-tree'), `${mode} has no delegation tree to show`);
     assert.ok(!pi.commands.has('locks'), 'write locks need a core terminal');
     assert.ok(!pi.commands.has('dashboard'), '/dashboard is gone');
@@ -69,10 +69,10 @@ test('index mount surface: worker and bare pi mount no core plugin', async (t) =
   }));
 });
 
-test('index core master: mounts subagent + bg-job + the four piher commands', withCleanup(async (cleanup) => {
+test('index core master: mounts subagent + bg_job + the four piher commands', withCleanup(async (cleanup) => {
   const pi = await mountIndex(cleanup, 'master');
   try {
-    for (const tool of ['subagent', 'bg-job']) assert.ok(pi.tools.has(tool), `core master mounts ${tool}`);
+    for (const tool of ['subagent', 'bg_job']) assert.ok(pi.tools.has(tool), `core master mounts ${tool}`);
     assert.deepEqual([...pi.commands.keys()].sort(),
       ['piher-config', 'piher-locks', 'piher-role', 'piher-tree'],
       'the master mounts exactly the four piher commands');

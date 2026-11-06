@@ -1,6 +1,6 @@
 # piher
 
-The pi extension behind **piher**: it registers the `subagent` and `bg-job` tools and runs what they
+The pi extension behind **piher**: it registers the `subagent` and `bg_job` tools and runs what they
 start as [herdr-core](https://herdr.dev/) (`hc`) terminals, which the optional **Herdr app** shows as
 spaces, tabs and panes.
 
@@ -27,7 +27,7 @@ npx piher-setup@latest
 
 | Surface | Names |
 |---|---|
-| Tools | `subagent` (`spawn`, `send`, `output`, `list`, `interrupt`, `resume`, `role`, `close`, `help`), `bg-job` (`start`, `status`, `log`, `stop`, `list`) |
+| Tools | `subagent` (`spawn`, `send`, `output`, `list`, `interrupt`, `resume`, `role`, `close`, `help`), `bg_job` (`start`, `status`, `log`, `stop`, `list`) |
 | Commands | `/piher-tree`, `/piher-role`, `/piher-config`, `/piher-locks` |
 | Skill | `piher-tools` — when to delegate, what a prompt must contain, the answer-or-`BLOCKED:` report contract |
 | Session entries | `piher.subs`, `piher.delegation`, `piher.settlement`, `piher.role-manifest`, `piher.job-exit`, `piher.config-guide` |
