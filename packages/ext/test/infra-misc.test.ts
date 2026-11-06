@@ -172,11 +172,11 @@ test('createRuntimePolicy: an invalid/out-of-range value warns once and falls ba
   console.warn = (message?: unknown) => { warnings.push(String(message)); };
   try {
     const p = createRuntimePolicy();
-    assert.equal(p.gitTimeoutMs, 10_000); assert.equal(p.subagentTimeoutMs, 600_000);
+    assert.equal(p.gitTimeoutMs, 10_000); assert.equal(p.subagentTimeoutMs, 300_000);
   } finally {
     console.warn = warn;
   }
-  assert.deepEqual(warnings, ['Invalid PIHER_GIT_TIMEOUT_MS="nope", using default 10000', 'Invalid PIHER_SUBAGENT_TIMEOUT_MS="-1", using default 600000']);
+  assert.deepEqual(warnings, ['Invalid PIHER_GIT_TIMEOUT_MS="nope", using default 10000', 'Invalid PIHER_SUBAGENT_TIMEOUT_MS="-1", using default 300000']);
   // A14: concurrent workers routinely take longer than 30s to boot.
   assert.equal(createRuntimePolicy().readinessTimeoutMs, 90_000);
 }));

@@ -34,7 +34,7 @@ export interface OptionSpec {
 /** Every option, with its default and bounds. */
 export const OPTION_SPECS: readonly OptionSpec[] = [
   { name: 'PIHER_GIT_TIMEOUT_MS', fallback: '10000', min: 1, policy: 'gitTimeoutMs', description: 'git command timeout (worktree list and status probes)' },
-  { name: 'PIHER_SUBAGENT_TIMEOUT_MS', fallback: '600000', min: 1000, policy: 'subagentTimeoutMs', description: 'subagent inactivity budget before forced termination' },
+  { name: 'PIHER_SUBAGENT_TIMEOUT_MS', fallback: '300000', min: 1000, policy: 'subagentTimeoutMs', description: 'how long a subagent may stay silent before the master is told it never reported' },
   { name: 'PIHER_READY_TIMEOUT_MS', fallback: '90000', min: 1000, policy: 'readinessTimeoutMs', description: 'how long to wait for a spawned pane to open its pipe (a dead pane fails fast)' },
   { name: 'PIHER_SETTLE_WINDOW_MS', fallback: '4000', min: 0, policy: 'settleWindowMs', description: 'debounce after a subagent turn ends before it is called settled (a new turn cancels it)' },
   { name: 'PIHER_POLL_INTERVAL_MS', fallback: '30000', min: 1000, policy: 'pollIntervalMs', description: 'safety re-check of a subagent when no core event arrives (events drive settlement)' },

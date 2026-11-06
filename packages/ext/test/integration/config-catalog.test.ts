@@ -123,7 +123,7 @@ test('collectConfigSnapshot: reports effective env values, sources and per-plane
   const snapshot = collectConfigSnapshot({ ...fx.deps, env: { PIHER_GC_TICK_MS: '5000' } });
 
   assert.equal(knobValue(snapshot, 'env', 'PIHER_GC_TICK_MS'), '5000 [env]');
-  assert.equal(knobValue(snapshot, 'env', 'PIHER_SUBAGENT_TIMEOUT_MS'), '600000 [default]');
+  assert.equal(knobValue(snapshot, 'env', 'PIHER_SUBAGENT_TIMEOUT_MS'), '300000 [default]');
   for (const plane of ['roles', 'env'] as const) assert.equal(planeReport(snapshot, plane).ok, true, planeReport(snapshot, plane).issues.join(' | '));
   assert.equal(snapshot.roleSummary, '3 role(s): workspace 1 / user 0 / builtin 2');
 
