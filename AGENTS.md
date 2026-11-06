@@ -50,34 +50,22 @@ the role forbids it (a worker's manifest denies `bg_job`), to an `hc` terminal (
 `hc wait`) — never to a blocking shell call. `bash` is for short, interactive or order-dependent
 commands.
 
-## Tests: one command, and it is fast enough to just run it
+## Tests: `npm test`, and nothing else to decide
 
-`npm test` is `tsc --noEmit` plus the whole suite: **439 tests in ~15 s**. Run it — a one-line edit, a
-string, a whole feature. There is no tier to pick and no cheap-loop calculus to rehearse; that
-reasoning used to exist because an unbounded readiness wait made the suite take two minutes, and the
-wait is gone.
+`npm test` is `tsc --noEmit` plus the whole suite: **439 tests in ~15 s**. That covers every case — a
+one-line edit, a string, a whole feature — so there is no tier, no subset and no cheap-loop calculus to
+rehearse: run it before every commit and push, and let the result speak.
 
-| Command | What runs | Time |
-|---|---|---|
-| `npm test` | `tsc --noEmit` + every suite (439 tests) | ~15 s |
-| `node --test --test-timeout=120000 test/<file>.test.ts` | one suite, while iterating on it | ~1-3 s |
-
-Rules:
-
-- **Run `npm test` before every commit and push.** That is where `typecheck` lives too.
-- A single suite by path is fine while you are still editing it, but it is not a cheaper way to
-  validate a change: it is the same runner, one file.
-- `test/integration/` still groups what spawns a process, opens a socket, touches a real git worktree
-  or boots the composition root — directory order, not a separate command: the same `npm test` runs
-  both.
+- `test/integration/` groups what spawns a process, opens a socket, touches a real git worktree or
+  boots the composition root. That is directory order, not a separate command: the same run covers it.
 - **Give the harness its budgets; never force the exit.** `worktree.test.ts` passes
   `policy: { readinessTimeoutMs: 3000 }`, so a spawn whose pipe never answers fails in seconds
   instead of waiting out the 90 s `PIHER_READY_TIMEOUT_MS` — that wait is what made the suite look
   100 s long. `--test-force-exit` was what made the reported totals lie as well: `node --test` exits
   with async stdout writes still pending, so a green run reported 437 tests instead of 439. No script
-  passes it now. `stryker.conf.json` still does: a mutation run spawns the suite thousands of times
- is what turns a hang into a failure instead of a
-  blocked terminal.
+  passes it now. `stryker.conf.json` still does: a mutation run spawns the suite thousands of times,
+  and a stuck one must not become a stuck mutation.
+- `--test-timeout=120000` is what turns a hang into a failure instead of a blocked terminal.
 - Do not add real sleeps to a test to satisfy a timer. Set the budget the code reads
   (`PIHER_SETTLE_WINDOW_MS`, `PIHER_READY_TIMEOUT_MS`, …) to something small in the harness instead.
 - Anything long goes to `bg_job` (or an `hc` terminal when the role forbids it), never to a blocking
