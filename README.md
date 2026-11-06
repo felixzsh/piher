@@ -2,11 +2,11 @@
 
 # piher
 
-**pi** × h**er**dr — subagents and terminals for [pi](https://pi.dev/), on [herdr-core](https://herdr.dev/).
+**pi** × h**er**dr — subagents and background jobs for [pi](https://pi.dev/), on [herdr-core](https://herdr.dev/).
 
 </div>
 
-`piher` is one pi extension. It gives a pi session two tools — `subagent` and `terminal` — and runs
+`piher` is one pi extension. It gives a pi session two tools — `subagent` and `bg-job` — and runs
 what they start as real terminals through [herdr-core](https://herdr.dev/) (`hc`), which the optional
 **Herdr app** displays as spaces, tabs and panes. A subagent is a separate pi session in its own
 terminal: its own context, visible to the person watching, and attachable at any time.
@@ -18,7 +18,7 @@ its own rules.
 
 | Piece | Package | Role |
 |---|---|---|
-| **pi extension** | `packages/ext` (npm: [`piher`](https://www.npmjs.com/package/piher)) | Registers `subagent` and `terminal`; starts, reads and reclaims their terminals through core; carries the role manifests and the delegation ledger |
+| **pi extension** | `packages/ext` (npm: [`piher`](https://www.npmjs.com/package/piher)) | Registers `subagent` and `bg-job`; starts, reads and reclaims their terminals through core; carries the role manifests and the delegation ledger |
 | **herdr-core** | `hc` ≥ 0.1.16 | Terminal server: `terminal.run/read/wait/send/keys/interrupt/label/kill/rm` plus status and events over `HC_TERMINAL_SOCKET` |
 | **Herdr app** | `herdr-app` (optional) | Displays core terminals as spaces, tabs and panes; its built-in sidebar shows agents and raises blocked notifications |
 
@@ -75,24 +75,28 @@ to remove.
 
 A role that declares `lifecycle: "one-shot"` is reclaimed this way automatically at its settlement.
 
-### `terminal`
+### `bg-job`
 
-Persistent interactive shells in dedicated core terminals; cwd, environment and background
-processes survive between calls.
+One shell command as its own core terminal, reported once when it exits. The command runs under
+`bash -o pipefail`, so any multiline script, pipe or heredoc works and the exit code is the
+pipeline's; nothing is typed at a prompt, so no command has to be a single line.
 
 | Action | What it does |
 |---|---|
-| `open` | Create the shell (`cwd`, optional `terminal_id`); returns its id and readiness |
-| `send` | Type `text` at the prompt (Enter appended; multi-line runs line by line) |
-| `wait` | Block until output matches `pattern` (literal or `regex`), or until a log named by `file` matches |
-| `read` | What is new since the previous read, up to `max_chars`; `pane_id` reads another terminal of the tab |
-| `signal` | Send a control key: `ctrl+c`, `ctrl+d`, `ctrl+z`, `esc`, `enter` |
-| `close` | Kill the process tree |
-| `list` | This session's shells |
+| `start` | Run `command` in the background (`name`, `cwd`, `timeout_s`); returns a job id and the log path |
+| `status` | One job's state, exit code, elapsed time, pane and log, with the last lines |
+| `log` | A bounded slice of the log: `mode` (`head`/`tail`), `lines` (1-400), `grep` |
+| `stop` | Kill the job's process tree; a stopped job never notifies |
+| `list` | This session's jobs, newest first |
 
-A single-line command typed at a POSIX prompt reports itself: when it finishes, one notice carries
-its exit code, the last lines and the path of the log with the full output — no `wait` and no sleep
-loop. Nothing else notifies: an idle shell is not a finished command.
+The notice is the only thing the model receives: outcome, exit code, elapsed time, the last lines and
+how to read more. The whole output stays in the log, so a long build never floods the context, and
+`timeout_s` (default 300) produces a **check-in**, not a failure — the job keeps running and the
+notice says so first. A settle wakes an idle session; a check-in does not.
+
+Interactive shells are not a tool: they belong to `hc` itself (`hc run --bg bash`, `hc send`,
+`hc read --lines`, `hc keys`, `hc interrupt`), and the bundled `piher-tools` skill tells a session
+when to reach for them.
 
 ## Commands
 
@@ -118,6 +122,15 @@ The caller's model learns which roles exist from a derived `piher-roles` prompt 
 skill file, so a role added to a directory appears without editing any text. Deny rules are not
 bypassable: a denied tool call returns `terminate`, so a batch whose results are all terminating ends
 without another model round trip.
+
+### `hc` templates come from the manifests
+
+A role is declared once, in its manifest. `hc run <role> "task"` needs the same role as a Markdown
+template in `~/.config/herdr-core/templates/<role>.md`, so those files are **generated**: the
+frontmatter (`name`, `description`, `command`) is the manifest's model, thinking level and tool set,
+and the body is the standing brief. Regenerating rewrites only the frontmatter and keeps a
+hand-written body, and an integration test fails when the two disagree — the drift that once had
+`subagent spawn {role:"reviewer"}` and `hc run reviewer` launching different models.
 
 ## The delegation ledger
 
@@ -176,7 +189,7 @@ After install, piher is live in every pi session, not only inside a core termina
 
 | Surface | Bare `pi` | Inside a herdr-core terminal |
 |---|---|---|
-| `subagent`, `terminal` | **not registered** | live |
+| `subagent`, `bg-job` | **not registered** | live |
 | Worker-terminal rules, write locks, pipe channel | off | live |
 | Role manifest and its visible-tool layer (`setActiveTools`) | off | on |
 | Session entries of the extension's own types | replayed from the transcript | live |
@@ -198,10 +211,7 @@ noted. `PIHER_*` is the only namespace.
 | `PIHER_GC_TICK_MS` | `30000` | Idle GC sweep cadence |
 | `PIHER_SESSION_TTL_SECONDS` | `600` | Session retention after a worker exits, before GC |
 | `PIHER_GIT_TIMEOUT_MS` | `10000` | git command timeout (worktree creation, status probes) |
-| `PIHER_TERM_READ_MAX` | `8000` | Characters returned per terminal read |
-| `PIHER_TERM_IDLE_MS` | `300000` | Idle time before the second cleanup nudge for an open terminal |
-| `PIHER_TERM_GRACE_MS` | `30000` | Settle grace before that nudge |
-| `PIHER_TERMINAL_PROMPT` | auto from `$SHELL` | Prompt strategy for terminal readiness: `bash\|zsh\|powershell\|pwsh` |
+| `PIHER_JOBS_DIR` | system temp `piher-jobs` | Directory receiving one log file per background job |
 | `PIHER_WRITE_LOCK` | – | `1` makes a conflicting `write`/`edit` block instead of warn |
 | `PIHER_TRACE` | – | Write diagnostics (renderers, swallowed errors) to stderr, or to this path |
 | `PIHER_HMR` | – | Dev only: enable the cordis HMR boundary (needs `--expose-internals`) |

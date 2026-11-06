@@ -26,18 +26,20 @@ or at a file that no longer exists, fails the suite.
 | D80 | Loader, group and timer plugins mount in order so declarations resolve; HMR is a development path only | `packages/ext/src/bootstrap.ts:20` |
 | D81 | Three-way split: entry (mode selection), pure core (testable planners), platform adapter (core client) | `packages/ext/src/bootstrap.ts:1` |
 | D82 | `unknownTools: allow\|deny` states what happens to a tool a role has never heard of — a newly installed extension tool is governed on purpose, not by silence | `packages/ext/schemas/role-manifest.schema.json:1` |
-| D83 | `worker-default` mirrors the master's tools minus `subagent` and `terminal`, and those families are denied explicitly: a worker owns no other worker | `packages/ext/src/role-loader.ts:1` |
+| D83 | `worker-default` mirrors the master's tools minus `subagent` and `bg-job`, and those families are denied explicitly: a worker owns no other worker | `packages/ext/src/role-loader.ts:1` |
 | D86 | Workers group by git worktree: a worker in the caller's checkout shares its tab, one in another worktree gets the tab named after it, and the main tab is never closed wholesale | `packages/ext/src/subagent-core.ts:1` |
 | D92 | A settlement that lands while the parent is mid-turn waits in a notice buffer instead of being dropped by pi's prompt rejection | `packages/ext/src/index-notices.ts:1` |
 | D94 | A terminal that already runs the same session is reused, so two pi processes never compete over one transcript | `packages/ext/src/subagent-spawn.ts:393` |
 | D96 | When the caller settles while workers still run, one reminder is injected per run set (de-duplicated, cooled down, suppressed by an abort) | `packages/ext/src/settle-wake-core.ts:1` |
 | D97 | Fullscreen TUI mode is what turns a pane into a static frame the caller can read without ANSI reflow | `packages/ext/src/subagent-core.ts:474` |
+| D98 | Execution is a program, not a typed shell line: `bg-job` runs an argv and core reports the child's exit, so no sentinel is parsed from a screen | `packages/ext/src/background-core.ts:1` |
+| D99 | There is no `terminal` tool: an interactive shell is `hc`'s business through the bundled skill, so the extension never re-implements a PTY CLI | `packages/ext/skills/piher-tools/SKILL.md:1` |
 | D104 | The config catalog is one plane map: roles are per file, env is per process, and every value reports its source | `packages/ext/src/config-catalog-core.ts:1` |
 | D113 | The delegation tree (running workers plus the settled nodes still resumable) renders inside pi as an overlay; the resident widget stays one line per running worker | `packages/ext/src/tree-view.ts:1` |
 | S1 | The package is the delegation surface: role manifests and tool wiring live here, and a workflow policy belongs to the prompt that asks for it | `packages/ext/src/index.ts:1` |
 | S2 | Write locks are a soft veto by default and a hard one under `PIHER_WRITE_LOCK=1`; the warning names every holder | `packages/ext/src/lock-core.ts:1` |
 | S9 | A role may declare `lifecycle`; only `one-shot` changes behaviour (the worker is reclaimed at its settlement), and an unresolvable role never reclaims a pane by surprise | `packages/ext/src/role-manifest.ts:1` |
-| S10 | The registered tool set is exactly `{subagent, terminal}`, asserted by a test, because pi keeps one provider per tool name | `packages/ext/test/integration/tool-scope.test.ts:1` |
+| S10 | The registered tool set is exactly `{subagent, bg-job}`, asserted by a test, because pi keeps one provider per tool name | `packages/ext/test/integration/tool-scope.test.ts:1` |
 | S20 | The role menu is derived from the manifests on every turn, so a role added to a directory appears without editing any shipped text | `packages/ext/src/role-catalog.ts:1` |
 | S21 | The catalog rides the prompt: an action would spend a round trip on text that fits in the request for free | `packages/ext/src/role-catalog.ts:1` |
 | S22 | A role switch is the one recompute point for the visible tool set; a widen from a human asks first | `packages/ext/src/role-state.ts:1` |
@@ -48,7 +50,7 @@ or at a file that no longer exists, fails the suite.
 | S53 | `close` reclaims a worker that already finished — `terminal.kill` then `terminal.rm`, the app closes the pane, the session and ledger row stay | `packages/ext/src/plugins/subagent.ts:1` |
 | S54 | The push comes before the shutdown: a worker whose report never reached the caller must not exit as if it had | `packages/ext/src/index.ts:1` |
 | S57 | A settlement renders as one card header (name, role, outcome, elapsed) while the text the caller receives stays plain | `packages/ext/src/settlement-card.ts:1` |
-| S64 | An explicitly run terminal command gets exactly one completion notice: its real exit code, the last lines and the path of the full log | `packages/ext/src/terminal-run.ts:1` |
+| S64 | A background job gets exactly one completion notice: its real exit code, the last lines and the path of the full log | `packages/ext/src/background-core.ts:1` |
 | S69 | Nothing under the per-session root is the extension's to prune; the transcript and the ledger are the record | `packages/ext/src/index.ts:1` |
 | S70 | The three texts that describe `subagent` (tool description, manual, skill) cannot diverge: a test extracts the actions and parameters and fails on a gap | `packages/ext/test/skill-coverage.test.ts:1` |
 | S71 | A persisted checkout record is trusted only when its path and branch are readable; an occupied path fails naming both | `packages/ext/src/worktree.ts:1` |

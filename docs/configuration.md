@@ -43,7 +43,7 @@ spawn.
 | Make a role clean itself up | `roles` | `lifecycle: "one-shot"` | at that worker's settlement |
 | Keep a role out of the model-facing list | `roles` | `modelInvocable: false` (still launchable by name) | immediately |
 | Change a timeout, window or GC cadence | `env` | Export the `PIHER_*` variable | new pi processes |
-| Cap how much a terminal read returns | `env` | `PIHER_TERM_READ_MAX` (default 8000) | new pi processes |
+| Choose where job logs are written | `env` | `PIHER_JOBS_DIR` (default: system temp `piher-jobs`) | new pi processes |
 | Make a write conflict block instead of warn | `env` | `PIHER_WRITE_LOCK=1` | new pi processes |
 | Change pi's own compaction | — | pi's `/settings`; piher neither reads nor proxies it | new session |
 

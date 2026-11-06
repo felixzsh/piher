@@ -35,7 +35,7 @@ test('drift guards: the catalog mirrors the planes and every runtime env read is
   assert.deepEqual(knobsOfPlane('env'), OPTION_SPECS.map((o) => o.name), 'the env plane is the OPTION_SPECS registry');
 
   // Runtime env reads must be registered as an option.
-  const sources = ['src/runtime-policy.ts', 'src/terminal-core.ts', 'src/config-command.ts']
+  const sources = ['src/runtime-policy.ts', 'src/plugins/bg-job.ts', 'src/config-command.ts']
     .map((rel) => readFileSync(join(repoRoot, 'packages', 'ext', rel), 'utf8'))
     .join('\n');
   const found = new Set((sources.match(/\bPI(_HERDR)?_[A-Z0-9_]+\b/g) ?? []).filter((n) => !n.endsWith('_')));
@@ -50,25 +50,25 @@ test('drift guards: the catalog mirrors the planes and every runtime env read is
 /* ── pure catalog ───────────────────────────────────────────────────────── */
 
 test('resolveEnvKnobs and checkEnvKnobs only touch registered option keys', () => {
-  const env = { PIHER_GC_TICK_MS: '5000', PIHER_TERM_IDLE_MS: '0', PIHER_SESSION_TTL_SECONDS: 'nope', SECRET_TOKEN: 'x' };
+  const env = { PIHER_GC_TICK_MS: '5000', PIHER_SESSION_TTL_SECONDS: '0', PIHER_GIT_TIMEOUT_MS: 'nope', SECRET_TOKEN: 'x' };
   const resolved = resolveEnvKnobs(env);
   assert.equal(resolved.length, OPTION_SPECS.length);
-  const idle = resolved.find((r) => r.knob.key === 'PIHER_TERM_IDLE_MS')!;
+  const idle = resolved.find((r) => r.knob.key === 'PIHER_SESSION_TTL_SECONDS')!;
   assert.equal(idle.value, '0'); assert.equal(idle.source, 'env');
   assert.equal(resolved.find((r) => r.knob.key === 'PIHER_GC_TICK_MS')!.source, 'env');
   assert.equal(resolved.some((r) => r.knob.key === 'SECRET_TOKEN'), false, 'unknown env keys are never reported');
 });
 
 test('checkEnvKnobs flags only unparsable/out-of-range registered values', () => {
-  const issues = checkEnvKnobs({ PIHER_GC_TICK_MS: '30000', PIHER_SESSION_TTL_SECONDS: 'nope', PIHER_TERM_IDLE_MS: '0' });
+  const issues = checkEnvKnobs({ PIHER_GC_TICK_MS: '30000', PIHER_SESSION_TTL_SECONDS: 'nope', PIHER_GIT_TIMEOUT_MS: '0' });
   assert.equal(issues.length, 2, issues.join(' | ')); assert.ok(issues.some((i) => i.includes('PIHER_SESSION_TTL_SECONDS')));
-  assert.ok(issues.some((i) => i.includes('PIHER_TERM_IDLE_MS'))); assert.deepEqual(checkEnvKnobs({ PIHER_GC_TICK_MS: '30000' }), []);
+  assert.ok(issues.some((i) => i.includes('PIHER_GIT_TIMEOUT_MS'))); assert.deepEqual(checkEnvKnobs({ PIHER_GC_TICK_MS: '30000' }), []);
 });
 
 test('secret-shaped keys are redacted and never rendered verbatim', () => {
   // Deliberately narrower than a bare `token` match, so a key that merely carries token-shaped
   // vocabulary is still shown verbatim.
-  assert.equal(redactValue('PIHER_TERM_READ_MAX', 8000), '8000'); assert.equal(redactValue('PIHER_TRACE', '/tmp/x'), '/tmp/x');
+  assert.equal(redactValue('PIHER_GC_TICK_MS', 8000), '8000'); assert.equal(redactValue('PIHER_TRACE', '/tmp/x'), '/tmp/x');
   assert.equal(redactValue('PIHER_API_KEY', 'sk-live-123'), '***'); assert.equal(formatValue(undefined), '(unset)');
 
   const entries = [{ knob: { plane: 'env' as const, key: 'PIHER_API_KEY', kind: 'string' as const, impact: 'api key' }, value: '***', source: 'env' as const }];

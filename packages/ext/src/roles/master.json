@@ -1,12 +1,12 @@
 {
   "role": "master",
   "version": "1.0.0",
-  "description": "Master role: the pane that delegates. Core tools (subagent/terminal) + pi built-ins + web_search, and unknownTools=allow under D82 so a newly installed extension tool is visible without editing this file. An `ask` rule is invalid: no permission can hand a decision to a human mid-call.",
+  "description": "Master role: the pane that delegates. Core tools (subagent/bg-job) + pi built-ins + web_search, and unknownTools=allow under D82 so a newly installed extension tool is visible without editing this file. An `ask` rule is invalid: no permission can hand a decision to a human mid-call.",
   "manifest": {
     "unknownTools": "allow",
     "tools": [
       "subagent",
-      "terminal",
+      "bg-job",
       "read",
       "grep",
       "glob",

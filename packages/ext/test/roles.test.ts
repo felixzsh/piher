@@ -136,8 +136,8 @@ test('bundled manifests: loadable for both built-ins, and worker mirrors master 
     assert.equal(role.role, name); assert.match(role.version, /^\d+\.\d+\.\d+$/, name);
     assert.equal(role.model, undefined, `${name} leaves model routing to the process default`);
   }
-  // D83 inheritance: worker-default.tools ≡ master.tools − subagent − terminal, pinned against drift.
-  const EXCLUDED = ['subagent', 'terminal'];
+  // D83 inheritance: worker-default.tools ≡ master.tools − subagent − bg-job, pinned against drift.
+  const EXCLUDED = ['subagent', 'bg-job'];
   const master = loadRoleConfig('master');
   const worker = loadRoleConfig('worker-default');
   assert.deepEqual(
@@ -147,7 +147,7 @@ test('bundled manifests: loadable for both built-ins, and worker mirrors master 
   for (const family of EXCLUDED) assert.equal(worker.manifest.rules?.[family], 'deny', `${family} stays denied under unknownTools=allow`);
   // Placement of the tool families the bundled master really carries (never a fixture-only name):
   // the two herdr families, pwsh and web search must not drift out of the bundled file.
-  for (const need of ['subagent', 'terminal', 'pwsh', 'web_search']) {
+  for (const need of ['subagent', 'bg-job', 'pwsh', 'web_search']) {
     assert.ok(master.manifest.tools.includes(need), `tool placement: ${need}`);
   }
   assert.equal(master.manifest.unknownTools, 'allow'); assert.equal(worker.manifest.unknownTools, 'allow');

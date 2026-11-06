@@ -5,8 +5,8 @@
  */
 import { SUBS_CUSTOM_TYPE, type SubsRegistry } from './subagent-core.ts';
 import { DELEGATION_CUSTOM_TYPE } from './delegation-core.ts';
-import { TERMINALS_CUSTOM_TYPE, TERM_REMINDER_CUSTOM_TYPE, type TerminalsRegistry } from './terminal-core.ts';
 import { SETTLEMENT_CUSTOM_TYPE, formatElapsed, type SettlementCard } from './settlement-card.ts';
+import { JOB_NOTICE_CUSTOM_TYPE, formatDuration } from './background-core.ts';
 
 // Width handling lives in ansi-text.ts so the transcript cards need no pi-tui import.
 import { truncateStyled } from './ansi-text.ts';
@@ -44,22 +44,7 @@ function card(lines: readonly string[]): RenderComponent {
   };
 }
 
-/** Registry card, shared by the subagent and terminal registries: a titled count line plus one row
- *  per entry when expanded; an empty or malformed registry renders one dim placeholder. */
-function registryLines<T>(
-  items: readonly T[] | undefined,
-  theme: RenderTheme,
-  expanded: boolean,
-  card: { label: string; unit: string; badge?: string; row: (item: T) => string },
-): string[] {
-  if (!items || items.length === 0) return [theme.fg('dim', `${card.label} · none`)];
-  const head = `${theme.fg('accent', theme.bold(card.label))} ${theme.fg('dim', `· ${items.length} ${card.unit}`)}${card.badge ? ` ${theme.fg('success', card.badge)}` : ''}`;
-  if (!expanded) return [head];
-  return [head, ...items.map((item) => theme.fg('dim', card.row(item)))];
-}
-
-/** The registry entry is a record, not a transcript card (S73): one line while workers run, so the
- *  master can see it is delegated, and nothing at all once every worker has settled. */
+/** Registry card for the subagent board: one line while workers run, nothing once they settle. */
 function subsLines(data: unknown, theme: RenderTheme): string[] {
   const subs = (data as SubsRegistry | undefined)?.subs;
   const running = Array.isArray(subs) ? subs.filter((sub) => sub.status === 'running').length : 0;
@@ -86,15 +71,6 @@ function delegationLines(data: unknown, theme: RenderTheme, expanded: boolean): 
     head,
     theme.fg('dim', `  task ${typeof rec.taskId === 'string' ? rec.taskId : '?'} · role ${role} · parent session ${session}`),
   ];
-}
-
-function terminalsLines(data: unknown, theme: RenderTheme, expanded: boolean): string[] {
-  const terminals = (data as TerminalsRegistry | undefined)?.terminals;
-  return registryLines(Array.isArray(terminals) ? terminals : undefined, theme, expanded, {
-    label: 'terminals',
-    unit: 'open',
-    row: (t) => `  ${t.paneId} · ${clip(String(t.label ?? t.cwd ?? ''), 70)}`,
-  });
 }
 
 function roleManifestLines(data: unknown, theme: RenderTheme): string[] {
@@ -143,6 +119,44 @@ function settlementLines(message: unknown, theme: RenderTheme, expanded: boolean
   return [head, ...content.split('\n').map((line) => theme.fg('dim', line))];
 }
 
+/** Background job notice: the header is what the transcript shows (outcome, name, elapsed); the
+ *  body is the notice text minus its own headline, so the card never says the same thing twice. */
+function jobNoticeLines(message: unknown, theme: RenderTheme, expanded: boolean): string[] {
+  const rec = (message ?? {}) as { content?: unknown; details?: unknown };
+  const details = (rec.details ?? {}) as {
+    jobId?: unknown;
+    label?: unknown;
+    status?: unknown;
+    exitCode?: unknown;
+    durationMs?: unknown;
+    checkIn?: unknown;
+  };
+  const content = typeof rec.content === 'string' ? rec.content : '';
+  const id = typeof details.jobId === 'string' && details.jobId ? details.jobId : 'job';
+  const name = typeof details.label === 'string' && details.label ? ` ("${details.label}")` : '';
+  const failed = details.status === 'failed'
+    || (details.status === 'finished' && details.exitCode !== 0 && details.exitCode !== null);
+  const checkIn = details.checkIn === true;
+  const icon = checkIn ? theme.fg('warning', '⧗') : failed ? theme.fg('error', '✗') : theme.fg('success', '✓');
+  const outcome = checkIn
+    ? 'still running'
+    : details.status === 'stopped'
+      ? 'stopped'
+      : failed
+        ? `exit ${String(details.exitCode ?? '?')}`
+        : 'exit 0';
+  const elapsed = typeof details.durationMs === 'number' && details.durationMs >= 0
+    ? ` · ${formatDuration(details.durationMs)}`
+    : '';
+  const head = `${icon} ${theme.fg('accent', theme.bold('bg-job'))} ${theme.bold(id)}${name} ${theme.fg('dim', `· ${outcome}${elapsed}`)}`;
+  const body = content.split('\n').slice(1).filter((line) => line.trim() !== '');
+  if (body.length === 0) return [head];
+  if (expanded) return [head, ...body.map((line) => theme.fg('dim', `  ${line}`))];
+  const preview = body.slice(0, 4).map((line) => theme.fg('dim', `  ${clip(line, 110)}`));
+  const rest = body.length - preview.length;
+  return rest > 0 ? [...preview.length > 0 ? [head, ...preview] : [head], theme.fg('muted', `  … ${rest} more lines`)] : [head, ...preview];
+}
+
 /** Reminder custom messages carry the full injected text; restyle without altering it. */
 function reminderLines(message: unknown, theme: RenderTheme, label: string, expanded: boolean): string[] {
   const content = typeof (message as { content?: unknown } | undefined)?.content === 'string'
@@ -183,10 +197,9 @@ export function installRenderers(pi: unknown): string[] {
   };
 
   entry(SUBS_CUSTOM_TYPE, subsLines);
-  entry(TERMINALS_CUSTOM_TYPE, terminalsLines);
   entry(DELEGATION_CUSTOM_TYPE, delegationLines);
   entry(ROLE_MANIFEST_CUSTOM_TYPE, (data, theme) => roleManifestLines(data, theme));
   message(SETTLEMENT_CUSTOM_TYPE, (msg, theme, expanded) => settlementLines(msg, theme, expanded));
-  message(TERM_REMINDER_CUSTOM_TYPE, (msg, theme, expanded) => reminderLines(msg, theme, 'terminal nudge', expanded));
+  message(JOB_NOTICE_CUSTOM_TYPE, (msg, theme, expanded) => jobNoticeLines(msg, theme, expanded));
   return registered;
 }

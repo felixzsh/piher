@@ -4,17 +4,19 @@ description: >-
   Judgement for piher's two tools: when to delegate with subagent (spawn, send, output,
   list, interrupt, close, resume, role, help), what a good prompt contains, how to read
   the settlement notice that carries a worker's result, the answer-or-BLOCKED report
-  contract, and when a persistent terminal (open, send, wait, read, signal, close, list)
-  beats bash. Load when delegating, following up on, interrupting, closing or resuming a
-  worker, or driving a shell that must keep state.
+  contract, and when a background job (start, status, log, stop, list) beats bash. It also
+  holds the `hc` recipes for the one thing no tool owns: driving a live interactive program.
+  Load when delegating, following up on, interrupting, closing or resuming a worker, when a
+  command will outlive the turn, or when a program has to be talked to line by line.
 license: MIT
 ---
 
 # piher tools
 
-piher registers exactly two tools, `subagent` and `terminal`. Their schemas carry every
+piher registers exactly two tools, `subagent` and `bg-job`. Their schemas carry every
 parameter and `action: "help"` carries the reference; this file carries what a schema
-cannot: when to reach for them, and what a call must contain to be worth making.
+cannot: when to reach for them, and what a call must contain to be worth making. Everything
+else a terminal can do belongs to `hc` itself, not to a piher tool.
 
 A subagent is a real pi session in its own terminal pane, with its own context — it does
 **not** see your conversation — and a human can attach to that pane and talk to it at any
@@ -114,23 +116,51 @@ stays yours: you made it, you remove it, when you decide. A worker whose checkou
 cannot be resumed; the refusal names the branch and the `git worktree add` that brings the
 checkout back, so the work is one command away rather than lost.
 
-## terminal
+## bg-job
 
-Persistent shells in dedicated terminals: cwd, environment and background processes survive
-between calls, so dev servers, REPLs, watchers and multi-step shell state belong here; a
-single command that finishes belongs in bash. `open` creates the shell and returns its id and
-readiness; `send` types text (`text`, line by line when multi-line); `wait` blocks on a
-`pattern` or on the log named by `file`; `read` returns what is new since your last read,
-optionally another pane of your tab; `signal` sends a control `key` (`ctrl+c` to interrupt);
-`close` kills the process tree; `list` shows this session's shells.
+A command that outlives the turn is a background job, not a `bash` call: `bash` blocks the whole
+turn, so nothing else happens until it ends or the harness kills it.
 
-A single-line command typed at a POSIX prompt reports itself: when it finishes, one notice
-carries its exit code, the last lines and the absolute path of the log with the full output,
-so a long job needs neither `wait` nor a sleep loop. The code is the status of the whole
-line, which for a pipeline is the **last** command — use `set -o pipefail` when an earlier
-stage can fail. Nothing else notifies: an idle shell is not a finished command, and a line
-the reporter cannot see is sent exactly as typed. State does not survive `close` or a core
-restart — persist to files.
+`start` runs one shell command as its own core terminal under `bash -o pipefail` and returns a job
+id and a log path at once. The command may be a multiline script, a pipe or a heredoc; it must not
+need input, because nothing can answer a prompt. When it exits you get **one** notice: outcome, exit
+code, elapsed time, the last lines, and how to read more from the log. The whole output stays in the
+log, so a long build never floods the context.
+
+- After `start`, keep working or end the turn. Never poll `status` or `log` to wait: the notice
+  arrives by itself.
+- `timeout_s` (default 300) is a **check-in**, not a timeout. The notice says the job is still
+  running and that it was not stopped. Look once with `log`, then keep waiting or `stop` it. Never
+  re-send the command.
+- Read output with `log` (`mode` head/tail, `lines` 1-400, `grep`); do not read the log file with
+  `read` when a bounded slice is enough.
+- `stop` kills the process tree and sends no notice, because whoever stopped it already knows.
+- The exit code is the pipeline's: `pipefail` is already set for you.
+
+Use `bash` instead for anything short, interactive, or order-dependent.
+
+## A live program, with `hc`
+
+No piher tool drives a program that is already running. That is `hc`'s job, and `hc --skill` is its
+manual; the four recipes that matter:
+
+```sh
+hc run --bg --name db --cwd . "psql mydb"     # a program that waits for you
+hc send db "BEGIN;"                           # type one line
+hc read db --lines 40                         # read what it answered
+hc interrupt db                              # stop the current job, keep the program
+```
+
+- **After every `send`, read the pane.** `hc send` reports success even when the shell is still
+  collecting input: if the last line is a continuation prompt (`∙`, `>`, `dquote>`, `heredoc>`), the
+  next line is data for it, not a command. Finish the quote/heredoc or `hc interrupt` first.
+- `hc read --lines N` is bounded on purpose: a full-screen program returns only its screen.
+- A program that asks for input is `blocked` in `hc get`; a human can type the answer with
+  `hc attach <t>`, and the agent continues when the program moves on.
+- Prefer a non-interactive flag whenever it exists (`-y`, `--yes`, `--force`, `-c`, `--with-token`);
+  typing into a prompt is the fallback, not the default.
+- `hc run --bg <cmd>` + `hc wait <t>` also works for a one-off long command, but `bg-job` reports
+  better: it delivers a card, wakes an idle session and keeps the output in a log.
 
 ## Roles and configuration
 

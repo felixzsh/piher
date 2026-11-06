@@ -8,7 +8,7 @@ import { shouldClosePane, shouldCloseTaskTab } from './gc-core.ts';
 import { runtimePolicy } from './runtime-policy.ts';
 import { swallow } from './swallow.ts';
 import { foldSubsRegistry, registrySnapshot, sleep, SUBS_CUSTOM_TYPE, type SubEntry } from './subagent-core.ts';
-import type { TerminalStateSlot } from './plugins/terminal.ts';
+import type { PaneStateSlot } from './plugins/bg-job.ts';
 
 /* ── registry projection + recovery ─────────────────────────────── */
 
@@ -93,7 +93,7 @@ interface GcHost {
   subs: Map<string, SubEntry>;
   persistSubs(): void;
   writeHistory(e: SubEntry, patch?: { outcome?: string | null; status?: SubEntry['status']; closedAt?: number }, via?: string): void;
-  terminalState: TerminalStateSlot;
+  terminalState: PaneStateSlot;
   noticePending?: () => ReadonlySet<string>;
 }
 

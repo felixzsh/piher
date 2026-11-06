@@ -33,6 +33,15 @@ export function charWidth(cp: number): number {
   return 1;
 }
 
+/** Text with escape sequences and control characters removed: log lines and notices carry neither. */
+export function stripAnsi(raw: string): string {
+  return raw
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '')
+    .replace(/\x1b[@-Z\\-_]/g, '')
+    .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+}
+
 /** Rendered cell width; SGR sequences count as zero cells. */
 export function styledWidth(line: string): number {
   let width = 0;

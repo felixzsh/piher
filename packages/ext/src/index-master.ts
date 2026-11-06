@@ -7,7 +7,7 @@ import { PiSurface } from './pi-surface.ts';
 import { createCordisApp } from './bootstrap.ts';
 import { cordisProvide } from './cordis-services.ts';
 import { disposeSessionRoot } from './subagent-poller.ts';
-import terminalPlugin from './plugins/terminal.ts';
+import bgJobPlugin from './plugins/bg-job.ts';
 import subagentPlugin from './plugins/subagent.ts';
 import type { CoreClientLike, CoreEnv } from './core-client.ts';
 import type { SubagentPortBox } from './subagent-core.ts';
@@ -59,14 +59,14 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
 
   const surface = new PiSurface(m.pi as unknown as object, cordisApp.ledger);
   cordisProvide(sessionRoot, 'piher.surface', surface);
-  const terminalDeps = {
+  const jobDeps = {
     client: m.client,
     env: m.env,
     state: { activePaneIds: (): Set<string> => new Set() },
   };
-  cordisProvide(sessionRoot, 'piher.terminal-deps', terminalDeps);
+  cordisProvide(sessionRoot, 'piher.bg-job-deps', jobDeps);
 
-  await loadEntry(sessionRoot, useLoader, './plugins/terminal.ts', terminalPlugin);
+  await loadEntry(sessionRoot, useLoader, './plugins/bg-job.ts', bgJobPlugin);
 
   // Dropped keys fail here: cordisProvide checks the bag against PiherCordisServices (fe99252).
   cordisProvide(sessionRoot, 'piher.subagent-deps', {
@@ -79,7 +79,7 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
     noticePending: m.noticePending,
     getSessionId: m.getSessionId,
     claimSettleNotice: m.claimSettleNotice,
-    terminalState: terminalDeps.state,
+    terminalState: jobDeps.state,
   });
   await loadEntry(sessionRoot, useLoader, './plugins/subagent.ts', subagentPlugin);
 

@@ -14,7 +14,6 @@ import {
   piSessionDirCandidates, sessionDirName,
 } from '../src/storage-layout.ts';
 import { SWALLOW_BUFFER_MAX, formatSwallowedErrors, resetSwallowedErrors, swallow, swallowedErrors } from '../src/swallow.ts';
-import { POSIX_PROMPT, POWERSHELL_PROMPT, promptStrategyFor, terminalIdleMs, terminalReminderGraceMs } from '../src/terminal-core.ts';
 import { ToolError, toolError } from '../src/tool-error.ts';
 import { withCleanup, type CleanupContext } from './test-utils.ts';
 
@@ -141,9 +140,9 @@ test('optionValue: a set value is read, an empty string counts as unset', () => 
 });
 
 test('optionRows/formatOptionRows: env / default provenance', () => {
-  const set = optionRows({ PIHER_TERM_GRACE_MS: '0' }).find((r) => r.name === 'PIHER_TERM_GRACE_MS');
+  const set = optionRows({ PIHER_SESSION_TTL_SECONDS: '0' }).find((r) => r.name === 'PIHER_SESSION_TTL_SECONDS');
   assert.equal(set?.value, '0'); assert.equal(set?.source, 'env');
-  const unset = optionRows({}).find((r) => r.name === 'PIHER_TERM_GRACE_MS');
+  const unset = optionRows({}).find((r) => r.name === 'PIHER_SESSION_TTL_SECONDS');
   assert.equal(unset?.source, 'default'); assert.equal(formatOptionRows({}).length, OPTION_SPECS.length);
   assert.match(formatOptionRows({})[0]!, /^\s+PIHER_[A-Z_]+ = .+\(default\)/);
 });
@@ -183,10 +182,8 @@ test('createRuntimePolicy: an invalid/out-of-range value warns once and falls ba
 }));
 
 test('registry: every registered name reaches the reader that owns it', withCleanup((cleanup) => {
-  applyEnv(cleanup, { PIHER_TERM_IDLE_MS: '1234', PIHER_TERM_GRACE_MS: '4321' });
-  assert.equal(terminalIdleMs(), 1234); assert.equal(terminalReminderGraceMs(), 4321);
-  assert.equal(promptStrategyFor({ PIHER_TERMINAL_PROMPT: 'powershell' }), POWERSHELL_PROMPT);
-  assert.equal(promptStrategyFor({ PIHER_TERMINAL_PROMPT: 'bash' }), POSIX_PROMPT);
+  applyEnv(cleanup, { PIHER_JOBS_DIR: '/tmp/piher-job-test' });
+  assert.equal(optionValue('PIHER_JOBS_DIR'), '/tmp/piher-job-test');
 }));
 
 test('registry self-consistency: PIHER_* names, integer fallbacks', () => {
@@ -242,7 +239,7 @@ test('formatSwallowedErrors: explicit empty state, otherwise the last 10', () =>
 // invisible to the model and to hooks keyed on event.isError. Guard the tool modules against it.
 test('A1: tool modules never return a hard failure as text', () => {
   const offenders: string[] = [];
-  for (const file of ['src/plugins/subagent.ts', 'src/plugins/terminal.ts']) {
+  for (const file of ['src/plugins/subagent.ts', 'src/plugins/bg-job.ts']) {
     const src = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8');
     src.split('\n').forEach((line, i) => {
       const code = line.trim();

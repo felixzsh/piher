@@ -45,7 +45,7 @@ import { loadRoleConfig } from '../role-loader.ts';
 import type { Lifecycle } from '../role-manifest.ts';
 import { toolError, ToolError } from '../tool-error.ts';
 import { pipeNameFor, pipeRequestTo, type PipeRequest, type PipeResponse } from '../pipe-channel.ts';
-import type { TerminalStateSlot } from './terminal.ts';
+import type { PaneStateSlot } from './bg-job.ts';
 import { bareSessionId, resolveSessionFileValue } from '../session-tail.ts';
 import { mainWorktreeRoot } from '../storage-layout.ts';
 import { settlementCard, type SettlementCard } from '../settlement-card.ts';
@@ -82,8 +82,8 @@ export interface SubagentDeps {
   deliverNotice?: (content: string, paneId?: string, card?: SettlementCard | null) => Promise<void>;
   /** Panes whose settlement notice is still buffered (GC exemption). */
   noticePending?: () => ReadonlySet<string>;
-  /** Terminal-family GC exemption (live terminal panes are not collected). */
-  terminalState: TerminalStateSlot;
+  /** Pane-owning plugins (background jobs) are exempt from subagent panes collection. */
+  terminalState: PaneStateSlot;
   /** Test seam for the checkout piher may create and the app space that shows it (S71). */
   worktreeIo?: WorktreeIo;
 }

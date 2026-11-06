@@ -40,12 +40,9 @@ export const OPTION_SPECS: readonly OptionSpec[] = [
   { name: 'PIHER_POLL_INTERVAL_MS', fallback: '30000', min: 1000, policy: 'pollIntervalMs', description: 'safety re-check of a subagent when no core event arrives (events drive settlement)' },
   { name: 'PIHER_GC_TICK_MS', fallback: '30000', min: 1000, policy: 'gcTickMs', description: 'idle GC sweep cadence (panes)' },
   { name: 'PIHER_SESSION_TTL_SECONDS', fallback: '600', min: 0, policy: 'sessionTtlSeconds', description: 'session retention after a subagent exits, before GC' },
-  { name: 'PIHER_TERMINAL_PROMPT', fallback: '(auto from $SHELL)', description: 'prompt strategy for terminal readiness: bash|zsh|powershell|pwsh' },
   { name: 'PIHER_WRITE_LOCK', fallback: '', description: '1 makes a conflicting write/edit block instead of warn (read by the lock layer)' },
   { name: 'PIHER_TRACE', fallback: '', description: 'write diagnostics (renderers, swallowed errors) to stderr (or to this file when it is a path)' },
-  { name: 'PIHER_TERM_IDLE_MS', fallback: '300000', min: 1, description: 'idle time before the second cleanup nudge for an open terminal (per-terminal max 2; 0/NaN falls back to the default)' },
-  { name: 'PIHER_TERM_GRACE_MS', fallback: '30000', min: 1, description: 'settle grace before the terminal idle nudge (0/NaN falls back to the default)' },
-  { name: 'PIHER_TERM_READ_MAX', fallback: '8000', min: 1, description: 'characters returned per terminal read (0/NaN falls back to the default)' },
+  { name: 'PIHER_JOBS_DIR', fallback: '(system temp)/piher-jobs', description: 'directory receiving one log file per background job' },
   { name: 'PIHER_HMR', fallback: '', description: 'dev: enable the cordis HMR boundary (requires --expose-internals)' },
 ];
 

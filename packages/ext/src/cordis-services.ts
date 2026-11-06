@@ -8,13 +8,13 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { DisposeLedger } from './ledger.ts';
 import type { PiSurface } from './pi-surface.ts';
-import type { TerminalDeps } from './plugins/terminal.ts';
+import type { BgJobDeps } from './plugins/bg-job.ts';
 import type { SubagentDeps } from './plugins/subagent.ts';
 
 export interface PiherCordisServices {
   'piher.ledger': DisposeLedger;
   'piher.surface': PiSurface<object>;
-  'piher.terminal-deps': TerminalDeps;
+  'piher.bg-job-deps': BgJobDeps;
   'piher.subagent-deps': SubagentDeps;
 }
 
