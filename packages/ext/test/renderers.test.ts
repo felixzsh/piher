@@ -75,15 +75,21 @@ test('every card clips its lines to the requested width', () => {
 interface RenderCase {
   name: string; kind: 'entry' | 'message'; type: string; data?: unknown;
   expanded?: boolean; theme?: RenderTheme; expect: string[];
+  /** Env overrides for the renderer (a knob the card reads at render time). */
+  env?: Record<string, string>;
 }
 
 const CASES: RenderCase[] = [
-  { name: 'subagents: one line naming the running workers', kind: 'entry', type: SUBS_CUSTOM_TYPE, data: { version: 2, subs: [{ paneId: 'wD:p4', status: 'running', description: 'workbench upgrade' }, { paneId: 'wD:p5', status: 'running', description: 'poll-loop tests' }] }, expect: ['subagents · 2 running'] },
-  { name: 'subagents: the settled are never rows, even expanded', kind: 'entry', type: SUBS_CUSTOM_TYPE, expanded: true, data: { version: 2, subs: [{ paneId: 'wD:p4', slug: 'workbench-upgrade', status: 'running', description: 'workbench upgrade' }, { paneId: 'wD:p5', slug: 'poll-loop', status: 'settled', description: 'poll-loop tests' }] }, expect: ['subagents · 1 running'] },
-  { name: 'subagents: the running count is styled', kind: 'entry', type: SUBS_CUSTOM_TYPE, theme: marker, data: { version: 2, subs: [{ paneId: 'wD:p4', status: 'running' }, { paneId: 'wD:p5', status: 'running' }] }, expect: ['[accent]**subagents** [dim]· 2 running'] },
-  { name: 'subagents: every worker settled renders nothing', kind: 'entry', type: SUBS_CUSTOM_TYPE, expanded: true, data: { version: 2, subs: [{ paneId: 'wD:p4', status: 'settled' }, { paneId: 'wD:p5', status: 'closed' }, { paneId: 'wD:p6', status: 'consumed' }] }, expect: [] },
-  { name: 'subagents empty list', kind: 'entry', type: SUBS_CUSTOM_TYPE, data: { version: 2, subs: [] }, expect: [] },
-  { name: 'subagents undefined data', kind: 'entry', type: SUBS_CUSTOM_TYPE, expect: [] },
+  // rows (default): the count always, one row per worker when expanded — the master's fan-out.
+  { name: 'subagents rows: the count, collapsed', kind: 'entry', type: SUBS_CUSTOM_TYPE, data: { version: 2, subs: [{ paneId: 'wD:p4', status: 'running', description: 'workbench upgrade' }, { paneId: 'wD:p5', status: 'settled', description: 'poll-loop tests' }] }, expect: ['subagents · 2 tracked 1 running'] },
+  { name: 'subagents rows: every worker, settled ones included', kind: 'entry', type: SUBS_CUSTOM_TYPE, expanded: true, data: { version: 2, subs: [{ paneId: 'wD:p4', slug: 'workbench-upgrade', status: 'running', description: 'workbench upgrade' }, { paneId: 'wD:p5', slug: 'poll-loop', status: 'settled', description: 'poll-loop tests' }] }, expect: ['subagents · 2 tracked 1 running', '  ↳ workbench-upgrade@wD:p4 · running · workbench upgrade', '  ↳ poll-loop@wD:p5 · settled · poll-loop tests'] },
+  { name: 'subagents rows: an empty registry still says so', kind: 'entry', type: SUBS_CUSTOM_TYPE, data: { version: 2, subs: [] }, expect: ['subagents · none'] },
+  // summary: one line while workers run, nothing once they settle.
+  { name: 'subagents summary: only the running count', kind: 'entry', type: SUBS_CUSTOM_TYPE, env: { PIHER_SUBAGENT_CARDS: 'summary' }, data: { version: 2, subs: [{ paneId: 'wD:p4', status: 'running' }, { paneId: 'wD:p5', status: 'settled' }] }, expect: ['subagents · 1 running'] },
+  { name: 'subagents summary: all settled renders nothing', kind: 'entry', type: SUBS_CUSTOM_TYPE, env: { PIHER_SUBAGENT_CARDS: 'summary' }, expanded: true, data: { version: 2, subs: [{ paneId: 'wD:p4', status: 'settled' }] }, expect: [] },
+  // off: nothing at all, whatever the registry holds.
+  { name: 'subagents off: nothing, even while running', kind: 'entry', type: SUBS_CUSTOM_TYPE, env: { PIHER_SUBAGENT_CARDS: 'off' }, expanded: true, data: { version: 2, subs: [{ paneId: 'wD:p4', status: 'running' }] }, expect: [] },
+  { name: 'subagents undefined data still renders the head', kind: 'entry', type: SUBS_CUSTOM_TYPE, expect: ['subagents · none'] },
   { name: 'role manifest (marker theme)', kind: 'entry', type: ROLE_MANIFEST_CUSTOM_TYPE, theme: marker, data: { role: 'worker-default', manifestVersion: 'v1', tools: ['read', 'bash', 'write'], permissions: { bash: 'deny', write: 'deny', read: 'allow' } }, expect: ['[accent]**role** worker-default [dim]vv1 · 3 tools[warning] · 2 gated'] },
   { name: 'role manifest switched', kind: 'entry', type: ROLE_MANIFEST_CUSTOM_TYPE, theme: marker, data: { role: 'worker-default', manifestVersion: 'v1', tools: ['read', 'bash', 'write'], permissions: { bash: 'deny', write: 'deny', read: 'allow' }, origin: 'switch', switchedBy: 'p-master' }, expect: ['[accent]**role** worker-default [dim]vv1 · 3 tools[warning] · 2 gated[accent] ⇄ p-master'] },
   { name: 'role manifest missing', kind: 'entry', type: ROLE_MANIFEST_CUSTOM_TYPE, expect: ['role ? v? · 0 tools'] },
@@ -98,7 +104,15 @@ const CASES: RenderCase[] = [
 test('card renderers: each custom type renders its lines', async (t) => {
   for (const c of CASES) {
     await t.test(c.name, () => {
-      assert.deepEqual(cardLines(c.kind, c.type, c.data, c.expanded ?? false, c.theme ?? plain), c.expect);
+      const saved = process.env.PIHER_SUBAGENT_CARDS;
+      if (c.env) Object.assign(process.env, c.env);
+      else delete process.env.PIHER_SUBAGENT_CARDS;
+      try {
+        assert.deepEqual(cardLines(c.kind, c.type, c.data, c.expanded ?? false, c.theme ?? plain), c.expect);
+      } finally {
+        if (saved === undefined) delete process.env.PIHER_SUBAGENT_CARDS;
+        else process.env.PIHER_SUBAGENT_CARDS = saved;
+      }
     });
   }
 });

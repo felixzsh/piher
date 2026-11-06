@@ -42,6 +42,7 @@ export const OPTION_SPECS: readonly OptionSpec[] = [
   { name: 'PIHER_SESSION_TTL_SECONDS', fallback: '600', min: 0, policy: 'sessionTtlSeconds', description: 'session retention after a subagent exits, before GC' },
   { name: 'PIHER_WRITE_LOCK', fallback: '', description: '1 makes a conflicting write/edit block instead of warn (read by the lock layer)' },
   { name: 'PIHER_TRACE', fallback: '', description: 'write diagnostics (renderers, swallowed errors) to stderr (or to this file when it is a path)' },
+  { name: 'PIHER_SUBAGENT_CARDS', fallback: 'rows', description: 'transcript card for the subagent registry: rows (count + one row per worker when expanded), summary (one line while running), off (never)' },
   { name: 'PIHER_JOBS_DIR', fallback: '(system temp)/piher-jobs', description: 'directory receiving one log file per background job' },
   { name: 'PIHER_HMR', fallback: '', description: 'dev: enable the cordis HMR boundary (requires --expose-internals)' },
 ];

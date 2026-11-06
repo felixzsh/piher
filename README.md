@@ -225,6 +225,7 @@ noted. `PIHER_*` is the only namespace.
 | `PIHER_GC_TICK_MS` | `30000` | Idle GC sweep cadence |
 | `PIHER_SESSION_TTL_SECONDS` | `600` | Session retention after a worker exits, before GC |
 | `PIHER_GIT_TIMEOUT_MS` | `10000` | git command timeout (worktree creation, status probes) |
+| `PIHER_SUBAGENT_CARDS` | `rows` | Transcript card for the subagent registry: `rows` (count, and one row per worker when expanded), `summary` (one line while workers run), `off` (never) |
 | `PIHER_JOBS_DIR` | system temp `piher-jobs` | Directory receiving one log file per background job |
 | `PIHER_WRITE_LOCK` | – | `1` makes a conflicting `write`/`edit` block instead of warn |
 | `PIHER_TRACE` | – | Write diagnostics (renderers, swallowed errors) to stderr, or to this path |
