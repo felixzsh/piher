@@ -31,6 +31,7 @@ import {
   JOB_LABEL_KEY,
   JOB_NOTICE_CUSTOM_TYPE,
   LOG_READ_BYTES,
+  chooseTail,
   clampTimeoutS,
   formatJobCheckIn,
   formatJobListLine,
@@ -41,7 +42,6 @@ import {
   nextJobId,
   planJobArgv,
   readLogSlice,
-  tailLines,
   type JobRecord,
   type JobStatus,
 } from '../bg-job-core.ts';
@@ -61,7 +61,7 @@ export interface BgJobDeps {
 /** Jobs allowed at once in one session: a runaway loop of jobs is worse than a refused start. */
 const MAX_JOBS = 12;
 /** Wake at least this often to re-check a child, so a missed event is never a missed result. */
-const HEARTBEAT_MS = 5_000;
+const HEARTBEAT_MS = 2_500;
 /** Lines read from the log for a notice; the model can ask for more with `log`. */
 const NOTICE_TAIL_LINES = 20;
 
@@ -165,8 +165,12 @@ export default function bgJobPlugin(ctx: Context): void {
     stopWatchers(job.id);
     let tail = '';
     try {
-      const text = await readLogEnd(job.logPath, 'tail');
-      tail = text === null ? '' : tailLines(text, NOTICE_TAIL_LINES);
+      const logText = await readLogEnd(job.logPath, 'tail');
+      // A log that never got written falls back to the pane: a shell error is output too.
+      const paneText = logText === null || logText.trim() === ''
+        ? await client.read(job.paneId, { lines: NOTICE_TAIL_LINES * 2 }).then((r) => r.text).catch(() => '')
+        : '';
+      tail = chooseTail(logText, paneText, NOTICE_TAIL_LINES);
     } catch (err) {
       swallow('bg-job.notice-tail', err);
     }
@@ -216,7 +220,10 @@ export default function bgJobPlugin(ctx: Context): void {
       job.checkInSent = true;
       void (async () => {
         const text = await readLogEnd(job.logPath, 'tail').catch(() => null);
-        const tail = text === null ? '' : tailLines(text, NOTICE_TAIL_LINES);
+        const pane = text === null || text.trim() === ''
+          ? await client.read(job.paneId, { lines: NOTICE_TAIL_LINES * 2 }).then((r) => r.text).catch(() => '')
+          : '';
+        const tail = chooseTail(text, pane, NOTICE_TAIL_LINES);
         const bytes = await logSize(job.logPath).catch(() => null);
         sendNotice(formatJobCheckIn(job, Date.now(), tail, bytes), jobNoticeDetails(job, Date.now(), true), false);
       })();
@@ -321,8 +328,11 @@ export default function bgJobPlugin(ctx: Context): void {
     const job = findJob(params?.job_id);
     if (!job) return fail(`unknown job "${String(params?.job_id)}" (see action list)`);
     await refresh(job);
-    const tail = await readLogEnd(job.logPath, 'tail').catch(() => null);
-    const preview = tail === null || tail.trim() === '' ? '' : tailLines(tail, NOTICE_TAIL_LINES);
+    const logText = await readLogEnd(job.logPath, 'tail').catch(() => null);
+    const paneText = logText === null || logText.trim() === ''
+      ? await client.read(job.paneId, { lines: NOTICE_TAIL_LINES * 2 }).then((r) => r.text).catch(() => '')
+      : '';
+    const preview = chooseTail(logText, paneText, NOTICE_TAIL_LINES);
     const text = preview === ''
       ? formatJobStatus(job, Date.now())
       : `${formatJobStatus(job, Date.now())}\nLast output:\n${preview}`;

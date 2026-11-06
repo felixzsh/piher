@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DEFAULT_TIMEOUT_S,
+  chooseTail,
   MAX_LOG_LINES,
   MAX_TIMEOUT_S,
   MIN_TIMEOUT_S,
@@ -65,13 +66,23 @@ test('the command runs under bash with pipefail and a tee log', () => {
   const argv = planJobArgv('cargo build\n', "/tmp/job's.log");
   assert.deepEqual(argv.slice(0, 4), ['bash', '-o', 'pipefail', '-c']);
   const script = argv[4]!;
-  assert.ok(script.startsWith('cargo build 2>&1 | tee -a '));
-  assert.ok(script.includes(`'/tmp/job'\\''s.log'`));
+  assert.equal(script, `{\ncargo build\n} 2>&1 | tee -a '/tmp/job'\\''s.log'`);
 });
 
 test('a multiline command stays one script, with no line-at-a-prompt restriction', () => {
   const argv = planJobArgv('set -e\nfor i in 1 2; do echo "$i"; done', '/tmp/l.log');
   assert.ok(argv[4]!.includes('for i in 1 2'));
+});
+
+test('every command of a ; list reaches the log, not just the last', () => {
+  // `a; b | tee` would log only `b`: the brace group is what makes the log the whole output.
+  const script = planJobArgv('echo one; echo two', '/tmp/l.log')[4]!;
+  assert.equal(script, '{\necho one; echo two\n} 2>&1 | tee -a \'/tmp/l.log\'');
+});
+
+test('a trailing comment or backgrounded command cannot swallow the closing brace', () => {
+  assert.equal(planJobArgv('echo x # why not', '/tmp/l')[4]!, '{\necho x # why not\n} 2>&1 | tee -a \'/tmp/l\'');
+  assert.equal(planJobArgv('serve &', '/tmp/l')[4]!, '{\nserve &\n} 2>&1 | tee -a \'/tmp/l\'');
 });
 
 test('the check-in seconds are clamped, and a garbled value falls back to the default', () => {
@@ -89,8 +100,8 @@ test('log text loses escape sequences and carriage returns before it is shown', 
 
 test('a tail keeps the newest lines and bounds an endless one', () => {
   const lines = Array.from({ length: 50 }, (_, i) => `line ${i + 1}`).join('\n');
-  const tail = tailLines(lines, 3);
-  assert.equal(tail, 'line 48\nline 49\nline 50');
+  const tail = tailLines(`${lines}\n`, 3);
+  assert.equal(tail, 'line 48\nline 49\nline 50', 'a trailing newline costs no line');
   const endless = 'x'.repeat(5_000);
   const clipped = tailLines(endless, 1);
   assert.ok(clipped.length < 5_000);
@@ -205,4 +216,13 @@ test('a running job measures elapsed time against now', () => {
   const details = jobNoticeDetails(job({ status: 'running', endedAt: null }), 6_000, true);
   assert.equal(details.durationMs, 5_000);
   assert.equal(details.checkIn, true);
+});
+
+test('the notice falls back to the pane when the log was never written', () => {
+  // A body a shell rejects before `tee` runs leaves no log; the pane is the only witness.
+  assert.equal(chooseTail(null, 'bash: syntax error near unexpected token', 5), 'bash: syntax error near unexpected token');
+  assert.equal(chooseTail('   \n', 'line on the pane', 5), 'line on the pane');
+  // A log with content wins: it is the whole output, the pane is only a window.
+  assert.equal(chooseTail('one\ntwo\nthree\n', 'pane text', 2), 'two\nthree');
+  assert.equal(chooseTail(null, '   ', 5), '');
 });

@@ -76,7 +76,10 @@ export function shellQuote(value: string): string {
  */
 export function planJobArgv(command: string, logPath: string): readonly string[] {
   const body = command.replace(/\s+$/, '');
-  return ['bash', '-o', 'pipefail', '-c', `${body} 2>&1 | tee -a ${shellQuote(logPath)}`];
+  // The body goes in a brace group: `|` binds tighter than `;`, so `a; b | tee log` would send `a`
+  // straight to the pane and log only `b`. On its own lines, `}` also survives a trailing `&` and a
+  // trailing `# comment`, both of which would swallow it on the same line.
+  return ['bash', '-o', 'pipefail', '-c', `{\n${body}\n} 2>&1 | tee -a ${shellQuote(logPath)}`];
 }
 
 /** A check-in seconds value: clamped, never zero, and the default when the model omits or garbles it. */
@@ -93,12 +96,25 @@ export function stripOutput(text: string): string {
 /** Last `max` lines, one bounded line each: enough to judge, never a whole log in the context. */
 export function tailLines(text: string, max: number): string {
   const lines = stripOutput(text).split('\n').map((line) => clipLine(line));
-  return lines.slice(-Math.max(1, max)).join('\n').replace(/\s+$/, '');
+  // A trailing newline is not a line: left in, it costs the tail one line of real output.
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  return lines.slice(-Math.max(1, max)).join('\n');
 }
 
 function clipLine(line: string): string {
   if (line.length <= MAX_LINE_CHARS) return line;
   return `…${line.slice(-MAX_LINE_CHARS)}`;
+}
+
+/**
+ * What the notice shows: the log when it has content, the pane otherwise. A command that dies before
+ * `tee` starts (a shell syntax error, a `#` that swallows the pipe) leaves no log, and its output is
+ * only on the pane — reporting "No output" there would hide the very error the model must read.
+ */
+export function chooseTail(logText: string | null, paneText: string, max: number): string {
+  if (logText !== null && logText.trim() !== '') return tailLines(logText, max);
+  if (paneText.trim() === '') return '';
+  return tailLines(paneText, max);
 }
 
 export type LogSliceResult =
