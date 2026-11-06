@@ -292,6 +292,9 @@ async function withHarness(fn: (h: WtHarness) => Promise<void>): Promise<void> {
   let paneIndex = 0;
   const { root, pi, port } = await mountSubagent({
     deps: {
+      // A spawn whose pipe never answers must fail fast here; the production default is 90 s and this
+      // suite used to wait it out, which is why the run needed --test-force-exit to end.
+      policy: { readinessTimeoutMs: 3000 },
       checkoutIo: new NodeCheckoutIo(),
       checkoutSpace: {
         close: async (id) => {

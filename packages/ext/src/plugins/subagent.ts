@@ -44,6 +44,7 @@ import {
 } from '../history-store.ts';
 import { platformPaths } from '../platform-paths.ts';
 import { listRoleNames, loadRoleConfig } from '../role-loader.ts';
+import type { RuntimePolicy } from '../runtime-policy.ts';
 import type { Lifecycle } from '../role-manifest.ts';
 import { toolError, ToolError } from '../tool-error.ts';
 import { pipeNameFor, pipeRequestTo, type PipeRequest, type PipeResponse } from '../pipe-channel.ts';
@@ -85,6 +86,8 @@ export interface SubagentDeps {
   noticePending?: () => ReadonlySet<string>;
   /** Pane-owning plugins (background jobs) are exempt from subagent panes collection. */
   terminalState: PaneStateSlot;
+  /** Test seam for the budgets the loop reads, so a suite never waits out a production default. */
+  policy?: Partial<RuntimePolicy>;
   /** Test seam for the checkout piher may create and the app space that shows it (S71). */
   checkoutIo?: CheckoutIo;
   checkoutSpace?: CheckoutSpace;
@@ -303,7 +306,7 @@ export default function subagentPlugin(ctx: Context): void {
   };
 
   const session = createSessionIo({ client, getSessionId: d.getSessionId, sessionsDir: defaultAgentSessionsDir });
-  const spawn = createSpawner({ client, env, runtime, git });
+  const spawn = createSpawner({ client, env, runtime, git, readinessTimeoutMs: d.policy?.readinessTimeoutMs });
   const poller = createPoller({
     client,
     sessionRoot,
@@ -315,6 +318,7 @@ export default function subagentPlugin(ctx: Context): void {
     injectNotice,
     claimSettleNotice: d.claimSettleNotice,
     reclaim,
+    policy: d.policy,
   });
   const { startPoller, pollers } = poller;
   const gc = createGcController({

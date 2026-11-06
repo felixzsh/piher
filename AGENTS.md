@@ -57,10 +57,10 @@ after a one-line edit wastes the most expensive resource in the loop.
 
 | Command | What runs | Time |
 |---|---|---|
-| `node --test --test-force-exit test/<file>.test.ts` | one suite you know you touched | ~1 s |
-| `npm run test:fast` | `packages/ext/test/*.test.ts` — pure planners, roles, config catalog, renderers, transcript folding (318 tests) | ~4 s |
-| `npm run test:integration` | `packages/ext/test/integration/*.test.ts` — boots the extension, real git worktrees, installer subprocesses, core-client sockets (121 tests) | ~9 s |
-| `npm test` | `tsc --noEmit` + both tiers (439 tests) | ~20 s |
+| `node --test --test-timeout=30000 test/<file>.test.ts` | one suite you know you touched | ~1 s |
+| `npm run test:fast` | `packages/ext/test/*.test.ts` — pure planners, roles, config catalog, renderers, transcript folding (322 tests) | ~4 s |
+| `npm run test:integration` | `packages/ext/test/integration/*.test.ts` — boots the extension, real git worktrees, installer subprocesses, core-client sockets (117 tests) | ~9 s |
+| `npm test` | `tsc --noEmit` + both tiers (439 tests) | ~15 s |
 
 Rules:
 
@@ -71,9 +71,12 @@ Rules:
 - `test/integration/` is the tier for anything that spawns a process, starts a socket, touches a real
   git worktree or boots the composition root. A new suite with those properties belongs there, and
   the fast tier stays fast because of it.
-- **Never remove `--test-force-exit` from the scripts.** Without it, the spawn harness in
-  `worktree.test.ts` leaves a readiness wait pending and the process idles for the full 90 s
-  `PIHER_READY_TIMEOUT_MS` after the last test — the suite looked 100 s long for that reason alone.
+- **Give the harness its budgets; never force the exit.** `worktree.test.ts` passes
+  `policy: { readinessTimeoutMs: 3000 }`, so a spawn whose pipe never answers fails in seconds
+  instead of waiting out the 90 s `PIHER_READY_TIMEOUT_MS` (that wait alone made integration look
+  100 s long). `--test-force-exit` is what made the reported totals lie: `node --test` exits with
+  async stdout writes still pending, so a green run reported 437 tests instead of 439. With the
+  budget in the harness the flag is gone from all three scripts and the totals are stable.
 - `--test-timeout` (30 s fast, 120 s integration) is what turns a hang into a failure instead of a
   blocked terminal.
 - Do not add real sleeps to a test to satisfy a timer. Set the budget the code reads
