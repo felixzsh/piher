@@ -1,6 +1,6 @@
 {
   "name": "piher",
-  "version": "0.5.2",
+  "version": "0.1.0",
   "description": "piher: registers the subagent and terminal tools in pi and runs them as herdr-core terminals shown by the Herdr app",
   "license": "MIT",
   "type": "module",
@@ -15,12 +15,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/July24/piher.git",
+    "url": "git+https://github.com/felixzsh/piher.git",
     "directory": "packages/ext"
   },
-  "homepage": "https://github.com/July24/piher#readme",
+  "homepage": "https://github.com/felixzsh/piher#readme",
   "bugs": {
-    "url": "https://github.com/July24/piher/issues"
+    "url": "https://github.com/felixzsh/piher/issues"
   },
   "engines": {
     "node": ">=22"

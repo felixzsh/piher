@@ -1,6 +1,6 @@
-# Two-package release: a v* tag triggers this, publishing through npm Trusted Publishing (OIDC, no token).
-# Prerequisite: this workflow is registered under Settings → Trusted Publishing for both npm packages,
-# piher and piher-setup.
+# Two-package release: a v* tag publishes both npm packages through Trusted Publishing (OIDC, no
+# token) and then opens the GitHub Release for that tag. Prerequisite: this workflow is registered
+# under Settings → Trusted Publishing for both npm packages, piher and piher-setup.
 name: publish
 
 on:
@@ -8,6 +8,11 @@ on:
     tags:
       - 'v*'   # v-prefixed
       - '[0-9]*' # bare semver (e.g. 0.2.0)
+
+# A re-run of the same tag must not race a second publish.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -37,9 +42,57 @@ jobs:
       - name: Test
         run: npm test
 
+      # Each package is published only when npm does not have this version yet: the first
+      # publish of a brand-new package cannot use Trusted Publishing (npm requires the
+      # package to exist to register a trusted publisher), so that one goes out by hand —
+      # see docs/RELEASE.md. A tag push afterwards stays green instead of failing on a
+      # version npm already holds.
       - name: Publish piher
-        run: npm publish
         working-directory: packages/ext
+        run: |
+          V=$(node -p "require('./package.json').version")
+          if npm view "piher@$V" version >/dev/null 2>&1; then
+            echo "piher@$V is already on npm — nothing to publish"
+          else
+            npm publish
+          fi
 
       - name: Publish piher-setup
-        run: npm publish
+        run: |
+          V=$(node -p "require('./package.json').version")
+          if npm view "piher-setup@$V" version >/dev/null 2>&1; then
+            echo "piher-setup@$V is already on npm — nothing to publish"
+          else
+            npm publish
+          fi
+
+  # The Release is written only after both packages are on npm: a failed publish must not announce
+  # a version nobody can install. Notes are GitHub's generated ones, with the conventional-commit
+  # entries of commits that have no pull request merged into their category — the same notes the
+  # other repos produce (see .github/release.yml and .github/scripts/merge-release-notes.mjs).
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the notes need the previous tag and the whole compare range
+
+      - name: Prepare release notes
+        env:
+          GITHUB_API_URL: ${{ github.api_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node .github/scripts/merge-release-notes.mjs
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: .github/release-notes.md

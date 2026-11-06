@@ -6,6 +6,8 @@ node_modules/
 !.github/**
 docs/research/
 reports/
+# Release notes the publish workflow writes before handing them to the Release
+.github/release-notes.md
 # tsc --incremental state (a local build artifact, never committed)
 .tsbuildinfo
 packages/ext/.tsbuildinfo

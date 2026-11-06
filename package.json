@@ -1,6 +1,6 @@
 {
   "name": "piher-setup",
-  "version": "0.5.2",
+  "version": "0.1.0",
   "description": "One-shot installer for piher: install / update / version / uninstall of the piher extension on herdr-core",
   "license": "MIT",
   "type": "module",
@@ -12,11 +12,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/July24/piher.git"
+    "url": "git+https://github.com/felixzsh/piher.git"
   },
-  "homepage": "https://github.com/July24/piher#readme",
+  "homepage": "https://github.com/felixzsh/piher#readme",
   "bugs": {
-    "url": "https://github.com/July24/piher/issues"
+    "url": "https://github.com/felixzsh/piher/issues"
   },
   "engines": {
     "node": ">=22"
