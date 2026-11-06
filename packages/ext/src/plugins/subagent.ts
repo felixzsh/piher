@@ -96,7 +96,7 @@ const SUBAGENT_DESCRIPTION = [
   'spawn: `prompt` is the COMPLETE task, since only the prompt reaches it; `description` labels the pane. Several spawns in one message run in parallel (max 4).',
   'spawn places the worker by `cwd` or by `worktree` (a name: piher creates the checkout and its branch).',
   'spawn returns at once with the pane handle; the worker runs on and its result arrives later as a settlement notice at your next turn boundary — no need to sleep or poll.',
-  'send: follow-up to a running or settled worker (steered between its tool calls). output: what it printed since your last check, plus its final report once done. resume: revive a task that was left unfinished, by taskId. role: switch a worker\'s role profile mid-session.',
+  'send: follow-up to a running or settled worker, steered between tool calls. output: report once finished or the latest lines while it runs, for a stuck run or re-read; normally unneeded. resume: revive a task that was left unfinished, by taskId. role: switch a worker\'s role profile mid-session.',
   'help: the full manual (cwd/tab placement, role profiles, the delegation ledger).',
 ].join(' ');
 
@@ -110,7 +110,7 @@ const SUBAGENT_MANUAL = [
   '',
   'list — every worker that is still your business: running, or settled with a result you have not acted on. A closed worker is gone from it, and so is a one-shot once its verdict was consumed — close is final, and resume exists for work left unfinished, not for something you decided to end.',
   '',
-  'output — `agentId` required; returns status (running/idle/blocked/settled) plus what the worker has to say: its finalized report once it has finished, and the latest lines while it runs (default 6000 chars, max_chars 100-16000). The whole pane buffer is only returned with `full: true` — it carries boot chrome (banner, skills, extensions) you do not need. A settled worker also reaches you on its own as a settlement notice; read `output` when you want to re-read its words.',
+  'output — `agentId` required; returns status (running/idle/blocked/settled) plus what the worker has to say: its finalized report once it has finished, and the latest lines while it runs (default 6000 chars, max_chars 100-16000). The whole pane buffer is only returned with `full: true` — it carries boot chrome (banner, skills, extensions) you do not need. A settled worker also reaches you on its own as a settlement notice; read it when the run looks stuck or to re-read its words — in normal conditions you do not need it.',
   '',
   'send — `agentId` + `message`: if working, delivered at its next tool-call gap (seconds); if idle or settled, wakes a new turn. Do not spawn a duplicate for the same task. interrupt — aborts its current turn ONLY; the pane and its session stay and no report arrives for it, so it is not a stop.',
   '',
