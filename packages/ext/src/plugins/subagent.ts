@@ -16,6 +16,7 @@ import {
   attachSubagentStructuredContent,
   buildAliveNotice,
   buildLaunchLine,
+  entryScript,
   idParam,
   flattenToolParams,
   isAlive,
@@ -147,7 +148,7 @@ export default function subagentPlugin(ctx: Context): void {
   };
   const scoped = surface.forModule(import.meta.url);
 
-  const runtime = { nodePath: process.execPath, cliPath: process.argv[1] ?? '', extPath: d.extPath };
+  const runtime = { nodePath: process.execPath, cliPath: entryScript(process.argv[1], existsSync), extPath: d.extPath };
   const subSemaphore = new Semaphore(SUBAGENT_CONCURRENCY);
   /* Registry persisted as custom branch state so a parent restart can rebuild it. */
   const subs = new Map<string, SubEntry>();

@@ -11,7 +11,7 @@ import { mountSubagent, runSubagent, runSubagentRejects, subEntry, terminalInfo 
 import {
   MAIN_TAB_NAME, SUBS_CUSTOM_TYPE, SUBS_REGISTRY_TAIL, TAB_NAME_MAX, Semaphore, agoText, buildAliveNotice, buildBlockedGateNotice,
   allocateSubSlug, registrySnapshot, slugifyTask, subRef,
-  attachSubagentStructuredContent, buildLaunchLine, buildLaunchParts, classifyWorktreeZone, foldSubsRegistry, formatSpawnFailure, isAlive,
+  attachSubagentStructuredContent, buildLaunchLine, buildLaunchParts, entryScript, classifyWorktreeZone, foldSubsRegistry, formatSpawnFailure, isAlive,
   rekeySub, planLaunchValidation, planTabPlacement, resolveTaskIdPrefix,
   flattenToolParams, idParam, sleepWhileSubsRunningNote, tabNameForTask, type AliveProbe, type SubEntry,
 } from '../src/subagent-core.ts';
@@ -78,6 +78,23 @@ test('buildLaunchParts: a compiled binary is not named twice (a duplicate become
   // A binary with no script at all (argv[1] missing) must not become an empty argument.
   const bare = { nodePath: '/$bunfs/root/pi', cliPath: '', extPath: '/ext/index.ts' };
   assert.equal(buildLaunchParts(bare, {}, { PIHER_TUI: 'regular' })[1], '-e');
+});
+
+test('entryScript: an embedded bun path is not a script, a real file is', () => {
+  // A compiled pi reports argv[1] as /$bunfs/root/pi, which no filesystem has. Passing it made it the
+  // worker's first prompt: the child greeted "/$bunfs/root/pi" and then answered its real task, so
+  // the launch looked like the message was injected twice.
+  assert.equal(entryScript('/$bunfs/root/pi', () => false), '');
+  assert.equal(entryScript('/opt/pi/cli.js', () => true), '/opt/pi/cli.js');
+  assert.equal(entryScript(undefined, () => true), '');
+  assert.equal(entryScript('', () => true), '');
+  // With no script, the relaunch line carries no positional prompt at all.
+  const parts = buildLaunchParts(
+    { nodePath: '/bin/pi', cliPath: entryScript('/$bunfs/root/pi', () => false), extPath: '/e.ts' },
+    {},
+    { PIHER_TUI: 'regular' },
+  );
+  assert.deepEqual(parts, ['/bin/pi', '-e', '/e.ts']);
 });
 
 test('buildLaunchParts: fullscreen TUI by default (static frames); PIHER_TUI=regular opts out', () => {

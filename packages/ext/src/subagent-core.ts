@@ -471,14 +471,26 @@ function placementFor(tabName: string): TabPlacementPlan {
 }
 
 /** D97: fullscreen is what makes the pane a static frame the master can read. */
+/**
+ * The script argument to relaunch pi with, or '' when there is none. A compiled bun binary reports
+ * `argv[1]` as an embedded `/$bunfs/root/pi` that no filesystem has, and passing it makes it the
+ * child's first prompt — the worker greeted "/$bunfs/root/pi" before its real task. A script that is
+ * not on disk is not a script; an interpreter's real file is. The caller supplies `exists` so this
+ * stays a decision, not I/O.
+ */
+export function entryScript(argv1: string | undefined, exists: (path: string) => boolean): string {
+  const path = argv1 ?? '';
+  return path !== '' && exists(path) ? path : '';
+}
+
 export function buildLaunchParts(
   runtime: { nodePath: string; cliPath: string; extPath: string },
   opts: { resumeFile?: string | null; roleModel?: string | null; roleThinking?: string | null; approve?: boolean } = {},
   env: { PIHER_TUI?: string | undefined } = process.env,
 ): string[] {
   // A compiled binary is its own entrypoint: `execPath` and `argv[1]` are the same file, and passing
-  // both makes the second one the child's first prompt (observed: the worker greeted "/$bunfs/root/pi"
-  // before its real task). Only an interpreter needs its script named.
+  // both makes the second one the child's first prompt. `entryScript` already dropped an `argv[1]`
+  // that is not on disk; this covers the case where it genuinely is the binary again.
   const parts = runtime.cliPath === '' || runtime.cliPath === runtime.nodePath
     ? [runtime.nodePath]
     : [runtime.nodePath, runtime.cliPath];
