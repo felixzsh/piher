@@ -3,8 +3,17 @@
  * gc-core.ts; this adapter owns core kill/remove I/O and the ticker.
  */
 import type { Context } from '@deepseek-ai/cordis';
+import { basename } from 'node:path';
 import type { CoreClientLike, CoreEnv, TerminalInfo } from './core-client.ts';
-import { shouldClosePane, shouldCloseTaskTab } from './gc-core.ts';
+import {
+  decideCheckoutSpaces,
+  formatIdleCheckoutNotice,
+  shouldClosePane,
+  shouldCloseTaskTab,
+  type CheckoutRowLike,
+} from './gc-core.ts';
+import type { SettlementCard } from './settlement-card.ts';
+import { checkoutSpaceId, type CheckoutSpace } from './worktree.ts';
 import { runtimePolicy } from './runtime-policy.ts';
 import { swallow } from './swallow.ts';
 import { foldSubsRegistry, registrySnapshot, sleep, SUBS_CUSTOM_TYPE, type SubEntry } from './subagent-core.ts';
@@ -97,6 +106,10 @@ interface GcHost {
   writeHistory(e: SubEntry, patch?: { outcome?: string | null; status?: SubEntry['status']; closedAt?: number }, via?: string): void;
   terminalState: PaneStateSlot;
   noticePending?: () => ReadonlySet<string>;
+  /** The app's window on a checkout. Closing it ends the terminals inside, so only an empty one goes. */
+  checkoutSpace?: CheckoutSpace;
+  /** Settlement notice injector: buffers while the master is busy, flushes at turn_end. */
+  deliverNotice?: (content: string, paneId?: string, card?: SettlementCard | null) => Promise<void>;
 }
 
 interface GcController {
@@ -108,6 +121,40 @@ interface GcController {
 export function createGcController(h: GcHost): GcController {
   let prevTurnStart = Date.now();
   let gcRunning = false;
+  /** Path → the settlement a checkout reminder was already delivered for. */
+  const remindedCheckouts = new Map<string, number>();
+
+  /** A checkout's space is nobody else's to sweep: close it when empty, and remind the master once
+   *  about the window a finished-but-open worker left behind. Never ends a task, never ends a pane. */
+  async function sweepCheckoutSpaces(ttlMs: number): Promise<void> {
+    const rows: CheckoutRowLike[] = [...h.subs.values()]
+      .filter((e) => e.worktree?.path)
+      .map((e) => ({
+        kind: e.kind,
+        status: e.status,
+        consumedAt: e.consumedAt ?? null,
+        worktreePath: e.worktree?.path ?? null,
+      }));
+    if (rows.length === 0) return;
+    const sweep = decideCheckoutSpaces({ rows, ttlMs, now: Date.now(), remindedAt: remindedCheckouts });
+    for (const path of sweep.close) {
+      await h.checkoutSpace?.close(checkoutSpaceId(path)).catch(() => null);
+    }
+    for (const { path, since } of sweep.remind) {
+      const idle = [...h.subs.values()].filter((e) => e.worktree?.path === path);
+      const notice = formatIdleCheckoutNotice({
+        name: basename(path),
+        minutes: Math.round(ttlMs / 60000),
+        panes: idle.map((e) => e.paneId),
+      });
+      try {
+        await h.deliverNotice?.(notice, idle[0]?.paneId);
+      } catch {
+        continue; // refused (master mid-turn): the next tick retries the same reminder
+      }
+      remindedCheckouts.set(path, since);
+    }
+  }
 
   async function gcPass(): Promise<void> {
     if (h.subs.size === 0) return;
@@ -190,6 +237,7 @@ export function createGcController(h: GcHost): GcController {
       releaseRow(e);
       await sleep(300);
     }
+    await sweepCheckoutSpaces(ttlMs);
     h.persistSubs();
   }
 

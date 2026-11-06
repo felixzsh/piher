@@ -344,6 +344,8 @@ export default function subagentPlugin(ctx: Context): void {
     writeHistory,
     terminalState,
     noticePending: d.noticePending,
+    checkoutSpace,
+    deliverNotice: d.deliverNotice,
   });
   gc.startTicker(ctx);
   scoped.on('turn_start', () => gc.onTurnStart());

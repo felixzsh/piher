@@ -6,8 +6,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fakeWatch, fire, mountSubagent, subEntry, subsSnapshot, terminalInfo } from '../test-utils.ts';
 import { SUBS_REGISTRY_TAIL, type SubEntry } from '../../src/subagent-core.ts';
+import { checkoutSpaceId } from '../../src/worktree.ts';
 import type { TerminalInfo } from '../../src/core-client.ts';
-import { shouldClosePane, shouldCloseTaskTab, type GcEntryLike } from '../../src/gc-core.ts';
+import {
+  decideCheckoutSpaces, formatIdleCheckoutNotice, shouldClosePane, shouldCloseTaskTab,
+  type CheckoutRowLike, type GcEntryLike,
+} from '../../src/gc-core.ts';
 
 const NOW = 1_000_000;
 const TTL = 600_000;
@@ -79,8 +83,7 @@ async function gcPass(liveTerminals: string[], subs: SubEntry[]): Promise<{ clos
   }
 }
 
-test('GC pass: panes are reclaimed, tasks are not closed', async () => {
-  const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-'));
+test('GC pass: panes are reclaimed, tasks are not closed', async () => {  const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-'));
   const { closed, subs } = await gcPass(['pAlive'], [consumed('pAlive', cwd), consumed('pGone', cwd)]);
   assert.deepEqual(closed, ['pAlive'], 'the pane is retired');
   const byId = new Map(subs.map((s) => [s.paneId, s.status]));
@@ -143,4 +146,85 @@ test('registry: startup settles zombie running rows whose terminal core no longe
   } finally {
     await root.fiber.dispose();
   }
+});
+
+test('decideCheckoutSpaces: an empty window closes, a finished-but-open one only gets a reminder', () => {
+  const path = '/home/u/.herdr/worktrees/piher/probe';
+  const row = (over: Partial<GcEntryLike> = {}): CheckoutRowLike => ({ ...work(over), worktreePath: path });
+  const decide = (rows: ReturnType<typeof row>[], remindedAt?: Map<string, number>) =>
+    decideCheckoutSpaces({ rows, ttlMs: TTL, now: NOW, remindedAt });
+
+  // Every row closed → the space is an empty window: cleanup, no reminder.
+  assert.deepEqual(decide([row({ status: 'closed' }), row({ status: 'closed' })]), { close: [path], remind: [] });
+  // A finished row nobody closed keeps its window: a reminder, never a close.
+  assert.deepEqual(decide([row()]), { close: [], remind: [{ path, since: NOW - TTL - 1000 }] });
+  // One live sibling is enough to hold both decisions.
+  assert.deepEqual(decide([row({ status: 'closed' }), row({ status: 'running', consumedAt: null })]), { close: [], remind: [] });
+  // The grace window still runs.
+  assert.deepEqual(decide([row({ consumedAt: NOW - 1000 })]), { close: [], remind: [] });
+  // One reminder per settlement: the same `since` never fires twice.
+  const once = new Map([[path, NOW - TTL - 1000]]);
+  assert.deepEqual(decide([row()], once), { close: [], remind: [] });
+  // A revive that settles again is new activity, so it may remind again.
+  assert.deepEqual(decide([row({ consumedAt: NOW - TTL - 500 })], once).remind.length, 1);
+  // Rows with no checkout take no part in the sweep.
+  assert.deepEqual(decide([{ ...work(), worktreePath: null }]), { close: [], remind: [] });
+  assert.equal(decideCheckoutSpaces({ rows: [row()], ttlMs: 0, now: NOW }).remind.length, 0, 'ttl 0 disables the reminder');
+
+  const notice = formatIdleCheckoutNotice({ name: 'probe', minutes: 10, panes: ['p2', 'p3'] });
+  assert.match(notice, /checkout probe has had no running subagent for 10 min \(p2, p3\)/);
+  assert.match(notice, /stays open/);
+  assert.match(notice, /subagent action:"close"/);
+});
+
+/** A checkout sweep pass: one row per worker, all in the same checkout. */
+async function checkoutPass(subs: SubEntry[], passes = 1): Promise<{
+  closed: string[]; notices: string[]; subs: SubEntry[];
+}> {
+  const closed: string[] = [];
+  const notices: string[] = [];
+  const { root, pi } = await mountSubagent({
+    client: {
+      placementLabels: async () => ({ 'herdr.tab': 'tMAIN' }),
+      listTerminals: async () => [],
+      watchChildren: () => fakeWatch({ terminals: () => [] }),
+      kill: async () => {},
+    },
+    deps: {
+      checkoutSpace: { close: async (id: string) => { closed.push(id); return null; } },
+      deliverNotice: async (content: string) => { notices.push(content); },
+    },
+    subs,
+  });
+  try {
+    for (let i = 0; i < passes; i += 1) await fire(pi, 'turn_start');
+    return { closed, notices, subs: subsSnapshot(pi)!.subs };
+  } finally {
+    await root.fiber.dispose();
+  }
+}
+
+test('GC pass: a checkout with a finished-but-open worker is reminded once and kept', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'checkout-gc-'));
+  const path = join(cwd, 'probe');
+  const wt = { path, branch: 'probe' };
+  const old = Date.now() - 700_000;
+  const rows = [
+    { ...consumed('p2', path), tabId: '', worktree: wt, consumedAt: old },
+    { ...consumed('p3', path), tabId: '', taskId: 'task-p3', worktree: wt, consumedAt: old },
+  ];
+  const { closed, notices } = await checkoutPass(rows, 2);
+  assert.deepEqual(closed, [], 'an idle worker keeps its window: space.close ends its terminal');
+  assert.equal(notices.length, 1, 'the reminder is delivered once, not every tick');
+  assert.match(notices[0]!, /checkout probe has had no running subagent for 10 min/);
+});
+
+test('GC pass: a checkout whose workers are all closed has its space closed', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'checkout-gc-closed-'));
+  const path = join(cwd, 'probe');
+  const wt = { path, branch: 'probe' };
+  const rows = [{ ...consumed('p2', path), tabId: '', worktree: wt, status: 'closed' as const }];
+  const { closed, notices } = await checkoutPass(rows);
+  assert.deepEqual(closed, [checkoutSpaceId(path)], 'an empty window is cleanup, not a decision');
+  assert.deepEqual(notices, []);
 });
