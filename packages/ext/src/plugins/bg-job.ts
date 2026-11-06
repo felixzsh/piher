@@ -268,6 +268,7 @@ export default function bgJobPlugin(ctx: Context): void {
     const plans = planAdoption(
       terminals.map((terminal) => ({
         id: terminal.id,
+        parent: terminal.parent,
         cwd: terminal.cwd,
         labels: terminal.labels,
         state: terminal.state,
@@ -275,6 +276,7 @@ export default function bgJobPlugin(ctx: Context): void {
       })),
       new Set(jobs.keys()),
       Date.now(),
+      { parent: env?.terminalId ?? null },
     );
     for (const plan of plans) {
       jobs.set(plan.job.id, plan.job);

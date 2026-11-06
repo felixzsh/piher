@@ -24,9 +24,10 @@ async function mount(client: Parameters<typeof fakeCore>[0], pi: FakePi = fakePi
   return { pi, root };
 }
 
-function jobTerminal(over: { id: string; jobId: string; started?: number; state?: 'live' | 'finished'; exitCode?: number | null }) {
+function jobTerminal(over: { id: string; jobId: string; started?: number; state?: 'live' | 'finished'; exitCode?: number | null; parent?: string | null }) {
   return terminalInfo({
     id: over.id,
+    parent: over.parent ?? 't0',
     cwd: '/repo',
     state: over.state ?? 'live',
     exitCode: over.exitCode ?? null,
@@ -59,6 +60,30 @@ test('start: a job gets no placement labels, so it never opens a pane beside the
     assert.equal(captured!['herdr.tab'], undefined, 'no tab placement: no pane opens beside the master');
     assert.equal(captured!['herdr.space'], undefined, 'no space placement either');
     assert.equal(captured![JOB_LABEL_KEY] !== undefined, true, 'the job label is how core and the app name it');
+  } finally {
+    await root.fiber.dispose();
+  }
+}));
+
+test('mount: another master\'s job is not adopted, listed or announced here', withCleanup(async () => {
+  // Core reports every live terminal; the label alone would let a job from another project look like
+  // this session's own work. Lineage is the boundary: this master is t0.
+  const terminals = [
+    jobTerminal({ id: 't9', jobId: 'job-1xk3', parent: 'tOTHER' }),
+    jobTerminal({ id: 't8', jobId: 'job-2xk3' }),
+  ];
+  const { pi, root } = await mount({
+    listTerminals: async () => terminals,
+    getTerminal: async (id: string) => terminals.find((terminal) => terminal.id === id) ?? null,
+  });
+  try {
+    await fire(pi, 'session_start', {}, {});
+    const listed = (await pi.tools.get('bg_job')!.execute!('tc', { action: 'list' }, undefined, undefined, {})) as {
+      content: Array<{ text: string }>;
+    };
+    const text = listed.content.map((block) => block.text).join('\n');
+    assert.match(text, /job-2xk3/, 'its own job is listed');
+    assert.doesNotMatch(text, /job-1xk3/, 'a sibling master\'s job is not');
   } finally {
     await root.fiber.dispose();
   }

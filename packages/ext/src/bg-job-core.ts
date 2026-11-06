@@ -171,6 +171,8 @@ export function decodeJobMeta(raw: unknown): JobMeta | null {
 /** What adoption needs from a terminal: the plugin reads nothing else. */
 export interface AdoptableTerminal {
   id: string;
+  /** The terminal that started it: core's lineage, the only boundary that is not a guess. */
+  parent?: string | null;
   cwd: string;
   labels: Readonly<Record<string, string>>;
   state: 'live' | 'finished';
@@ -194,12 +196,16 @@ export function planAdoption(
   terminals: readonly AdoptableTerminal[],
   known: ReadonlySet<string>,
   now: number,
+  opts: { parent?: string | null } = {},
 ): AdoptPlan[] {
   const plans: AdoptPlan[] = [];
   const seen = new Set(known);
   for (const terminal of terminals) {
     const id = terminal.labels[JOB_LABEL_KEY];
     if (typeof id !== 'string' || id === '' || seen.has(id)) continue;
+    // Another master's job is not this session's business: core reports every live terminal, so the
+    // `piher.job` label alone would let a job from another project be adopted and announced here.
+    if (opts.parent !== undefined && terminal.parent !== opts.parent) continue;
     seen.add(id);
     const meta = decodeJobMeta(terminal.labels[JOB_META_LABEL]);
     const started = meta !== null && meta.started > 0 ? meta.started : now;
