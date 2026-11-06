@@ -95,7 +95,7 @@ type ToolDef = {
   [key: string]: unknown;
 };
 type CommandDef = { handler?: PiHandler; [key: string]: unknown };
-type SentMessage = { msg: { customType?: string; content?: unknown; display?: boolean }; opts?: Record<string, unknown> };
+type SentMessage = { msg: { customType?: string; content?: unknown; display?: boolean; details?: unknown }; opts?: Record<string, unknown> };
 
 /** Superset fake of the pi ExtensionAPI surface. */
 export interface FakePi {

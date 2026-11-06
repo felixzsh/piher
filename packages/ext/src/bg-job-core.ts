@@ -11,8 +11,16 @@ import { stripAnsi } from './ansi-text.ts';
 
 /** Transcript card for the one notice a job gets (exit, check-in). */
 export const JOB_NOTICE_CUSTOM_TYPE = 'piher.job-exit';
-/** Label every job pane carries, so the app and later sessions can recognize one. */
+/** Label every job pane carries, so the app and a later mount can recognize one. */
 export const JOB_LABEL_KEY = 'piher.job';
+/**
+ * Second label on a job pane: the facts the plugin's memory would have had. The registry is in
+ * memory, so a reload forgets a running job while core keeps it alive; this label is what lets the
+ * next mount adopt it instead of going blind. A command is metadata, not a log, so it is clipped.
+ */
+export const JOB_META_LABEL = 'piher.job.meta';
+/** Command characters kept in the label; enough to name the job in a notice, never the whole script. */
+export const META_COMMAND_MAX = 120;
 
 /** A check-in is a glance, not a failure: the job keeps running when it fires. */
 export const DEFAULT_TIMEOUT_S = 300;
@@ -119,6 +127,103 @@ export function chooseTail(logText: string | null, paneText: string, max: number
   if (logText !== null && logText.trim() !== '') return tailLines(logText, max);
   if (paneText.trim() === '') return '';
   return tailLines(paneText, max);
+}
+
+/** The facts of a job that outlive its plugin instance. Short keys keep the label compact. */
+export interface JobMeta {
+  name: string | null;
+  log: string;
+  started: number;
+  /** The check-in budget in seconds, so an adopted job knows how much of it is left. */
+  timeout: number;
+  command: string;
+}
+
+export function encodeJobMeta(meta: JobMeta): string {
+  const command = meta.command.length > META_COMMAND_MAX
+    ? `${meta.command.slice(0, META_COMMAND_MAX - 1)}…`
+    : meta.command;
+  return JSON.stringify({ n: meta.name, l: meta.log, s: meta.started, t: meta.timeout, c: command });
+}
+
+/** Tolerant on purpose: a label written by an older build must degrade, never throw. */
+export function decodeJobMeta(raw: unknown): JobMeta | null {
+  if (typeof raw !== 'string' || raw.trim() === '') return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const rec = parsed as Record<string, unknown>;
+  const log = typeof rec.l === 'string' ? rec.l : '';
+  const started = typeof rec.s === 'number' && Number.isFinite(rec.s) ? rec.s : 0;
+  const timeout = typeof rec.t === 'number' && Number.isFinite(rec.t) ? rec.t : 0;
+  const command = typeof rec.c === 'string' ? rec.c : '';
+  const name = typeof rec.n === 'string' && rec.n ? rec.n : null;
+  return { name, log, started, timeout, command };
+}
+
+/** What adoption needs from a terminal: the plugin reads nothing else. */
+export interface AdoptableTerminal {
+  id: string;
+  cwd: string;
+  labels: Readonly<Record<string, string>>;
+  state: 'live' | 'finished';
+  exitCode: number | null;
+}
+
+export interface AdoptPlan {
+  job: JobRecord;
+  /** The child already exited while no watcher was listening: report it now. */
+  finished: boolean;
+  /** Milliseconds left before the check-in, 0 when it is already due. */
+  remainingMs: number;
+}
+
+/**
+ * Jobs a fresh mount should pick up: the panes still carrying this session's job label, minus the
+ * ones it already tracks. A terminal with no meta label is adopted with what core knows and a
+ * clipped command, because a job nobody watches is worse than one described imprecisely.
+ */
+export function planAdoption(
+  terminals: readonly AdoptableTerminal[],
+  known: ReadonlySet<string>,
+  now: number,
+): AdoptPlan[] {
+  const plans: AdoptPlan[] = [];
+  const seen = new Set(known);
+  for (const terminal of terminals) {
+    const id = terminal.labels[JOB_LABEL_KEY];
+    if (typeof id !== 'string' || id === '' || seen.has(id)) continue;
+    seen.add(id);
+    const meta = decodeJobMeta(terminal.labels[JOB_META_LABEL]);
+    const started = meta !== null && meta.started > 0 ? meta.started : now;
+    const timeout = meta !== null && meta.timeout > 0 ? meta.timeout : DEFAULT_TIMEOUT_S;
+    const elapsed = Math.max(0, now - started);
+    const job: JobRecord = {
+      id,
+      label: meta?.name ?? null,
+      command: meta !== null && meta.command !== '' ? meta.command : '(started before this reload — command unknown)',
+      cwd: terminal.cwd,
+      paneId: terminal.id,
+      logPath: meta?.log ?? '',
+      startedAt: started,
+      status: 'running',
+      // Carry core's verdict in: a job that already exited is reported with its own exit code.
+      exitCode: terminal.state === 'finished' ? terminal.exitCode : null,
+      endedAt: null,
+      // A job that already outlived its budget when it was adopted must not fire a check-in burst.
+      checkInSent: elapsed >= timeout * 1000,
+    };
+    plans.push({
+      job,
+      finished: terminal.state === 'finished',
+      remainingMs: Math.max(0, timeout * 1000 - elapsed),
+    });
+  }
+  return plans;
 }
 
 export type LogSliceResult =

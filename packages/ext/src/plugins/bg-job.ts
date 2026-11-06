@@ -29,10 +29,12 @@ import { swallow } from '../swallow.ts';
 import {
   DEFAULT_TIMEOUT_S,
   JOB_LABEL_KEY,
+  JOB_META_LABEL,
   JOB_NOTICE_CUSTOM_TYPE,
   LOG_READ_BYTES,
   chooseTail,
   clampTimeoutS,
+  encodeJobMeta,
   formatJobCheckIn,
   formatJobListLine,
   formatJobNotice,
@@ -40,6 +42,7 @@ import {
   jobCoreName,
   jobNoticeDetails,
   nextJobId,
+  planAdoption,
   planJobArgv,
   readLogSlice,
   type JobRecord,
@@ -237,6 +240,43 @@ export default function bgJobPlugin(ctx: Context): void {
     timers.set(job.id, timer);
   }
 
+  /**
+   * Adopt what a previous mount left running. The registry is in memory, so a reload forgets a live
+   * job while core keeps it alive; asking core which panes still carry the job label is what turns
+   * that amnesia into "you are told anyway" — including a job that exited while nobody watched.
+   */
+  async function adoptPreviousJobs(): Promise<void> {
+    if (!client.available) return;
+    let terminals;
+    try {
+      terminals = await client.listTerminals();
+    } catch (err) {
+      swallow('bg-job.adopt', err);
+      return;
+    }
+    const plans = planAdoption(
+      terminals.map((terminal) => ({
+        id: terminal.id,
+        cwd: terminal.cwd,
+        labels: terminal.labels,
+        state: terminal.state,
+        exitCode: terminal.exitCode,
+      })),
+      new Set(jobs.keys()),
+      Date.now(),
+    );
+    for (const plan of plans) {
+      jobs.set(plan.job.id, plan.job);
+      if (plan.finished) {
+        // Its exit report was owed and never delivered: deliver it now, with core's own exit code.
+        await settleJob(plan.job, 'finished', plan.job.exitCode);
+        continue;
+      }
+      startWatch(plan.job);
+      if (!plan.job.checkInSent && plan.remainingMs > 0) armCheckIn(plan.job, plan.remainingMs / 1000);
+    }
+  }
+
   function runningCount(): number {
     return [...jobs.values()].filter((job) => job.status === 'running').length;
   }
@@ -251,10 +291,9 @@ export default function bgJobPlugin(ctx: Context): void {
     if (job.status !== 'running') return;
     const info = await client.getTerminal(job.paneId).catch(() => null);
     if (info === null) {
-      job.status = 'failed';
-      job.endedAt = Date.now();
-      job.error = 'the terminal disappeared before reporting an exit';
-      stopWatchers(job.id);
+      // A probe that says "gone" is an outcome, so it is reported like one: a job that vanishes
+      // silently would leave the launcher waiting for a notice that never comes.
+      await settleJob(job, 'failed', null, 'the terminal disappeared before reporting an exit');
       return;
     }
     if (info.state === 'finished') await settleJob(job, 'finished', info.exitCode);
@@ -285,6 +324,7 @@ export default function bgJobPlugin(ctx: Context): void {
     } catch (err) {
       return fail(`cannot create the log directory ${logDir}: ${errText(err)}`);
     }
+    const startedAt = Date.now();
     let info: TerminalInfo;
     try {
       // Keep the job in this terminal's app tab, and label it so `hc ls` and the app can name it.
@@ -293,7 +333,17 @@ export default function bgJobPlugin(ctx: Context): void {
         argv: [...planJobArgv(command, logPath)],
         cwd,
         env: childEnvironment(process.env, {}),
-        labels: { ...labels, [JOB_LABEL_KEY]: id },
+        labels: {
+          ...labels,
+          [JOB_LABEL_KEY]: id,
+          [JOB_META_LABEL]: encodeJobMeta({
+            name: label,
+            log: logPath,
+            started: startedAt,
+            timeout: timeoutS,
+            command,
+          }),
+        },
         name: jobCoreName(id, label),
         // The notice comes through pi's message API, never as a note typed into the master's PTY.
         noNotify: true,
@@ -308,7 +358,7 @@ export default function bgJobPlugin(ctx: Context): void {
       cwd,
       paneId: info.id,
       logPath,
-      startedAt: Date.now(),
+      startedAt,
       status: 'running',
       exitCode: null,
       endedAt: null,
@@ -477,6 +527,8 @@ export default function bgJobPlugin(ctx: Context): void {
     for (const id of [...timers.keys()]) stopWatchers(id);
     for (const id of [...watches.keys()]) stopWatchers(id);
   };
+  // A mount that inherited running jobs adopts them before anything else: the notice is owed.
+  scoped.on('session_start', async () => { await adoptPreviousJobs(); });
   scoped.on('session_shutdown', async () => { dispose(); });
   ctx.effect(() => dispose, 'bg-job-watchers');
 }

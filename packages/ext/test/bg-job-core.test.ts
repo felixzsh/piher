@@ -3,8 +3,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DEFAULT_TIMEOUT_S,
+  JOB_LABEL_KEY,
+  JOB_META_LABEL,
   chooseTail,
   clock,
+  decodeJobMeta,
+  encodeJobMeta,
+  planAdoption,
   MAX_LOG_LINES,
   MAX_TIMEOUT_S,
   MIN_TIMEOUT_S,
@@ -238,4 +243,72 @@ test('the notice falls back to the pane when the log was never written', () => {
   // A log with content wins: it is the whole output, the pane is only a window.
   assert.equal(chooseTail('one\ntwo\nthree\n', 'pane text', 2), 'two\nthree');
   assert.equal(chooseTail(null, '   ', 5), '');
+});
+
+test('a job label roundtrips, and a long command is clipped there', () => {
+  const meta = { name: 'build release', log: '/tmp/l.log', started: 1_000, timeout: 300, command: 'cargo build' };
+  assert.deepEqual(decodeJobMeta(encodeJobMeta(meta)), meta);
+  const long = encodeJobMeta({ ...meta, command: 'x'.repeat(400) });
+  assert.ok(long.length < 400 + 120, 'the label stays metadata-sized');
+  assert.match(decodeJobMeta(long)!.command, /…$/);
+});
+
+test('a label written by another build degrades instead of throwing', () => {
+  assert.equal(decodeJobMeta(undefined), null);
+  assert.equal(decodeJobMeta('not json'), null);
+  assert.equal(decodeJobMeta('[1,2]'), null);
+  assert.deepEqual(decodeJobMeta('{}'), { name: null, log: '', started: 0, timeout: 0, command: '' });
+});
+
+test('adoption picks up a live job with its remaining check-in budget', () => {
+  const now = 100_000;
+  const meta = encodeJobMeta({ name: 'tests', log: '/tmp/j.log', started: now - 40_000, timeout: 300, command: 'npm test' });
+  const plans = planAdoption([{
+    id: 't9', cwd: '/repo', labels: { [JOB_LABEL_KEY]: 'job-1k3', [JOB_META_LABEL]: meta },
+    state: 'live', exitCode: null,
+  }], new Set(), now);
+  assert.equal(plans.length, 1);
+  const plan = plans[0]!;
+  assert.equal(plan.finished, false);
+  assert.equal(plan.job.id, 'job-1k3');
+  assert.equal(plan.job.label, 'tests');
+  assert.equal(plan.job.paneId, 't9');
+  assert.equal(plan.job.status, 'running');
+  assert.equal(plan.remainingMs, 260_000, '300s budget minus the 40s already spent');
+  assert.equal(plan.job.checkInSent, false);
+});
+
+test('adoption reports a job that exited while nobody was watching', () => {
+  const now = 100_000;
+  const plans = planAdoption([{
+    id: 't9', cwd: '/repo', labels: { [JOB_LABEL_KEY]: 'job-2', [JOB_META_LABEL]: encodeJobMeta({ name: null, log: '', started: now - 9_000, timeout: 300, command: 'false' }) },
+    state: 'finished', exitCode: 1,
+  }], new Set(), now);
+  assert.equal(plans.length, 1);
+  assert.equal(plans[0]!.finished, true);
+  assert.equal(plans[0]!.job.exitCode, 1, "core's exit code survives the reload");
+});
+
+test('adoption ignores what it already tracks, foreign panes, and fires no late check-in', () => {
+  const now = 1_700_000_000_000;
+  const live = (id: string, labels: Record<string, string>) => ({ id: `t-${id}`, cwd: '/repo', labels, state: 'live' as const, exitCode: null });
+  const plans = planAdoption([
+    live('known', { [JOB_LABEL_KEY]: 'job-1' }),
+    live('foreign', { 'piher.session': 'abc' }),
+    live('stale', { [JOB_LABEL_KEY]: 'job-3', [JOB_META_LABEL]: encodeJobMeta({ name: null, log: '', started: now - 600_000, timeout: 300, command: 'sleep' }) }),
+  ], new Set(['job-1']), now);
+  assert.deepEqual(plans.map((plan) => plan.job.id), ['job-3']);
+  assert.equal(plans[0]!.job.checkInSent, true, 'a job already past its budget is not discovered again');
+  assert.equal(plans[0]!.job.command, 'sleep');
+});
+
+test('a job from a build without the meta label is still adopted, with what core knows', () => {
+  const now = 100_000;
+  const plans = planAdoption([{
+    id: 't7', cwd: '/repo', labels: { [JOB_LABEL_KEY]: 'job-9' }, state: 'live', exitCode: null,
+  }], new Set(), now);
+  assert.equal(plans.length, 1);
+  assert.equal(plans[0]!.job.logPath, '');
+  assert.match(plans[0]!.job.command, /command unknown/);
+  assert.equal(plans[0]!.job.startedAt, now);
 });

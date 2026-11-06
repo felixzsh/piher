@@ -33,6 +33,7 @@ or at a file that no longer exists, fails the suite.
 | D96 | When the caller settles while workers still run, one reminder is injected per run set (de-duplicated, cooled down, suppressed by an abort) | `packages/ext/src/settle-wake-core.ts:1` |
 | D97 | Fullscreen TUI mode is what turns a pane into a static frame the caller can read without ANSI reflow | `packages/ext/src/subagent-core.ts:474` |
 | D98 | Execution is a program, not a typed shell line: `bg_job` runs an argv and core reports the child's exit, so no sentinel is parsed from a screen | `packages/ext/src/bg-job-core.ts:1` |
+| D101 | A `bg_job` job is adopted by label after a reload: core knows what is alive, so an in-memory registry never decides whether the launcher gets told | `packages/ext/src/bg-job-core.ts:1` |
 | D100 | piher never calls `herdr-app`: its `Open worktree` lists `git worktree list`, so the shared path convention is the whole integration | `packages/ext/src/worktree.ts:1` |
 | D99 | There is no `terminal` tool: an interactive shell is `hc`'s business through the bundled skill, so the extension never re-implements a PTY CLI | `packages/ext/skills/piher-tools/SKILL.md:1` |
 | D104 | The config catalog is one plane map: roles are per file, env is per process, and every value reports its source | `packages/ext/src/config-catalog-core.ts:1` |

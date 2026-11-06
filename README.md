@@ -90,8 +90,10 @@ pipeline's; nothing is typed at a prompt, so no command has to be a single line.
 | `stop` | Kill the job's process tree; a stopped job never notifies |
 | `list` | This session's jobs, newest first |
 
-The notice is the only thing the model receives: outcome, exit code, elapsed time, the last lines and
-how to read more. The whole output stays in the log, so a long build never floods the context, and
+A job survives a reload of the extension: every job pane carries its id, log, start time and check-in
+budget in labels, so the next mount asks core what is still running, re-arms the watch and reports a
+job that exited while nobody was listening. The notice is the only thing the model receives:
+outcome, exit code, elapsed time, the last lines and how to read more. The whole output stays in the log, so a long build never floods the context, and
 `timeout_s` (default 300) produces a **check-in**, not a failure — the job keeps running and the
 notice says so first. A settle wakes an idle session; a check-in does not.
 

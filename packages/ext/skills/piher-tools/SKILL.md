@@ -128,7 +128,8 @@ code, elapsed time, the last lines, and how to read more from the log. The whole
 log, so a long build never floods the context.
 
 - After `start`, keep working or end the turn. Never poll `status` or `log` to wait: the notice
-  arrives by itself.
+  arrives by itself — it wakes an idle session, and it still arrives after the extension reloaded,
+  because the job is adopted from its pane's labels.
 - `timeout_s` (default 300) is a **check-in**, not a timeout. The notice says the job is still
   running and that it was not stopped. Look once with `log`, then keep waiting or `stop` it. Never
   re-send the command.
