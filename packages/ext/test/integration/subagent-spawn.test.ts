@@ -72,6 +72,8 @@ interface PipeEnv {
   spawnEnvs: Array<Record<string, string>>;
   /** `herdr.*` label blocks handed to `terminal.run` in spawn order. */
   spawnLabels: Array<Record<string, string>>;
+  /** Report the worker's terminal as gone, as housekeeping would have reclaimed it. */
+  paneGone: boolean;
   /** Uncancellable poll loop: make the children watch's `changed` never resolve, so a row it holds
    *  stays `running` for the rest of the test. */
   parkPollers(): void;
@@ -97,7 +99,7 @@ async function withPipeEnv(
   let parked = false;
   const env: PipeEnv = {
     cwd, home, pi: undefined as never, port: undefined as never, frames: [], retired: [], spawnEnvs: [], spawnLabels: [],
-    parkPollers: () => { parked = true; }, rejectPrompt: false, pipeDelayMs: 0,
+    parkPollers: () => { parked = true; }, rejectPrompt: false, pipeDelayMs: 0, paneGone: false,
   };
   let paneCounter = 0;
   const nextPaneId = (): string => (opts.paneSeq ? `p${2 + paneCounter++}` : 'p2');
@@ -126,7 +128,7 @@ async function withPipeEnv(
   await Promise.all(servers.map((s) => new Promise<void>((resolve) => s.once('listening', resolve))));
   const { root, pi, port } = await mountSubagent({
     client: {
-      getTerminal: async (id: string) => terminalInfo({
+      getTerminal: async (id: string) => env.paneGone ? null : terminalInfo({
         id,
         labels: ['p2', 'p3', 'p4'].includes(id) ? { 'piher.session': sessionFile } : {},
       }),
@@ -253,6 +255,38 @@ test('spawn/send: the reply pipe is scoped by the master session cwd, not the wo
     assert.match(sent.content[0]!.text, /Message sent to subagent [a-z0-9-]+@p2/);
     assert.equal((env.frames[1] as { from?: string }).from, expected, 'follow_up replies to the same master pipe');
   }, { childCwd: other });
+});
+
+test('send: a settled persistent worker is still reachable', async () => {
+  await withPipeEnv(async (env) => {
+    env.parkPollers();
+    const spawned = await runSubagent(env.pi, { description: 'hola', prompt: PROMPT }, env.cwd);
+    const paneId = spawned.details?.paneId as string;
+    await waitFor(() => env.port.current !== null);
+    env.port.current!.consumeReply(paneId, 'REPORT: hola');
+    // A persistent worker delivered its result, not its life: the master keeps talking to it.
+    const sent = await runSubagent(env.pi, { action: 'send', agentId: paneId, message: 'y ahora otra cosa' }, env.cwd);
+    assert.match(sent.content[0]!.text, /Message sent to subagent/);
+    // The combined `slug@paneId` form is what spawn prints, so it is what a master copies back.
+    const slug = /started subagent ([a-z0-9-]+)@/.exec(spawned.content[0]!.text)![1];
+    const combined = await runSubagent(env.pi, { action: 'send', agentId: `${slug}@${paneId}`, message: 'otra vez' }, env.cwd);
+    assert.match(combined.content[0]!.text, /Message sent to subagent/);
+  });
+});
+
+test('send: a persistent worker whose pane was reclaimed is revived, not refused', async () => {
+  await withPipeEnv(async (env) => {
+    env.parkPollers();
+    const spawned = await runSubagent(env.pi, { description: 'hola', prompt: PROMPT }, env.cwd);
+    const paneId = spawned.details?.paneId as string;
+    await waitFor(() => env.port.current !== null);
+    env.port.current!.consumeReply(paneId, 'REPORT: hola');
+    // Housekeeping reclaims the pane of a settled worker; the task itself was never closed.
+    env.paneGone = true;
+    const sent = await runSubagent(env.pi, { action: 'send', agentId: paneId, message: 'sigue aqui' }, env.cwd);
+    assert.match(sent.content[0]!.text, /Message sent to subagent/);
+    assert.equal(env.spawnEnvs.length, 2, 'a second terminal carries the follow-up on the same session');
+  });
 });
 
 test('send/resume: short prefixes resolve at four characters and report ambiguity or misses', async () => {

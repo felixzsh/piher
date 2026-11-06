@@ -75,8 +75,10 @@ export function createSubagentRegistry(host: SubagentRegistryHost): SubagentRegi
     let changed = false;
     for (const [paneId, entry] of host.subs) {
       if (entry.status !== 'running' || liveTerminalIds.has(paneId)) continue;
-      entry.status = 'closed';
-      host.writeHistory(entry, { status: 'closed', closedAt: Date.now() }, 'zombie-sweep');
+      // Its pane is gone, so it is not running — but nothing ended it: a vanished pane is unfinished
+      // work, and unfinished work is what `resume` exists for. Only `close` may write `closed`.
+      entry.status = 'settled';
+      host.writeHistory(entry, { status: 'settled' }, 'zombie-sweep');
       changed = true;
     }
     if (changed) persist();
@@ -131,10 +133,16 @@ export function createGcController(h: GcHost): GcController {
     }
     const mainTabId = (await h.client.placementLabels())['herdr.tab'] ?? '';
 
-    const closeRow = (e: SubEntry): void => {
-      if (e.status === 'closed') return;
-      e.status = 'closed';
-      h.writeHistory(e, { status: 'closed', closedAt: Date.now() }, 'gc');
+    /**
+     * Housekeeping never ends a task. The pane and the tab are piher's to reclaim, but the row is the
+     * master's: it becomes `settled` (unfinished, resumable) and only `close` writes `closed`. A sweep
+     * that stamped `closed` used to be undone by `send` reviving it, which is exactly the coupling
+     * that made "close is final" contradictory.
+     */
+    const releaseRow = (e: SubEntry): void => {
+      if (e.status !== 'running') return;
+      e.status = 'settled';
+      h.writeHistory(e, { status: 'settled' }, 'gc');
     };
     /** The pair `close` and a one-shot settlement use as well. */
     const retire = (id: string): Promise<void> => retirePane(h.client, id);
@@ -143,7 +151,7 @@ export function createGcController(h: GcHost): GcController {
       if (tabId === mainTabId) continue;
       const tabTerminals = terminals.filter((t) => tabOf(t) === tabId);
       if (tabTerminals.length === 0) {
-        for (const e of entries) closeRow(e);
+        for (const e of entries) releaseRow(e);
         continue;
       }
       if (!autoCloseTabs) continue;
@@ -156,7 +164,7 @@ export function createGcController(h: GcHost): GcController {
       // Live terminal panes and not-yet-delivered settlement notices keep the tab alive.
       if (tabTerminals.some((t) => termPaneIds.has(t.id) || pendingNoticeIds.has(t.id))) continue;
       for (const t of tabTerminals) await retire(t.id);
-      for (const e of entries) closeRow(e);
+      for (const e of entries) releaseRow(e);
       await sleep(300);
     }
 
@@ -174,11 +182,11 @@ export function createGcController(h: GcHost): GcController {
         prevTurnStart,
       })) continue;
       if (statuses.get(e.paneId) === undefined) {
-        closeRow(e);
+        releaseRow(e);
         continue;
       }
       await retire(e.paneId);
-      closeRow(e);
+      releaseRow(e);
       await sleep(300);
     }
     h.persistSubs();

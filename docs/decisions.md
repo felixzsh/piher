@@ -36,6 +36,7 @@ or at a file that no longer exists, fails the suite.
 | D102 | A worker is spent when the master was told: a consumed one-shot or a closed one leaves `list`, and `resume` exists only for work left unfinished | `packages/ext/src/plugins/subagent.ts:1` |
 | D101 | A `bg_job` job is adopted by label after a reload: core knows what is alive, so an in-memory registry never decides whether the launcher gets told | `packages/ext/src/bg-job-core.ts:1` |
 | D100 | A checkout worker opens its app space by `herdr.space` label alone (the app creates an unknown space from it); only closing that space calls `herdr-app`, best effort | `packages/ext/src/worktree.ts:1` |
+| D105 | Housekeeping reclaims panes and tabs but never ends a task: a vanished pane leaves the row `settled` (resumable), and only `close` writes `closed` | `packages/ext/src/subagent-gc.ts:1` |
 | D104 | A worker terminal carries no placement label: it never becomes a pane, and the app's agents view still nests it under its parent (the agents mod walks the core's terminals, not the panes) | `packages/ext/src/subagent-spawn.ts:1` |
 | D103 | A one-shot closes its space but never its checkout: the working tree is what the master reviews before deciding to merge | `packages/ext/src/plugins/subagent.ts:1` |
 | D99 | There is no `terminal` tool: an interactive shell is `hc`'s business through the bundled skill, so the extension never re-implements a PTY CLI | `packages/ext/skills/piher-tools/SKILL.md:1` |

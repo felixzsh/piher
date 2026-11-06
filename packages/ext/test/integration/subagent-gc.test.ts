@@ -74,13 +74,14 @@ async function gcPass(liveTerminals: string[], subs: SubEntry[]): Promise<{ clos
   }
 }
 
-test('GC pass: a live consumed terminal is retired, a vanished one is only recorded closed', async () => {
+test('GC pass: panes are reclaimed, tasks are not closed', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-'));
   const { closed, subs } = await gcPass(['pAlive'], [consumed('pAlive', cwd), consumed('pGone', cwd)]);
-  assert.deepEqual(closed, ['pAlive']);
+  assert.deepEqual(closed, ['pAlive'], 'the pane is retired');
   const byId = new Map(subs.map((s) => [s.paneId, s.status]));
-  assert.equal(byId.get('pAlive'), 'closed');
-  assert.equal(byId.get('pGone'), 'closed');
+  // Housekeeping frees panes; only `close` ends a task. A consumed row keeps its result unread state.
+  assert.equal(byId.get('pAlive'), 'consumed');
+  assert.equal(byId.get('pGone'), 'consumed');
 });
 
 test('GC pass: the master terminal is never collected, whatever the registry claims', async () => {
@@ -125,14 +126,15 @@ test('registry: the persisted snapshot keeps running rows plus a bounded tail of
   }
 });
 
-test('registry: startup sweeps zombie running rows whose terminal core no longer lists', async () => {
+test('registry: startup settles zombie running rows whose terminal core no longer lists', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-zombie-'));
   const { root, pi } = await mountSubagent({
     client: { listTerminals: async () => [] },
     subs: [{ ...consumed('pZombie', cwd), status: 'running', consumedAt: null }],
   });
   try {
-    assert.equal(subsSnapshot(pi)!.subs.find((s) => s.paneId === 'pZombie')!.status, 'closed');
+    // Not closed: the work is unfinished, which is what `resume` is for. Only `close` writes closed.
+    assert.equal(subsSnapshot(pi)!.subs.find((s) => s.paneId === 'pZombie')!.status, 'settled');
   } finally {
     await root.fiber.dispose();
   }

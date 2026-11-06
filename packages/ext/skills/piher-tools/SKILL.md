@@ -96,7 +96,10 @@ the correction.
 
 **`close`** is final: it reclaims a worker that already finished — pane and tab go — and the worker
 leaves `list` for good, because closing is you deciding the work is done. A closed worker cannot be
-sent to or resumed. A one-shot leaves the same way once its verdict is consumed. A worker that is still running is refused with a pointer at `interrupt` — a task must
+sent to or resumed. A one-shot leaves the same way once its verdict is consumed.
+
+Housekeeping is not `close`: when a settled worker's pane is reclaimed, the task stays `settled` and
+`send`/`resume` bring it back on the same session. Persistence means until *you* close it. A worker that is still running is refused with a pointer at `interrupt` — a task must
 not disappear without a report. Close is housekeeping, never how you kill work. When the
 spawn asked for a `worktree`, close ends that too: its space closes and the checkout is removed (a
 dirty one is refused), while the branch survives. A one-shot closes only its space: the checkout

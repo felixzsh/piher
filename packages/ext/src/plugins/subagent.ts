@@ -524,8 +524,21 @@ export default function subagentPlugin(ctx: Context): void {
     return { entry: resolved.entry, cwd };
   }
 
+  /**
+   * Bring back a worker whose pane is gone but whose task was never closed. Housekeeping reclaims
+   * panes and tabs (`gc`), so a settled persistent worker usually has no pane left; `send` used to
+   * read that as `closed` and revive, which collapsed "not live" and "closed by the master" into one
+   * state. They are different: a closed task is final, a vanished pane is unfinished work.
+   */
   async function ensureLive(entry: SubEntry): Promise<void> {
-    if (entry.status !== 'closed') return;
+    if (entry.status === 'closed') return; // final: the caller asked for `send` on purpose, refuse in spentText
+    let alive = false;
+    try {
+      alive = (await probeAlive(entry.paneId, entry.cwd)).paneExists;
+    } catch {
+      alive = true; // a probe that fails must not spawn a second pane over a live one
+    }
+    if (alive) return;
     const previousPaneId = entry.paneId;
     await reviveEntry(entry);
     rekeySub(subs, previousPaneId, entry);
