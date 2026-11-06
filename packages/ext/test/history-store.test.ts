@@ -119,3 +119,22 @@ test('via: the writer marker survives a round-trip (one row per event, auditable
   ));
   assert.deepEqual(rows.map((r) => r.via), ['poll-settle', 'gc']);
 });
+
+test('appendLedger: a checkout that no longer exists is not announced as a misconfiguration', () => {
+  // A worktree the close removed still has rows in the registry; writing one more must not print
+  // "not inside a git repository" about a path nobody can visit.
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (line: string) => { lines.push(String(line)); };
+  try {
+    const gone = path.join(fs.mkdtempSync(path.join(fs.realpathSync('/tmp'), 'piher-gone-')), 'nested');
+    const res = appendLedger(gone, {
+      taskId: 't-gone', description: 'x', status: 'closed', paneId: 'p1', createdAt: 1,
+      kind: 'worker', cwd: gone, tabId: 't1', tabName: 'w',
+    } as never);
+    assert.equal(res.ok, false, 'nothing is recorded: there is nowhere to record it');
+    assert.deepEqual(lines, [], 'and nothing says a removed checkout is not a repository');
+  } finally {
+    console.error = original;
+  }
+});

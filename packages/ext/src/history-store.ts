@@ -154,6 +154,9 @@ const noLedgerLogged = new Set<string>();
 export function appendLedger(cwd: string, entry: HistoryEntry): HistoryWriteResult {
   const file = ledgerFile(cwd);
   if (file !== null) return appendHistory(file, entry);
+  // A checkout the spawn itself removed is not a misconfiguration: the rows it wrote while it existed
+  // are its history, and a line about a path that no longer exists only reads as an error in a prompt.
+  if (!fs.existsSync(cwd)) return { ok: false, error: new Error(`delegation ledger root is gone: ${cwd}`) };
   if (!noLedgerLogged.has(cwd)) {
     noLedgerLogged.add(cwd);
     console.error(
