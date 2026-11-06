@@ -50,7 +50,9 @@ never a path, and piher makes `~/.herdr/worktrees/<repo>/<slug>` on branch `<nam
 HEAD, so you write no `git worktree add`. The worker opens in its own space of the app, as the
 app's worktree button would: piher labels the terminal and the app creates the space from it. The slug
 is the name with anything outside `[A-Za-z0-9._-]` turned into `-`. The two parameters are
-mutually exclusive. `role` picks a profile (unknown names are display labels only), and
+mutually exclusive. `role` picks a profile — `action: "help"` lists the ones available here with their
+description, tools and lifecycle, so never go hunting for role files on disk — (unknown names are
+display labels only), and
 `allowed_tools` only *adds* tools on top of the role baseline; a role's deny rules still win.
 `lifecycle` is the role's, never a per-spawn choice: `one-shot` reports once and exits (its row is
 consumed with the verdict), and a role that omits it is `persistent` — it stays until you `close` it.

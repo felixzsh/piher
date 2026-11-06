@@ -11,7 +11,7 @@ import { mountSubagent, runSubagent, runSubagentRejects, subEntry, terminalInfo 
 import {
   MAIN_TAB_NAME, SUBS_CUSTOM_TYPE, SUBS_REGISTRY_TAIL, TAB_NAME_MAX, Semaphore, agoText, buildAliveNotice, buildBlockedGateNotice,
   allocateSubSlug, registrySnapshot, slugifyTask, subRef,
-  attachSubagentStructuredContent, buildLaunchLine, buildLaunchParts, entryScript, classifyWorktreeZone, foldSubsRegistry, formatSpawnFailure, isAlive,
+  attachSubagentStructuredContent, buildLaunchLine, buildLaunchParts, entryScript, formatRoleCatalog, classifyWorktreeZone, foldSubsRegistry, formatSpawnFailure, isAlive,
   rekeySub, planLaunchValidation, planTabPlacement, resolveTaskIdPrefix,
   flattenToolParams, idParam, sleepWhileSubsRunningNote, tabNameForTask, type AliveProbe, type SubEntry,
 } from '../src/subagent-core.ts';
@@ -557,12 +557,27 @@ test('subagent plugin: tool_result hook only rewrites our errors, and stays sile
   await root.fiber.dispose();
 });
 
+test('formatRoleCatalog: name, description, lifecycle and tools — what a master needs to pick', () => {
+  const text = formatRoleCatalog([
+    { name: 'reviewer', description: 'Static reviewer of a bounded change', tools: ['read', 'bash'], lifecycle: 'one-shot' },
+    { name: 'worker', description: null, tools: [], lifecycle: 'persistent' },
+    { name: 'broken', invalid: 'manifest.tools must be an array' },
+  ]);
+  assert.match(text, /role profiles available here/, 'discovery is the tool\'s job, not the filesystem\'s');
+  assert.match(text, /- reviewer — Static reviewer of a bounded change \(one-shot · tools: read, bash\)/);
+  assert.match(text, /- worker — no description \(persistent · tools: none declared\)/);
+  assert.match(text, /- broken — INVALID: manifest\.tools must be an array/, 'a broken profile is reported, not hidden');
+  assert.match(formatRoleCatalog([]), /none in this workspace/, 'an empty catalog still answers the question');
+});
+
 test('subagent plugin: help returns the manual, and a missing action normalizes to spawn', async () => {
   const { root, pi } = await mountSubagent();
   const def = pi.tools.get('subagent')!;
   const help = await runSubagent(pi, { action: 'help' });
   assert.match(help.content[0]!.text, /^subagent manual/);
   for (const topic of ['cwd', 'role + allowed_tools', 'resume', 'history.jsonl']) assert.ok(help.content[0]!.text.includes(topic), topic);
+  // Either shape answers "which agents do I have"; the machine's own role files decide which.
+  assert.match(help.content[0]!.text, /role profiles( available here| — none)/, 'help lists the launchable profiles, so no hunting for role files');
   assert.equal(String(def.description).includes('history.jsonl'), false, 'ledger detail rides help, not every request');
   assert.deepEqual(def.prepareArguments?.({ description: 'x', prompt: 'y' }), { description: 'x', prompt: 'y', action: 'spawn' });
   assert.deepEqual(def.prepareArguments?.({ action: 'list' }), { action: 'list' });

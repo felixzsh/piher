@@ -17,6 +17,7 @@ import {
   buildAliveNotice,
   buildLaunchLine,
   entryScript,
+  formatRoleCatalog,
   idParam,
   flattenToolParams,
   isAlive,
@@ -42,7 +43,7 @@ import {
   type HistoryEntry,
 } from '../history-store.ts';
 import { platformPaths } from '../platform-paths.ts';
-import { loadRoleConfig } from '../role-loader.ts';
+import { listRoleNames, loadRoleConfig } from '../role-loader.ts';
 import type { Lifecycle } from '../role-manifest.ts';
 import { toolError, ToolError } from '../tool-error.ts';
 import { pipeNameFor, pipeRequestTo, type PipeRequest, type PipeResponse } from '../pipe-channel.ts';
@@ -106,7 +107,7 @@ const SUBAGENT_MANUAL = [
   '',
   'spawn — the subagent shares this workspace and works independently; its result is its final text answer, delivered as a settlement notice. The call returns at once with the worker handle, so never wait on it in-turn. `prompt` is the whole task: the worker does not see this conversation, so paths, acceptance criteria, the command that proves the work and what to report back all belong in it. Do not delegate the current step itself. Placement: a worker opens no pane — the app lists it under you in its agents view, where you can peek at it on demand, and only a worker in its own checkout opens a space of its own (exactly as the app\'s worktree button does, from a label, without stealing focus). `tab` joins or creates a named task tab instead. `cwd` targets an existing directory or worktree you already have. `worktree` is a name, never a path: piher creates `~/.herdr/worktrees/<repo>/<slug>` (the name, anything outside A-Za-z0-9._- turned into a dash) on branch `<name>` from your HEAD and reuses it when it already sits on that branch. `close` ends that space and removes the checkout, refusing a dirty one; a one-shot closes only its space and keeps the checkout, because merging is your decision — `cwd` and `worktree` are mutually exclusive.',
   '',
-  'role + allowed_tools — when role matches a profile (searched: workspace .piher/roles/ → user-global ~/.pi/agent/piher/roles/ → builtin), the worker toolset becomes baseline ∪ allowed_tools minus role-deny tools (deny always wins). Custom roles: drop a JSON profile into .piher/roles/ (master/worker-default reserved). Unknown role names stay display labels. action role switches a live worker (pi transcript tool delta: applies on its next request, survives resume); the reply reports the tool diff.',
+  'role + allowed_tools — `action: "help"` lists the profiles available here (name, description, tools, lifecycle), so no filesystem hunting is needed. When role matches a profile (searched: workspace .piher/roles/ → user-global ~/.pi/agent/piher/roles/ → builtin), the worker toolset becomes baseline ∪ allowed_tools minus role-deny tools (deny always wins). Custom roles: drop a JSON profile into .piher/roles/ (master/worker-default reserved). Unknown role names stay display labels. action role switches a live worker (pi transcript tool delta: applies on its next request, survives resume); the reply reports the tool diff.',
   '',
   'list — every worker that is still your business: running, or settled with a result you have not acted on. A closed worker is gone from it, and so is a one-shot once its verdict was consumed — close is final, and resume exists for work left unfinished, not for something you decided to end.',
   '',
@@ -147,6 +148,24 @@ export default function subagentPlugin(ctx: Context): void {
     sendUserMessage?: (content: string, opts?: { deliverAs?: string }) => void;
   };
   const scoped = surface.forModule(import.meta.url);
+
+  /** Every launchable profile, read at call time: workspace roles change without restarting pi. */
+  function roleCatalog(cwd: string): string {
+    const profiles = listRoleNames(cwd, undefined).map((name) => {
+      try {
+        const role = loadRoleConfig(name, { baseDir: cwd });
+        return {
+          name,
+          description: role.description ?? null,
+          tools: role.manifest.tools,
+          lifecycle: role.lifecycle === 'one-shot' ? ('one-shot' as const) : ('persistent' as const),
+        };
+      } catch (err) {
+        return { name, invalid: (err as Error).message.split('\n')[0] ?? 'invalid manifest' };
+      }
+    });
+    return formatRoleCatalog(profiles);
+  }
 
   const runtime = { nodePath: process.execPath, cliPath: entryScript(process.argv[1], existsSync), extPath: d.extPath };
   const subSemaphore = new Semaphore(SUBAGENT_CONCURRENCY);
@@ -895,7 +914,10 @@ export default function subagentPlugin(ctx: Context): void {
     output: (params, toolCtx) => executeSubagentOutput(params, toolCtx, outputActionDeps),
     role: (params, toolCtx) => executeSubagentRole(params, toolCtx),
     close: (params, toolCtx) => executeSubagentClose(params, toolCtx),
-    help: async () => ({ content: [{ type: 'text', text: SUBAGENT_MANUAL }], details: {} }),
+    help: async (_params, toolCtx) => {
+      const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
+      return { content: [{ type: 'text' as const, text: `${SUBAGENT_MANUAL}\n\n${roleCatalog(cwd)}` }], details: {} };
+    },
   };
 
   scoped.registerTool({
@@ -926,7 +948,7 @@ export default function subagentPlugin(ctx: Context): void {
       prompt: Type.Optional(Type.String({ description: '[spawn] The complete self-contained task' })),
       cwd: Type.Optional(Type.String({ description: '[spawn] Existing directory or worktree to run in (absolute or workspace-relative)' })),
       worktree: Type.Optional(Type.String({ description: '[spawn] Name of a checkout piher creates for the worker (branch of the same name); mutually exclusive with cwd' })),
-      role: Type.Optional(Type.String({ description: '[spawn|role] Role profile name; unknown names are display labels only' })),
+      role: Type.Optional(Type.String({ description: '[spawn|role] Role profile name; action help lists the profiles available here (description, tools, lifecycle). Unknown names are display labels only' })),
       tab: Type.Optional(Type.String({ description: '[spawn] Task tab to join or create (default: grouped by worktree)' })),
       allowed_tools: Type.Optional(Type.Array(Type.String(), { description: '[spawn] Extra tools on top of the role baseline' })),
       taskId: Type.Optional(Type.String({ description: '[resume] Task id from the delegation ledger' })),

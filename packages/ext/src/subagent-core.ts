@@ -516,6 +516,38 @@ export function buildLaunchParts(
   return parts;
 }
 
+/**
+ * The role profiles a master can actually launch here, as `help` prints them. Discovery belongs to the
+ * tool: without this a master hunts the filesystem (workspace, user dir, find, then the whole manifest)
+ * to answer "which agents do I have", which is what it did before every review spawn.
+ */
+export function formatRoleCatalog(
+  profiles: readonly {
+    name: string;
+    description?: string | null;
+    tools?: readonly string[];
+    lifecycle?: 'one-shot' | 'persistent';
+    invalid?: string | null;
+  }[],
+): string {
+  if (profiles.length === 0) {
+    return 'role profiles — none in this workspace or user directory; pass no `role` for the builtin worker-default.';
+  }
+  const lines = profiles.map((profile) => {
+    if (profile.invalid) return `  - ${profile.name} — INVALID: ${profile.invalid}`;
+    const facts = [
+      profile.lifecycle === 'one-shot' ? 'one-shot' : 'persistent',
+      profile.tools?.length ? `tools: ${profile.tools.join(', ')}` : 'tools: none declared',
+    ].join(' · ');
+    const what = profile.description?.trim() ? profile.description.trim() : 'no description';
+    return `  - ${profile.name} — ${what} (${facts})`;
+  });
+  return [
+    'role profiles available here (`role` accepts these; omit it for the builtin worker-default):',
+    ...lines,
+  ].join('\n');
+}
+
 /* ── execute planners ───────────────────────────────────────────── */
 
 type LaunchValidation =
