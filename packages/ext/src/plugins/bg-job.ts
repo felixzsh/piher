@@ -23,6 +23,7 @@ import {
   type CoreEnv,
   type TerminalInfo,
 } from '../core-client.ts';
+import { withoutPlacement } from '../subagent-core.ts';
 import { toolError } from '../tool-error.ts';
 import { optionValue } from '../options.ts';
 import { swallow } from '../swallow.ts';
@@ -337,8 +338,9 @@ export default function bgJobPlugin(ctx: Context): void {
     const startedAt = Date.now();
     let info: TerminalInfo;
     try {
-      // Keep the job in this terminal's app tab, and label it so `hc ls` and the app can name it.
-      const labels = await client.placementLabels();
+      // No placement: like a worker, a job's terminal belongs to the agents section of the sidebar,
+      // not to a pane beside the master in this tab. Core still runs it, and the labels name it.
+      const labels = withoutPlacement(await client.placementLabels());
       info = await client.run({
         argv: [...planJobArgv(command, logPath)],
         cwd,

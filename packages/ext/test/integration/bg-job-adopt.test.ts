@@ -43,6 +43,27 @@ function jobTerminal(over: { id: string; jobId: string; started?: number; state?
   });
 }
 
+test('start: a job gets no placement labels, so it never opens a pane beside the master', withCleanup(async () => {
+  let captured: Record<string, string> | null = null;
+  const { pi, root } = await mount({
+    placementLabels: async () => ({ 'herdr.space': 'sp0', 'herdr.tab': 'tb0' }),
+    run: async (o: { labels?: Record<string, string> }) => {
+      captured = o.labels ?? null;
+      return terminalInfo({ id: 't1', cwd: '/repo' });
+    },
+  });
+  try {
+    const execute = pi.tools.get('bg_job')!.execute!;
+    await execute('tc', { action: 'start', command: 'sleep 1' }, undefined, undefined, { cwd: '/repo' } as never);
+    // A worker opens no pane — the app nests it in the agents section — and a job is the same deal.
+    assert.equal(captured!['herdr.tab'], undefined, 'no tab placement: no pane opens beside the master');
+    assert.equal(captured!['herdr.space'], undefined, 'no space placement either');
+    assert.equal(captured![JOB_LABEL_KEY] !== undefined, true, 'the job label is how core and the app name it');
+  } finally {
+    await root.fiber.dispose();
+  }
+}));
+
 test('mount: a job that exited during the reload is reported with its own exit code', withCleanup(async () => {
   const terminals = [jobTerminal({ id: 't9', jobId: 'job-1xk3', state: 'finished', exitCode: 101 })];
   const { pi, root } = await mount({ listTerminals: async () => terminals });
