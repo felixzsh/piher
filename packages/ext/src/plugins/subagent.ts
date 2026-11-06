@@ -648,30 +648,26 @@ export default function subagentPlugin(ctx: Context): void {
     try {
       if (opts.ready !== false) {
         // A just-spawned worker is still booting: its prompt must reach it before any follow-up.
-        // An already-live worker needs none of the spawn-readiness machinery (a ping round plus a
-        // pane probe with a terminal read), so `send` pays only the pipe round trip and proves
-        // reachability by delivering.
         const boot = boots.get(entry.paneId);
-        if (boot) await boot;
-        trace('boot');
-        await ensureLive(entry);
-        trace('live');
         if (boot) {
-          const ready = await waitSubReady(entry.cwd, entry.paneId);
-          trace('ready');
-          if (!ready.ok) throw new Error(ready.message);
+          await boot;
+          trace('boot');
         }
       }
       const payload = opts.build();
       let res: PipeResponse;
       try {
+        // The pipe IS the liveness proof: a worker that answers it is alive, so a healthy `send` is
+        // one round trip with no liveness RPC and no terminal read in front of it.
         res = await pipeRequestTo(entry.cwd, entry.paneId, payload);
       } catch (err) {
-        // No boot record and no answer: a revived pane may still be starting its pipe. Pay for
-        // readiness once, then retry the same request instead of failing a live worker.
         if (opts.ready === false) throw err;
+        // Only a pipe that did not answer earns the expensive path: the pane may be gone (revive it
+        // and rekey the row) or still starting (wait for readiness), then retry the same request.
+        await ensureLive(entry);
+        trace('recovered-liveness');
         const ready = await waitSubReady(entry.cwd, entry.paneId);
-        trace('ready-fallback');
+        trace('recovered-ready');
         if (!ready.ok) throw new Error(ready.message);
         res = await pipeRequestTo(entry.cwd, entry.paneId, payload);
       }

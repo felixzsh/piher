@@ -74,6 +74,8 @@ interface PipeEnv {
   spawnLabels: Array<Record<string, string>>;
   /** Report the worker's terminal as gone, as housekeeping would have reclaimed it. */
   paneGone: boolean;
+  /** How many pipe connections die before one is served: a reclaimed pane's socket, then the revived one. */
+  deadPipes: number;
   /** Uncancellable poll loop: make the children watch's `changed` never resolve, so a row it holds
    *  stays `running` for the rest of the test. */
   parkPollers(): void;
@@ -99,7 +101,7 @@ async function withPipeEnv(
   let parked = false;
   const env: PipeEnv = {
     cwd, home, pi: undefined as never, port: undefined as never, frames: [], retired: [], spawnEnvs: [], spawnLabels: [],
-    parkPollers: () => { parked = true; }, rejectPrompt: false, pipeDelayMs: 0, paneGone: false,
+    parkPollers: () => { parked = true; }, rejectPrompt: false, pipeDelayMs: 0, paneGone: false, deadPipes: 0,
   };
   let paneCounter = 0;
   const nextPaneId = (): string => (opts.paneSeq ? `p${2 + paneCounter++}` : 'p2');
@@ -118,6 +120,12 @@ async function withPipeEnv(
     });
     servers.push(server);
     server.on('connection', (sock) => {
+      // A reclaimed pane's pipe dies mid-request: the client must fall back to liveness, not hang.
+      if (env.deadPipes > 0) {
+        env.deadPipes -= 1;
+        sock.destroy();
+        return;
+      }
       sockets.add(sock);
       sock.on('close', () => sockets.delete(sock));
     });
@@ -262,7 +270,9 @@ test('send: a settled persistent worker is still reachable', async () => {
     env.parkPollers();
     const spawned = await runSubagent(env.pi, { description: 'hola', prompt: PROMPT }, env.cwd);
     const paneId = spawned.details?.paneId as string;
-    await waitFor(() => env.port.current !== null);
+    // The spawn's own boot (readiness ping + prompt) must be over, so the dead pipe the send meets is
+    // the send's, not the boot's.
+    await waitFor(() => env.frames.length === 1);
     env.port.current!.consumeReply(paneId, 'REPORT: hola');
     // A persistent worker delivered its result, not its life: the master keeps talking to it.
     const sent = await runSubagent(env.pi, { action: 'send', agentId: paneId, message: 'y ahora otra cosa' }, env.cwd);
@@ -279,10 +289,14 @@ test('send: a persistent worker whose pane was reclaimed is revived, not refused
     env.parkPollers();
     const spawned = await runSubagent(env.pi, { description: 'hola', prompt: PROMPT }, env.cwd);
     const paneId = spawned.details?.paneId as string;
-    await waitFor(() => env.port.current !== null);
+    // The spawn's own boot (readiness ping + prompt) must be over, so the dead pipe the send meets is
+    // the send's, not the boot's.
+    await waitFor(() => env.frames.length === 1);
     env.port.current!.consumeReply(paneId, 'REPORT: hola');
-    // Housekeeping reclaims the pane of a settled worker; the task itself was never closed.
+    // Housekeeping reclaims the pane of a settled worker; the task itself was never closed. The pane's
+    // pipe goes with it, which is what a `send` sees first — no liveness RPC answers for it.
     env.paneGone = true;
+    env.deadPipes = 1;
     const sent = await runSubagent(env.pi, { action: 'send', agentId: paneId, message: 'sigue aqui' }, env.cwd);
     assert.match(sent.content[0]!.text, /Message sent to subagent/);
     assert.equal(env.spawnEnvs.length, 2, 'a second terminal carries the follow-up on the same session');
