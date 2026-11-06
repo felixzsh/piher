@@ -6,6 +6,7 @@ import { normalizeEntryKind } from './history-store.ts';
 import type { Lifecycle } from './role-manifest.ts';
 import type { WorktreeRecord } from './worktree.ts';
 import { foldWorktree } from './worktree.ts';
+import { CORE_REQUIRED } from './core-client.ts';
 import type { SettlementCard, SettlementOutcome } from './settlement-card.ts';
 import type { WorkerWidgetRow } from './tree-view.ts';
 import { Type } from 'typebox';
@@ -581,7 +582,7 @@ export function planLaunchValidation(
   available: boolean,
 ): LaunchValidation {
   if (!available) {
-    return { kind: 'error', text: 'Error: subagent requires pi to run inside a herdr-core terminal (HC_TERMINAL_ID not set).' };
+    return { kind: 'error', text: `Error: subagent: ${CORE_REQUIRED}.` };
   }
   const spec: SubagentSpec = {
     description: String(params?.description ?? 'subagent'),

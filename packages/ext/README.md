@@ -12,16 +12,12 @@ transcript already recorded.
 ## Install
 
 ```sh
-pi install npm:piher
 curl -fsSL https://releases.herdr.dev/core/install.sh | sh   # herdr-core, required for the tools
+pi install npm:piher                                        # this package
 ```
 
-Or use the one-shot installer from the repository root, which preflights node / pi / `hc` and prints
-an informational line for `herdr-app`:
-
-```sh
-npx piher-setup@latest
-```
+`pi update --extensions` updates it, `pi remove npm:piher` removes it. Without `hc` the package still
+loads and both tools answer with that install command instead of running anything.
 
 ## What it registers
 

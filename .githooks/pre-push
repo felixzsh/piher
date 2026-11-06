@@ -1,16 +1,15 @@
 #!/bin/sh
 # ─────────────────────────────────────────────────────────────────────
-# Release guard: pushes of a tag are refused unless the three version
-# numbers agree.
+# Release guard: pushes of a tag are refused unless the tag and the one
+# published package agree.
 # The full recipe is in docs/RELEASE.md (maintainer notes, not the README).
 #
-# The three places (all equal, and greater than what npm already has):
+# Both places (equal, and greater than what npm already has):
 #   1. the git tag itself (v-prefixed or bare semver: v0.2.0 / 0.2.0)
 #   2. version in packages/ext/package.json   (npm package piher)
-#   3. version in the root package.json       (npm package piher-setup)
 #
 # How to release:
-#   1. set both package.json versions to the target version
+#   1. set the version in packages/ext/package.json to the target version
 #   2. git commit
 #   3. git tag <target> && git push && git push --tags
 #
@@ -19,7 +18,7 @@
 # ─────────────────────────────────────────────────────────────────────
 set -u
 
-fail() { echo "✗ [publish-guard] $1" >&2; echo '  hint: set the version in packages/ext/package.json and in the root package.json to the tag, then re-tag.' >&2; exit 1; }
+fail() { echo "✗ [publish-guard] $1" >&2; echo '  hint: set the version in packages/ext/package.json to the tag, then re-tag.' >&2; exit 1; }
 
 ver_of() { # $1=ref $2=json path inside that ref → prints its version
   git show "$1:$2" 2>/dev/null | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8")).version' 2>/dev/null
@@ -37,16 +36,14 @@ while read -r local_ref local_sha _remote_ref _remote_sha; do
   ver="${tag#v}"
 
   ext="$(ver_of "$tag" packages/ext/package.json)" || true
-  root="$(ver_of "$tag" package.json)" || true
 
   [ -n "$ext" ]  || fail "cannot read the version in packages/ext/package.json at tag $tag"
-  [ -n "$root" ] || fail "cannot read the version in the root package.json at tag $tag (piher-setup needs one)"
 
-  if [ "$ver" != "$ext" ] || [ "$ver" != "$root" ]; then
-    fail "version mismatch: tag=$ver, piher=$ext, piher-setup=$root"
+  if [ "$ver" != "$ext" ]; then
+    fail "version mismatch: tag=$ver, piher=$ext"
   fi
 
-  echo "✓ [publish-guard] ${tag}: tag = piher@${ext} = piher-setup@${root}"
+  echo "✓ [publish-guard] ${tag}: tag = piher@${ext}"
 done
 
 exit 0

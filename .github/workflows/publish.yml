@@ -1,6 +1,6 @@
-# Two-package release: a v* tag publishes both npm packages through Trusted Publishing (OIDC, no
-# token) and then opens the GitHub Release for that tag. Prerequisite: this workflow is registered
-# under Settings → Trusted Publishing for both npm packages, piher and piher-setup.
+# One package: a v* tag publishes `piher` through Trusted Publishing (OIDC, no token) and then opens
+# the GitHub Release for that tag. Prerequisite: this workflow is registered under Settings →
+# Trusted Publishing for the npm package piher.
 name: publish
 
 on:
@@ -29,24 +29,22 @@ jobs:
       # npm Trusted Publishing (OIDC) needs npm >= 11.5; Node 22 ships npm 10.x
       - run: npm install -g npm@^11
 
-      - name: Check tag matches package versions
+      - name: Check tag matches the package version
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           EXT=$(node -p "require('./packages/ext/package.json').version")
-          ROOT=$(node -p "require('./package.json').version")
-          [ "$TAG" = "$EXT" ] && [ "$TAG" = "$ROOT" ] || {
-            echo "✗ tag v$TAG does not match the package versions (piher=$EXT, piher-setup=$ROOT)"; exit 1; }
+          [ "$TAG" = "$EXT" ] || {
+            echo "✗ tag v$TAG does not match the package version (piher=$EXT)"; exit 1; }
 
       - run: npm install --ignore-scripts
 
       - name: Test
         run: npm test
 
-      # Each package is published only when npm does not have this version yet: the first
-      # publish of a brand-new package cannot use Trusted Publishing (npm requires the
-      # package to exist to register a trusted publisher), so that one goes out by hand —
-      # see docs/RELEASE.md. A tag push afterwards stays green instead of failing on a
-      # version npm already holds.
+      # Published only when npm does not have this version yet: the first publish of a brand-new
+      # package cannot use Trusted Publishing (npm requires the package to exist to register a
+      # trusted publisher), so that one goes out by hand — see docs/RELEASE.md. A tag push
+      # afterwards stays green instead of failing on a version npm already holds.
       - name: Publish piher
         working-directory: packages/ext
         run: |
@@ -57,17 +55,8 @@ jobs:
             npm publish
           fi
 
-      - name: Publish piher-setup
-        run: |
-          V=$(node -p "require('./package.json').version")
-          if npm view "piher-setup@$V" version >/dev/null 2>&1; then
-            echo "piher-setup@$V is already on npm — nothing to publish"
-          else
-            npm publish
-          fi
-
-  # The Release is written only after both packages are on npm: a failed publish must not announce
-  # a version nobody can install. Notes are GitHub's generated ones, with the conventional-commit
+  # The Release is written only after the package is on npm: a failed publish must not announce a
+  # version nobody can install. Notes are GitHub's generated ones, with the conventional-commit
   # entries of commits that have no pull request merged into their category — the same notes the
   # other repos produce (see .github/release.yml and .github/scripts/merge-release-notes.mjs).
   release:

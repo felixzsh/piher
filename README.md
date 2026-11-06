@@ -168,34 +168,31 @@ first few plus a tail that says how many were withheld.
 - Herdr app (optional) — without it pi still runs and piher still spawns workers; you just cannot
   watch them in a window
 
-### One-shot install
+### Install
 
-```sh
-npx piher-setup@latest            # user mode: pi install npm:piher (preflights node / pi / hc)
-npx piher-setup@latest version    # local vs npm latest (installer / extension / herdr-core)
-npx piher-setup@latest update     # refresh the extension in place
-npx piher-setup@latest uninstall
-```
-
-Pin `@latest` so npx does not reuse a cached installer. `piher-setup --help` lists every command.
-The installer never touches core's own configuration; upgrade core with `hc update`.
-
-### Manual install (equivalent steps)
+piher is one pi package — the extension and its skill in one — so pi owns installing, updating and
+removing it:
 
 ```sh
 curl -fsSL https://releases.herdr.dev/core/install.sh | sh   # herdr-core, once
 pi install npm:piher                                         # the extension
 ```
 
+| Task | Command |
+|---|---|
+| Update | `pi update --extensions` |
+| Remove | `pi remove npm:piher` |
+| Version, changelog | pi shows it under *Extension Updates* on the next launch |
+
 Dev mode links a clone instead, so code edits are live:
 
 ```sh
 git clone <this repo> && cd <this repo>
-node install.mjs install --dev
+pi install ./packages/ext
 ```
 
-piher must be registered in pi from exactly one source; `install`/`update` stop (exit 1, nothing
-changed) when it is already registered from another one, and print the `pi remove …` to run.
+piher must be registered in pi from exactly one source: two registrations load the same tool names
+twice and pi rejects the duplicate provider at launch. `pi remove` the other source first.
 
 ## Scope — what the extension changes
 
@@ -267,16 +264,15 @@ extension that owns `subagent` (for example `@tintinweb/pi-subagents`, `@minhduy
 
 ```
 packages/
-  ext/             # the pi extension (npm: piher): tools, core client, roles, ledger, skill
+  ext/             # the pi package (npm: piher): tools, core client, roles, ledger, skill
 docs/              # install guide, configuration overview, decision index, release process
-install.mjs        # the one-shot installer (npm: piher-setup)
 ```
 
 ## Development
 
 ```sh
 npm install --ignore-scripts
-npm test                  # typecheck + the whole suite (439 tests, ~15 s)
+npm test                  # typecheck + the whole suite (444 tests, ~15 s)
 npm run test:mutation
 ```
 

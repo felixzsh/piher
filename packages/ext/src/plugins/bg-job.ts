@@ -18,6 +18,7 @@ import { Type } from 'typebox';
 import { cordisGet } from '../cordis-services.ts';
 import {
   childEnvironment,
+  CORE_REQUIRED,
   coreUnavailableHint,
   type CoreClientLike,
   type CoreEnv,
@@ -314,7 +315,7 @@ export default function bgJobPlugin(ctx: Context): void {
 
   async function executeStart(params: ToolParams, ctx: unknown) {
     if (!client.available || !env) {
-      return fail('bg_job requires a herdr-core terminal (HC_TERMINAL_SOCKET/HC_TERMINAL_ID)');
+      return fail(`bg_job: ${CORE_REQUIRED}`);
     }
     const command = typeof params?.command === 'string' ? params.command.trim() : '';
     if (command === '') return fail('command is required: the shell command to run in the background');

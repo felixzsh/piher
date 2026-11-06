@@ -42,7 +42,7 @@ function shippedDocs(): string[] {
 
 /** Every source file under `dir`, recursively, concatenated — a knob is live if the code names it. */
 function sourceText(): string {
-  return [...sourceFiles('packages/ext/src'), read('install.mjs')].join('\n');}
+  return sourceFiles('packages/ext/src').join('\n');}
 
 function sourceFiles(dir: string): string[] {
   const out: string[] = [];

@@ -125,6 +125,12 @@ export function childEnvironment(
   return { ...out, ...overrides };
 }
 
+/** Tool-result sentence when there is no core terminal: what is missing, and the one command that
+ *  fixes it. The install hint lives here so a missing `hc` never reads as a piher bug. */
+export const CORE_REQUIRED =
+  'no herdr-core terminal (HC_TERMINAL_SOCKET/HC_TERMINAL_ID) — install herdr-core: ' +
+  'curl -fsSL https://releases.herdr.dev/core/install.sh | sh';
+
 /** Transport failure (core stopped, stale socket) → one sentence the model can act on; null otherwise. */
 export function coreUnavailableHint(err: unknown): string | null {
   if (err instanceof CoreError) return null;
@@ -235,7 +241,7 @@ export class NoopCoreClient implements CoreClientLike {
   async placementLabels(): Promise<Record<string, string>> { return {}; }
   async getTerminal(): Promise<null> { return null; }
   async listTerminals(): Promise<TerminalInfo[]> { return []; }
-  async run(): Promise<TerminalInfo> { throw new Error('subagents and terminals require running inside a herdr-core terminal'); }
+  async run(): Promise<TerminalInfo> { throw new Error(`subagents and terminals: ${CORE_REQUIRED}`); }
   async send(): Promise<void> {}
   async keys(): Promise<void> {}
   async interrupt(): Promise<InterruptOutcome> { return 'unknown'; }

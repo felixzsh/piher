@@ -1,50 +1,41 @@
 # Install and use
 
-Two programs and one extension:
+Two programs and one package:
 
 | Piece | What it is | Needed |
 |---|---|---|
 | **herdr-core** (`hc`) | Terminal server. piher starts, reads and reclaims terminals through it | yes |
 | **Herdr app** (`herdr-app`) | Shows those terminals as spaces, tabs and panes | optional |
-| **piher** | The pi extension (npm `piher`) registering `subagent` and `terminal` | yes |
+| **piher** | The pi package (npm `piher`) registering `subagent` and `terminal` | yes |
 
-## One-shot install (recommended)
+## Install
 
-```sh
-npx piher-setup@latest            # user mode: pi install npm:piher (preflights node / pi / hc)
-npx piher-setup@latest version    # local vs npm latest (installer / extension / herdr-core)
-npx piher-setup@latest update     # refresh the extension in place (does not uninstall first)
-npx piher-setup@latest uninstall
-```
-
-Pin `@latest` so npx does not reuse a cached installer. The installer never writes core's own
-configuration; upgrade core with `hc update`.
-
-| | User mode (default) | Dev mode (`--dev`) |
-|---|---|---|
-| The extension | `pi install npm:piher` | `pi install ./packages/ext` (local path) |
-| Versions | `npx piher-setup@latest version` | `node install.mjs version --dev` |
-| Update | `npx piher-setup@latest update` (`pi update`, no uninstall) | re-checks versions only; the linked directory is live |
-| Uninstall | `npx piher-setup@latest uninstall` | same |
-
-piher must be registered from exactly one source. Two registrations load the same tool names twice
-and pi rejects the duplicate provider at launch, so `install`/`update` stop with exit 1 and print the
-`pi remove …` to run first.
-
-## Manual install
+piher is one pi package — the extension and its skill in one — so pi owns the whole lifecycle:
 
 ```sh
-# herdr-core (required)
+# herdr-core (required, once)
 curl -fsSL https://releases.herdr.dev/core/install.sh | sh
 
-# Herdr app (optional, display only)
-# install from https://herdr.dev/
+# Herdr app (optional, display only): install from https://herdr.dev/
 
-# the extension, any one of:
+# the package, any one of:
 pi install npm:piher                 # npm release
 pi install ./packages/ext            # a local checkout (registered in settings.packages)
 pi -e ./packages/ext/src/index.ts    # one session only, not persisted
 ```
+
+| | npm release | local checkout |
+|---|---|---|
+| Install | `pi install npm:piher` | `pi install ./packages/ext` |
+| Update | `pi update --extensions` | nothing to do: the linked directory is live |
+| Remove | `pi remove npm:piher` | `pi remove ./packages/ext` |
+| Version, changelog | *Extension Updates* on the next launch | *Extension Updates* on the next launch |
+
+piher must be registered from exactly one source. Two registrations load the same tool names twice
+and pi rejects the duplicate provider at launch, so `pi remove` the other source first.
+
+If `hc` is missing, piher still loads but both tools answer with the core install command instead of
+running anything — the preflight is in the tool result, not in a separate installer.
 
 Hot reload while developing needs node's `--expose-internals` flag before pi's own entry point and
 `PIHER_HMR=1`; without both there is no watcher.

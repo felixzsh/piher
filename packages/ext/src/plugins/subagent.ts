@@ -8,7 +8,7 @@ import { Type } from 'typebox';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { cordisGet } from '../cordis-services.ts';
-import type { CoreClientLike, CoreEnv } from '../core-client.ts';
+import { CORE_REQUIRED, type CoreClientLike, type CoreEnv } from '../core-client.ts';
 import {
   Semaphore,
   SUBAGENT_OUTPUT_SCHEMA,
@@ -570,7 +570,7 @@ export default function subagentPlugin(ctx: Context): void {
   }
 
   async function executeSubagentResume(params: ToolParams, toolCtx: unknown) {
-    if (!client.available) return toolError('requires a herdr-core terminal.');
+    if (!client.available) return toolError(`subagent: ${CORE_REQUIRED}`);
     const rawTaskId = idParam(params, 'taskId', 'agentId');
     // Refuse a spent task by its ledger verdict, before any pane is made for it.
     {
@@ -804,7 +804,7 @@ export default function subagentPlugin(ctx: Context): void {
         details: { paneId: entry.paneId, taskId: entry.taskId, alreadyClosed: true },
       };
     }
-    if (!client.available) return toolError('requires a herdr-core terminal.');
+    if (!client.available) return toolError(`subagent: ${CORE_REQUIRED}`);
     // S71: close is terminal for what piher created. The checkout goes first, because a dirty one is
     // a refusal that must leave the worker reachable. The ledger row is written through the
     // repository root, since the checkout it records is about to disappear.

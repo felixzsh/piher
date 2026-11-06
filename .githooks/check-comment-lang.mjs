@@ -11,13 +11,11 @@ const COMMENT = /^\s*(\/\/|\/\*|\*)/;
 
 const TARGET_SCOPES = [
   'packages/ext/src/',
-  'install.mjs',
 ];
 
 function isTargetFile(file) {
   if (!file || file.endsWith('.toml')) return false;
-  if (file === 'install.mjs') return true;
-  return TARGET_SCOPES.some((scope) => scope !== 'install.mjs' && file.startsWith(scope));
+  return TARGET_SCOPES.some((scope) => file.startsWith(scope));
 }
 
 const explicit = process.argv.slice(2).filter((arg) => !arg.startsWith('--'));
