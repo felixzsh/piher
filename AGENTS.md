@@ -76,7 +76,10 @@ Rules:
   instead of waiting out the 90 s `PIHER_READY_TIMEOUT_MS` (that wait alone made integration look
   100 s long). `--test-force-exit` is what made the reported totals lie: `node --test` exits with
   async stdout writes still pending, so a green run reported 437 tests instead of 439. With the
-  budget in the harness the flag is gone from all three scripts and the totals are stable.
+  budget in the harness the flag is gone from the root and `packages/ext` scripts, and the
+  totals are stable. `stryker.conf.json` still passes it: a mutant run spawns the suite thousands
+  of times, and nobody has measured whether the truncation matters there. Drop it only after a
+  mutation run shows the same kill counts without it.
 - `--test-timeout` (30 s fast, 120 s integration) is what turns a hang into a failure instead of a
   blocked terminal.
 - Do not add real sleeps to a test to satisfy a timer. Set the budget the code reads
