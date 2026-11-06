@@ -478,7 +478,7 @@ test('resume: a ledger row pointing at the master session is refused; another pa
     const histFile = ledgerFile(cwd)!;
     const base = {
       kind: 'task' as const, tabId: 't0', workspaceId: 'w1', cwd,
-      launchCommand: ['node', 'cli.js'], status: 'closed' as const,
+      launchCommand: ['node', 'cli.js'], status: 'settled' as const,
     };
     appendHistory(histFile, { ...base, taskId: '8183022d-a733-4292-911b-850e6dffba5a', paneId: 'wA:p25', description: 'Investigate bug 19812', sessionFile: masterFile, createdAt: Date.now() });
     appendHistory(histFile, { ...base, taskId: '937f4abf-0000-4111-8222-333333333333', paneId: 'wA:p2old', description: 'healthy task', sessionFile: otherFile, createdAt: Date.now() + 1 });

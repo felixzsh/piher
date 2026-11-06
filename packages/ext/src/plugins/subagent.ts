@@ -90,9 +90,9 @@ const SUBAGENT_DESCRIPTION = [
   'Delegate a self-contained task to a subagent: a separate pi session in its own herdr terminal pane (its own context — it does NOT see this conversation; a human can talk to it in that pane).',
   'Actions (default spawn): spawn | send | output | list | interrupt | resume | role | close | help.',
   'spawn: `prompt` is the COMPLETE task, since only the prompt reaches it; `description` labels the pane. Several spawns in one message run in parallel (max 4).',
-  'spawn places the worker by `cwd` (a checkout you have) or by `worktree` (a name, and piher creates the checkout, its branch and its space).',
+  'spawn places the worker by `cwd` or by `worktree` (a name: piher creates the checkout and its branch).',
   'spawn returns at once with the pane handle; the worker runs on and its result arrives later as a settlement notice at your next turn boundary — no need to sleep or poll.',
-  'send: follow-up to a running or settled worker (steered between its tool calls). output: what it printed since your last check, plus its final report once done. resume: revive a collected task by taskId. role: switch a worker\'s role profile mid-session.',
+  'send: follow-up to a running or settled worker (steered between its tool calls). output: what it printed since your last check, plus its final report once done. resume: revive a task that was left unfinished, by taskId. role: switch a worker\'s role profile mid-session.',
   'help: the full manual (cwd/tab placement, role profiles, the delegation ledger).',
 ].join(' ');
 
@@ -100,11 +100,11 @@ const SUBAGENT_DESCRIPTION = [
 const SUBAGENT_MANUAL = [
   'subagent manual — what a call needs beyond the description that rides every request; help returns this text.',
   '',
-  'spawn — the subagent shares this workspace and works independently; its result is its final text answer, delivered as a settlement notice. The call returns at once with the worker handle, so never wait on it in-turn. `prompt` is the whole task: the worker does not see this conversation, so paths, acceptance criteria, the command that proves the work and what to report back all belong in it. Do not delegate the current step itself. Placement: by default panes group by git worktree — a subagent in your checkout shares your tab, one in a separate worktree gets its own tab named after the worktree directory. `tab` joins or creates a named task tab instead. `cwd` targets an existing directory or worktree you already have. `worktree` is a name, never a path: piher creates `~/.herdr/worktrees/<repo>/<slug>` (the name, anything outside A-Za-z0-9._- turned into a dash) on branch `<name>` from your HEAD, reuses it when it already sits on that branch, and asks the app for a space named after it — `cwd` and `worktree` are mutually exclusive.',
+  'spawn — the subagent shares this workspace and works independently; its result is its final text answer, delivered as a settlement notice. The call returns at once with the worker handle, so never wait on it in-turn. `prompt` is the whole task: the worker does not see this conversation, so paths, acceptance criteria, the command that proves the work and what to report back all belong in it. Do not delegate the current step itself. Placement: by default panes group by git worktree — a subagent in your checkout shares your tab, one in a separate worktree gets its own tab named after the worktree directory. `tab` joins or creates a named task tab instead. `cwd` targets an existing directory or worktree you already have. `worktree` is a name, never a path: piher creates `~/.herdr/worktrees/<repo>/<slug>` (the name, anything outside A-Za-z0-9._- turned into a dash) on branch `<name>` from your HEAD and reuses it when it already sits on that branch; the app\'s Open worktree lists it, and piher never talks to the app — `cwd` and `worktree` are mutually exclusive.',
   '',
   'role + allowed_tools — when role matches a profile (searched: workspace .piher/roles/ → user-global ~/.pi/agent/piher/roles/ → builtin), the worker toolset becomes baseline ∪ allowed_tools minus role-deny tools (deny always wins). Custom roles: drop a JSON profile into .piher/roles/ (master/worker-default reserved). Unknown role names stay display labels. action role switches a live worker (pi transcript tool delta: applies on its next request, survives resume); the reply reports the tool diff.',
   '',
-  'list — every worker of this session branch with live state (running / idle), pane ids, last activity, role and description.',
+  'list — every worker that is still your business: running, or settled with a result you have not acted on. A closed worker is gone from it, and so is a one-shot once its verdict was consumed — close is final, and resume exists for work left unfinished, not for something you decided to end.',
   '',
   'output — `agentId` required; returns the delta since your last output call (default 6000 chars, max_chars 100-16000) with status (running/idle/blocked/settled), revision and a truncated flag. TUI chrome is stripped; once the worker has finished, the complete transcript report is attached. A "buffer scrolled or reset" note means the full text was returned — normal for fullscreen TUI panes.',
   '',
@@ -175,6 +175,7 @@ export default function subagentPlugin(ctx: Context): void {
       sessionFile: e.sessionFile,
       launchCommand: e.launchCommand,
       status: e.status,
+      ...(e.lifecycle ? { lifecycle: e.lifecycle } : {}),
       outcome,
       createdAt: e.createdAt,
       consumedAt: e.consumedAt ?? null,
@@ -443,7 +444,10 @@ export default function subagentPlugin(ctx: Context): void {
       tabName: h.tabName ?? '',
       cwd: h.cwd,
       description: h.description,
-      status: 'closed',
+      // The ledger's verdict, not "closed": a settled or consumed row is unfinished business that
+      // `send`/`resume` may revive, while `closed` means the master was done with it.
+      status: h.status === 'running' ? 'settled' : h.status,
+      ...(h.lifecycle ? { lifecycle: h.lifecycle } : {}),
       sessionFile: h.sessionFile,
       launchCommand: h.launchCommand,
       createdAt: h.createdAt,
@@ -493,6 +497,20 @@ export default function subagentPlugin(ctx: Context): void {
     return { error: `Error: unknown subagent id "${rawId}" (see action list)` };
   }
 
+  /**
+   * `close` is the master's final word on a worker and a one-shot spends itself when its result is
+   * consumed: neither may be revived. Resume exists for work that was left unfinished.
+   */
+  function spentText(entry: SubEntry): string | null {
+    if (entry.status === 'closed') {
+      return `Error: task ${entry.taskId} was closed by the master; close is final, so there is nothing to resume or send to. Start a new subagent for further work.`;
+    }
+    if (entry.status === 'consumed' && entry.lifecycle === 'one-shot') {
+      return `Error: task ${entry.taskId} was a one-shot and already delivered its verdict; there is nothing to resume. Spawn a new one-shot for new work.`;
+    }
+    return null;
+  }
+
   function targetOf(params: ToolParams, toolCtx: unknown): { entry: SubEntry; cwd: string } {
     const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
     const resolved = resolveSubEntry(idParam(params, 'agentId', 'taskId'), cwd);
@@ -511,6 +529,14 @@ export default function subagentPlugin(ctx: Context): void {
   async function executeSubagentResume(params: ToolParams, toolCtx: unknown) {
     if (!client.available) return toolError('requires a herdr-core terminal.');
     const rawTaskId = idParam(params, 'taskId', 'agentId');
+    // Refuse a spent task by its ledger verdict, before any pane is made for it.
+    {
+      const known = resolveSubEntry(rawTaskId ?? '', (toolCtx as { cwd?: string })?.cwd);
+      if ('entry' in known) {
+        const spent = spentText(known.entry);
+        if (spent !== null) return toolError(spent);
+      }
+    }
     if (!rawTaskId) return toolError('missing taskId for resume (see action list or delegation ledger).');
     const running = newestPerTaskId([...subs.values()].filter((s) => s.status === 'running'));
     const live = resolveTaskIdPrefix(rawTaskId, running.keys());
@@ -619,6 +645,9 @@ export default function subagentPlugin(ctx: Context): void {
    * long-running worker within seconds during a tool-call gap; a plain queue waits for the run. */
   function executeSubagentSend(params: ToolParams, toolCtx: unknown) {
     const { entry, cwd } = targetOf(params, toolCtx);
+    // A closed worker or a spent one-shot is not a conversation partner any more.
+    const spent = spentText(entry);
+    if (spent !== null) return toolError(spent);
     return pipeAction(entry, {
       build: () => ({
         type: 'follow_up',
@@ -730,13 +759,20 @@ export default function subagentPlugin(ctx: Context): void {
    *  the bounded registry already pruned answers from the repository ledger, which keeps every row. */
   async function executeSubagentList(toolCtx: unknown) {
     const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
-    const byTask = newestPerTaskId([...subs.values()]);
+    // Only work that is still the master's business: running, settled, or a result not yet read.
+    // A closed worker was a decision, and a one-shot whose result was consumed has delivered its
+    // verdict — listing either would spend the master's context on something it already handled.
+    const visible = (sub: SubEntry): boolean => sub.status !== 'closed'
+      && !(sub.status === 'consumed' && sub.lifecycle === 'one-shot');
+    const byTask = newestPerTaskId([...subs.values()].filter(visible));
     const registered = new Set(byTask.keys());
     for (const row of readLedger(cwd)) {
       if (registered.has(row.taskId)) continue;
       const prev = byTask.get(row.taskId);
       if (prev && prev.createdAt >= (row.createdAt ?? 0)) continue;
-      byTask.set(row.taskId, entryFromHistory(row, {}));
+      const entry = entryFromHistory(row, {});
+      if (!visible(entry)) continue;
+      byTask.set(row.taskId, entry);
     }
     if (byTask.size === 0) {
       return { content: [{ type: 'text', text: 'No subagents started (from this session branch).' }], details: {} };
@@ -752,10 +788,6 @@ export default function subagentPlugin(ctx: Context): void {
     const lines: string[] = [];
     for (const sub of byTask.values()) {
       const tabTag = sub.tabName ? ` [tab: ${sub.tabName}]` : '';
-      if (sub.status === 'closed') {
-        lines.push(`${sub.taskId.slice(0, 8)} [idle] (${sub.kind}, closed; action send revives)${tabTag} ${sub.description}`);
-        continue;
-      }
       if (sub.status === 'consumed' || sub.status === 'settled') {
         lines.push(`${subRef(sub)} [idle] (${sub.kind}, settled; action send revives)${tabTag} ${sub.description}`);
         continue;

@@ -93,8 +93,9 @@ at once, and **no report arrives** for that turn. It is not a stop and not a can
 when a worker has gone down a wrong path and you already know what to say next, then `send`
 the correction.
 
-**`close`** reclaims a worker that already finished: pane and tab go, session and ledger row
-stay. A worker that is still running is refused with a pointer at `interrupt` — a task must
+**`close`** is final: it reclaims a worker that already finished — pane and tab go — and the worker
+leaves `list` for good, because closing is you deciding the work is done. A closed worker cannot be
+sent to or resumed. A one-shot leaves the same way once its verdict is consumed. A worker that is still running is refused with a pointer at `interrupt` — a task must
 not disappear without a report. Close is housekeeping, never how you kill work. When the
 spawn asked for a `worktree`, close ends that too: the worktree is removed, the branch survives. A dirty worktree is refused, naming the files, so commit first.
 

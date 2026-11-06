@@ -467,6 +467,14 @@ test('subagent plugin: list answers for a task the registry already pruned, from
       consumedAt: 6,
     };
     assert.deepEqual(appendLedger(repo, pruned), { ok: true });
+    // Unfinished business in the same ledger: a settled row is resumable, so it must still show.
+    assert.deepEqual(appendLedger(repo, {
+      ...pruned,
+      taskId: 'b2c3d4e5-0000-4000-8000-000000000002',
+      paneId: 'w1:p8',
+      description: 'settled worker',
+      status: 'settled',
+    }), { ok: true });
     // The same task the registry holds, recorded once more in the ledger: the live row must win.
     assert.deepEqual(appendLedger(repo, {
       ...pruned,
@@ -483,7 +491,8 @@ test('subagent plugin: list answers for a task the registry already pruned, from
     });
     try {
       const text = (await runSubagent(pi, { action: 'list' }, repo)).content[0]!.text;
-      assert.match(text, /a1b2c3d4 \[idle\] \(task, closed; action send revives\) pruned worker/);
+      assert.doesNotMatch(text, /pruned worker/, 'a closed task was a decision: it is not listed');
+      assert.match(text, /w1:p8 \[idle\] \(task, settled; action send revives\) settled worker/);
       assert.match(text, /w1:p4 \[running[^\n]*live worker/);
       assert.doesNotMatch(text, /stale ledger copy/, 'a row the registry still holds is not repeated from the ledger');
       assert.equal(text.split('\n').filter((line) => line.includes('live worker')).length, 1);

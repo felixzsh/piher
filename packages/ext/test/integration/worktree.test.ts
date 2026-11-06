@@ -387,23 +387,36 @@ test('close: the worktree goes, the branch survives; a dirty checkout is refused
     assert.ok(branches(h.repo).includes('probe'), 'close never deletes the branch');
     assert.ok(h.retired.includes(paneId), 'the pane is retired');
 
-    // resume decides by existence: the checkout is gone, so the refusal carries the way back.
+    // Close is final: resume is refused for what the master already decided, checkout or not.
     const resumed = await runSubagentRejects(h.pi, { action: 'resume', taskId: spawn.details?.taskId as string }, h.repo);
-    assert.match(resumed, new RegExp(`git worktree add ${path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} probe`));
-    assert.match(resumed, /branch probe survives/);
+    assert.match(resumed, /closed by the master/);
+    assert.match(resumed, /close is final/);
   });
 });
 
-test('resume: a worker in a plain cwd still revives after close', async () => {
+test('resume: unfinished work revives; a closed worker is final', async () => {
   await withHarness(async (h) => {
     const spawn = await runSubagent(h.pi, { description: 'plain run', prompt: PROMPT, cwd: h.repo }, h.repo);
     const paneId = spawn.details?.paneId as string;
+    const taskId = spawn.details?.taskId as string;
     await waitFor(() => h.port.current !== null);
+    // A result that was read is unfinished business for a persistent worker: it stays revivable.
     h.port.current!.consumeReply(paneId, 'REPORT: done');
-    await runSubagent(h.pi, { action: 'close', agentId: paneId }, h.repo);
-    const resumed = await runSubagent(h.pi, { action: 'resume', taskId: spawn.details?.taskId as string }, h.repo);
+    const resumed = await runSubagent(h.pi, { action: 'resume', taskId }, h.repo);
     assert.match(resumed.content[0]!.text, /resumed subagent/);
     assert.notEqual(resumed.details?.paneId, paneId, 'a fresh pane holds the revived session');
+
+    // Closing is the master's final word: no revival, no follow-up. Close only reclaims a worker
+    // that already finished, so the revived one reports first.
+    const revivedPane = resumed.details?.paneId as string;
+    await waitFor(() => h.port.current !== null);
+    h.port.current!.consumeReply(revivedPane, 'REPORT: again');
+    await runSubagent(h.pi, { action: 'close', agentId: revivedPane }, h.repo);
+    const refusedResume = await runSubagentRejects(h.pi, { action: 'resume', taskId }, h.repo);
+    assert.match(refusedResume, /closed by the master/);
+    assert.match(refusedResume, /close is final/);
+    const refusedSend = await runSubagentRejects(h.pi, { action: 'send', agentId: revivedPane, message: 'more' }, h.repo);
+    assert.match(refusedSend, /closed by the master/);
   });
 });
 

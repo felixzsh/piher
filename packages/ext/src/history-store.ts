@@ -41,6 +41,8 @@ export interface HistoryEntry {
   /** Launch command snapshot, used to rebuild an empty continuation when sessionFile is missing. */
   launchCommand: string[];
   status: 'running' | 'settled' | 'consumed' | 'closed';
+  /** A one-shot is spent once its result is consumed; a persistent one only when closed. */
+  lifecycle?: 'one-shot' | 'persistent';
   outcome?: string | null;
   createdAt: number;
   consumedAt?: number | null;

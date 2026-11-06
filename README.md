@@ -74,7 +74,9 @@ the app's `Open worktree` button and piher never talks to the app. `close` remov
 created — the worktree goes, the branch survives. A dirty worktree is refused, naming the files. `cwd` is the other way round: a checkout the caller already has stays the caller's
 to remove.
 
-A role that declares `lifecycle: "one-shot"` is reclaimed this way automatically at its settlement.
+A role that declares `lifecycle: "one-shot"` is reclaimed automatically once its verdict is consumed,
+and leaves `list` with it: a one-shot is spent when its result arrives. `close` is the same decision
+for a persistent worker — after it, the worker is gone from `list` and cannot be resumed.
 
 ### `bg_job`
 
