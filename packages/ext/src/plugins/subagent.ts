@@ -641,16 +641,41 @@ export default function subagentPlugin(ctx: Context): void {
       ready?: false;
     },
   ): Promise<unknown> {
+    const t0 = Date.now();
+    const trace = (step: string): void => {
+      if (process.env.PIHER_PIPE_TRACE === '1') console.error(`piher: pipeAction ${step} +${Date.now() - t0}ms`);
+    };
     try {
       if (opts.ready !== false) {
         // A just-spawned worker is still booting: its prompt must reach it before any follow-up.
-        await boots.get(entry.paneId);
+        // An already-live worker needs none of the spawn-readiness machinery (a ping round plus a
+        // pane probe with a terminal read), so `send` pays only the pipe round trip and proves
+        // reachability by delivering.
+        const boot = boots.get(entry.paneId);
+        if (boot) await boot;
+        trace('boot');
         await ensureLive(entry);
-        const ready = await waitSubReady(entry.cwd, entry.paneId);
-        if (!ready.ok) throw new Error(ready.message);
+        trace('live');
+        if (boot) {
+          const ready = await waitSubReady(entry.cwd, entry.paneId);
+          trace('ready');
+          if (!ready.ok) throw new Error(ready.message);
+        }
       }
       const payload = opts.build();
-      const res = await pipeRequestTo(entry.cwd, entry.paneId, payload);
+      let res: PipeResponse;
+      try {
+        res = await pipeRequestTo(entry.cwd, entry.paneId, payload);
+      } catch (err) {
+        // No boot record and no answer: a revived pane may still be starting its pipe. Pay for
+        // readiness once, then retry the same request instead of failing a live worker.
+        if (opts.ready === false) throw err;
+        const ready = await waitSubReady(entry.cwd, entry.paneId);
+        trace('ready-fallback');
+        if (!ready.ok) throw new Error(ready.message);
+        res = await pipeRequestTo(entry.cwd, entry.paneId, payload);
+      }
+      trace('delivered');
       if (res.type !== 'ok') {
         throw new Error(`pipe ${payload.type} rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
       }
