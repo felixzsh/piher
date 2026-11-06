@@ -110,7 +110,7 @@ const SUBAGENT_MANUAL = [
   '',
   'list — every worker that is still your business: running, or settled with a result you have not acted on. A closed worker is gone from it, and so is a one-shot once its verdict was consumed — close is final, and resume exists for work left unfinished, not for something you decided to end.',
   '',
-  'output — `agentId` required; returns the delta since your last output call (default 6000 chars, max_chars 100-16000) with status (running/idle/blocked/settled), revision and a truncated flag. TUI chrome is stripped; once the worker has finished, the complete transcript report is attached. A "buffer scrolled or reset" note means the full text was returned — normal for fullscreen TUI panes.',
+  'output — `agentId` required; returns status (running/idle/blocked/settled) plus what the worker has to say: its finalized report once it has finished, and the latest lines while it runs (default 6000 chars, max_chars 100-16000). The whole pane buffer is only returned with `full: true` — it carries boot chrome (banner, skills, extensions) you do not need. A settled worker also reaches you on its own as a settlement notice; read `output` when you want to re-read its words.',
   '',
   'send — `agentId` + `message`: if working, delivered at its next tool-call gap (seconds); if idle or settled, wakes a new turn. Do not spawn a duplicate for the same task. interrupt — aborts its current turn ONLY; the pane and its session stay and no report arrives for it, so it is not a stop.',
   '',
@@ -912,6 +912,7 @@ export default function subagentPlugin(ctx: Context): void {
       agentId: Type.Optional(Type.String({ description: '[send|interrupt|output|role|close] Slug, pane id, or slug@paneId as printed by spawn/list' })),
       message: Type.Optional(Type.String({ description: '[send] Follow-up message' })),
       max_chars: Type.Optional(Type.Integer({ description: '[output] Output cap (default 6000, 100-16000)' })),
+      full: Type.Optional(Type.Boolean({ description: '[output] Return the whole pane buffer instead of the latest lines (default false)' })),
     }),
     outputSchema: SUBAGENT_OUTPUT_SCHEMA,
     // B2: `action` is optional in the schema; normalize it so the validated arguments and the

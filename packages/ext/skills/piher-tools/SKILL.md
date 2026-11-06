@@ -85,9 +85,13 @@ tail that names how many were withheld and points at the ledger.
 
 `send` takes `agentId` and `message`. To a working worker it lands at its next tool gap,
 inside the same turn — a correction, not a queue, because there is no inbox. To an idle or
-settled worker it wakes a new turn. `output` reads what the worker printed since your last
-`output` call (bounded by `max_chars`, default 6000) and attaches the final report once it
-has one, which is how you catch a worker that is stuck rather than blocked. `list` shows
+settled worker it wakes a new turn. `output` answers with what the worker has to say: its
+finalized report once it has finished, the latest lines while it runs (bounded by
+`max_chars`, default 6000) — which is how you catch a worker that is stuck rather than
+blocked. It does not dump the pane by default: that buffer is boot chrome (banner, skills,
+extensions) around the same words, so the full text is behind `full: true`. You rarely need
+`output` at all: a settlement notice already carries the worker's own message, and a notice
+never arrives empty for a worker that answered. `list` shows
 every worker of this session with its state and handle; `agentId` is the slug, the pane id,
 or `slug@paneId` printed by `spawn` and `list`. `role` switches a live worker's profile
 mid-session and reports the tool diff.

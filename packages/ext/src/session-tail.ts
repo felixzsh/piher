@@ -72,6 +72,28 @@ export function lastAssistantText(
   }
   return best;
 }
+/**
+ * Newest assistant text after `sinceTs` with no stopReason filter: a turn can end by hitting the token
+ * cap or by an abort, and those words are still the report the master should receive instead of
+ * "left no closing message".
+ */
+export function lastAssistantAnyText(
+  entries: readonly SessionEntryLike[],
+  sinceTs: number,
+): string | null {
+  let best: { text: string; timestamp: number } | null = null;
+  for (const entry of entries) {
+    const m = messageOf(entry);
+    if (!m || m.role !== 'assistant') continue;
+    const ts = typeof m.timestamp === 'number' ? m.timestamp : 0;
+    if (ts < sinceTs) continue;
+    const text = textOf(m).trim();
+    if (!text) continue;
+    if (!best || ts >= best.timestamp) best = { text, timestamp: ts };
+  }
+  return best?.text ?? null;
+}
+
 /** Return whether any assistant message occurs after the injection point, regardless of stopReason. */
 export function hasAssistantAfter(
   entries: readonly SessionEntryLike[],
@@ -142,7 +164,13 @@ export function deriveSubSessionState(
   if (r?.text) return { text: r.text, pendingTool: false, activity: true, turnEnded: true };
   if (hasPendingToolCall(entries, sinceTs)) return { text: null, pendingTool: true, activity: true, turnEnded: false };
   if (hasAssistantAfter(entries, sinceTs)) {
-    return { text: null, pendingTool: false, activity: true, turnEnded: lastAssistantTurnEnded(entries, sinceTs) };
+    const turnEnded = lastAssistantTurnEnded(entries, sinceTs);
+    // An ended turn always has words to deliver, even when they did not come from a clean 'stop'
+    // (token cap, abort). Without this the poller saw "turn ended, no text" and announced
+    // "It left no closing message" for a worker that had answered.
+    const any = turnEnded ? lastAssistantAnyText(entries, sinceTs) : null;
+    if (any) return { text: any, pendingTool: false, activity: true, turnEnded: true };
+    return { text: null, pendingTool: false, activity: true, turnEnded };
   }
   return { text: null, pendingTool: false, activity: false, turnEnded: false };
 }

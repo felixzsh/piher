@@ -19,6 +19,9 @@ import { toolError } from './tool-error.ts';
 
 /* ── subagent output delta (pure) ───────────────────────────────── */
 
+/** How much of a running worker's pane a default read shows: the latest lines, not the boot chrome. */
+export const OUTPUT_TAIL_LINES = 40;
+export const OUTPUT_TAIL_MAX_CHARS = 2500;
 export const OUTPUT_DEFAULT_MAX_CHARS = 6000;
 export const OUTPUT_HARD_CAP_CHARS = 16000;
 const OUTPUT_MIN_OVERLAP = 16;
@@ -167,6 +170,8 @@ export interface FormatSubagentOutputOpts {
   bufferTruncated: boolean;
   deltaResult: { delta: string; restart: boolean; truncated: boolean };
   askQuestion?: string | null;
+  /** Set for a tail read: the header then says the pane was not dumped in full. */
+  tailNote?: string | null;
 }
 
 export function formatSubagentOutput(opts: FormatSubagentOutputOpts): string {
@@ -180,9 +185,17 @@ export function formatSubagentOutput(opts: FormatSubagentOutputOpts): string {
     metaItems.push('buffer scrolled or reset — full text returned (not a process restart)');
   }
   if (opts.bufferTruncated || opts.deltaResult.truncated) metaItems.push('truncated: true');
+  if (opts.tailNote) metaItems.push(opts.tailNote);
   parts.push(`[Subagent Output | ${metaItems.join(' | ')}]`);
   parts.push(opts.deltaResult.delta.length === 0 ? '(no new output since last read)' : opts.deltaResult.delta);
   return parts.join('\n');
+}
+
+/** The last lines of a pane read: what a running worker is doing now, without its boot chrome. */
+export function tailOfPaneRead(text: string, lines = OUTPUT_TAIL_LINES, chars = OUTPUT_TAIL_MAX_CHARS): string {
+  const all = text.split('\n');
+  const joined = (all.length > lines ? all.slice(-lines) : all).join('\n');
+  return joined.length > chars ? joined.slice(joined.length - chars) : joined;
 }
 
 /* ── session file resolution + liveness probes ──────────────────── */
@@ -484,16 +497,30 @@ export async function executeSubagentOutput(
     } catch {
     }
   }
-  deps.outputCursors.set(entry.paneId, deltaResult.nextCursor);
   const revision = deps.nextRevision(entry.paneId);
+
+  // A finished worker answers with its report; a running one with the last lines it printed. The whole
+  // pane buffer is boot chrome (banner, skills, extensions) around the same text, so dumping it by
+  // default is what made a master carry a worker's startup into its own context.
+  const wantFull = params?.full === true;
+  // A tail is a fresh view each time, so it must not spend the buffer before someone asks for it in
+  // full. A full read and a delivered report still advance the cursor: that is what makes an
+  // unchanged report stay delivered exactly once.
+  if (wantFull || reportSection) deps.outputCursors.set(entry.paneId, deltaResult.nextCursor);
+  const shown = wantFull || reportSection
+    ? deltaResult
+    : { ...deltaResult, restart: false, delta: tailOfPaneRead(deltaResult.delta) };
 
   const formatted = formatSubagentOutput({
     paneId: entry.paneId,
     status,
     revision,
     bufferTruncated: !rawRead.complete,
-    deltaResult,
+    deltaResult: shown,
     askQuestion,
+    tailNote: wantFull || reportSection
+      ? null
+      : `latest output only — pass full: true for the whole pane (${deltaResult.delta.length} chars held back)`,
   });
 
   return {

@@ -9,7 +9,7 @@ import type { CoreClientLike } from '../src/core-client.ts';
 import { SUBS_CUSTOM_TYPE, type SubEntry } from '../src/subagent-core.ts';
 import { sessionDirName } from '../src/session-tail.ts';
 import {
-  cleanPaneChrome, computeSubagentOutputDelta, createSessionIo, cutPaneReportCopy, formatSubagentOutput, resolveSubagentStatus,
+  cleanPaneChrome, computeSubagentOutputDelta, createSessionIo, cutPaneReportCopy, formatSubagentOutput, resolveSubagentStatus, tailOfPaneRead,
   type SubagentOutputCursor,
 } from '../src/subagent-session.ts';
 import { appendHistory, ledgerFile } from '../src/history-store.ts';
@@ -202,6 +202,16 @@ test('reattributeStaleSessionFile: repairs a stale or poisoned value from the wo
 
 const CURSOR = (tail: string, fullLength: number): SubagentOutputCursor => ({ tail, fullLength });
 
+test('tailOfPaneRead: the latest lines, bounded, never the whole boot chrome', () => {
+  const boot = Array.from({ length: 200 }, (_, i) => `banner ${i}`).join('\n') + '\nthe answer';
+  const tail = tailOfPaneRead(boot);
+  assert.equal(tail.split('\n').length, 40);
+  assert.ok(tail.endsWith('the answer'));
+  assert.ok(!tail.includes('banner 0'), 'the startup banner is not in a tail read');
+  assert.equal(tailOfPaneRead('a\nb', 40, 2), '\nb', 'the char bound keeps the end');
+  assert.equal(tailOfPaneRead(''), '');
+});
+
 test('computeSubagentOutputDelta: full, empty, appended and truncated deltas', async (t) => {
   await t.test('first call returns the full buffer bounded to maxChars', () => {
     const res = computeSubagentOutputDelta(null, 'Line 1\nLine 2\nLine 3\n', { maxChars: 100 });
@@ -334,7 +344,7 @@ test('output action: missing and unknown ids fail with actionable messages', asy
   }
 });
 
-test('output action: incremental reads return only the delta since the last call', async () => {
+test('output action: a default read is a repeatable tail, a full read is the delta reader', async () => {
   let output = 'Initial output line 1\nInitial output line 2\n';
   await withWorker(async (pi) => {
     const first = await runSubagent(pi, { action: 'output', agentId: 'pWorker' });
@@ -342,8 +352,28 @@ test('output action: incremental reads return only the delta since the last call
     output += 'Progress: compiling module B\n';
     const second = await runSubagent(pi, { action: 'output', agentId: 'pWorker' });
     assert.match(second.content[0]!.text, /Progress: compiling module B/);
-    assert.doesNotMatch(second.content[0]!.text, /Initial output line 2/, 'only the delta is returned');
+    assert.match(second.content[0]!.text, /Initial output line 2/, 'a tail repeats: it spent no cursor');
+    // `full` is where delta accounting lives, so two full reads are incremental.
+    const fullOne = await runSubagent(pi, { action: 'output', agentId: 'pWorker', full: true });
+    assert.match(fullOne.content[0]!.text, /Initial output line 1/);
+    output += 'Progress: linking\n';
+    const fullTwo = await runSubagent(pi, { action: 'output', agentId: 'pWorker', full: true });
+    assert.match(fullTwo.content[0]!.text, /Progress: linking/);
+    assert.doesNotMatch(fullTwo.content[0]!.text, /Initial output line 2/, 'only the delta is returned');
   }, outputPane(() => output));
+});
+
+test('output action: the default read is the latest lines, not the boot chrome (full: true returns it all)', async () => {
+  const boot = Array.from({ length: 120 }, (_, i) => `boot line ${i}`).join('\n') + '\nthe worker is working';
+  await withWorker(async (pi) => {
+    const tail = await runSubagent(pi, { action: 'output', agentId: 'pWorker' });
+    assert.match(tail.content[0]!.text, /the worker is working/);
+    assert.doesNotMatch(tail.content[0]!.text, /boot line 0$/, 'the startup banner is not dumped into a master');
+    assert.match(tail.content[0]!.text, /pass full: true/);
+    const full = await runSubagent(pi, { action: 'output', agentId: 'pWorker', full: true });
+    assert.match(full.content[0]!.text, /boot line 0\b/, 'the full read still has the whole buffer');
+    assert.doesNotMatch(full.content[0]!.text, /pass full: true/);
+  }, outputPane(() => boot));
 });
 
 test('output action: an incomplete terminal read is reported as truncated', async () => {
