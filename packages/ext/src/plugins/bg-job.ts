@@ -35,6 +35,8 @@ import {
   chooseTail,
   clampTimeoutS,
   encodeJobMeta,
+  expiredDelivered,
+  listedJobs,
   formatJobCheckIn,
   formatJobListLine,
   formatJobNotice,
@@ -183,6 +185,14 @@ export default function bgJobPlugin(ctx: Context): void {
       swallow('bg-job.notice-tail', err);
     }
     sendNotice(formatJobNotice(job, tail), jobNoticeDetails(job, job.endedAt, false), true);
+    job.delivered = true;
+    // The labels are the memory a later mount adopts from: a delivered job must not come back as news.
+    try {
+      await client.setLabels({ [JOB_LABEL_KEY]: null, [JOB_META_LABEL]: null });
+    } catch (err) {
+      swallow('bg-job.clear-labels', err);
+    }
+    for (const id of expiredDelivered(jobs.values())) jobs.delete(id);
   }
 
   /**
@@ -363,6 +373,7 @@ export default function bgJobPlugin(ctx: Context): void {
       exitCode: null,
       endedAt: null,
       checkInSent: false,
+      delivered: false,
     };
     jobs.set(id, job);
     startWatch(job);
@@ -431,9 +442,10 @@ export default function bgJobPlugin(ctx: Context): void {
         details: { jobId: job.id, status: job.status },
       };
     }
-    // Whoever stopped the job already knows: a stop never notifies.
+    // Whoever stopped the job already knows: a stop never notifies, and the job leaves the list.
     job.status = 'stopped';
     job.endedAt = Date.now();
+    job.delivered = true;
     stopWatchers(job.id);
     try {
       await client.kill(job.paneId);
@@ -448,8 +460,8 @@ export default function bgJobPlugin(ctx: Context): void {
   }
 
   async function executeList() {
-    const all = [...jobs.values()].sort((left, right) => right.startedAt - left.startedAt);
-    for (const job of all) await refresh(job);
+    for (const job of jobs.values()) await refresh(job);
+    const all = listedJobs(jobs.values());
     if (all.length === 0) {
       return { content: [{ type: 'text' as const, text: 'No background jobs in this session.' }], details: { count: 0 } };
     }

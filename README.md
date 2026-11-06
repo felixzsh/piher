@@ -88,9 +88,11 @@ pipeline's; nothing is typed at a prompt, so no command has to be a single line.
 | `status` | One job's state, exit code, elapsed time, pane and log, with the last lines |
 | `log` | A bounded slice of the log: `mode` (`head`/`tail`), `lines` (1-400), `grep` |
 | `stop` | Kill the job's process tree; a stopped job never notifies |
-| `list` | This session's jobs, newest first |
+| `list` | Jobs still yours: running, or finished with the notice not yet delivered |
 
-A job survives a reload of the extension: every job pane carries its id, log, start time and check-in
+A job is spent once its notice is handed over: it leaves `list`, its pane stops advertising it, and
+only a short tail stays addressable by id (`status`, `log`) — the log file itself is permanent. A job
+survives a reload of the extension: every job pane carries its id, log, start time and check-in
 budget in labels, so the next mount asks core what is still running, re-arms the watch and reports a
 job that exited while nobody was listening. The notice is the only thing the model receives:
 outcome, exit code, elapsed time, the last lines and how to read more. The whole output stays in the log, so a long build never floods the context, and

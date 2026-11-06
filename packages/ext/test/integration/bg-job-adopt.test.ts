@@ -99,6 +99,32 @@ test('mount: adopting twice cannot double-count or re-report a job', withCleanup
   }
 }));
 
+test('delivery is what makes a job disposable: labels cleared, list empty, no repeat notice', withCleanup(async () => {
+  // The fake core keeps its labels updated, the way core does.
+  const terminals = [jobTerminal({ id: 't9', jobId: 'job-4x1', state: 'finished', exitCode: 0 })];
+  const cleared: Array<Record<string, string | null>> = [];
+  const { pi, root } = await mount({
+    listTerminals: async () => terminals,
+    setLabels: async (labels) => {
+      cleared.push(labels);
+      for (const terminal of terminals) Object.assign(terminal.labels, labels);
+    },
+  });
+  try {
+    await fire(pi, 'session_start', {}, {});
+    assert.equal(pi.sent.filter((m) => m.msg.customType === JOB_NOTICE_CUSTOM_TYPE).length, 1);
+    // The pane stops advertising a job, so a later mount cannot adopt it again.
+    assert.deepEqual(cleared, [{ [JOB_LABEL_KEY]: null, [JOB_META_LABEL]: null }]);
+    assert.equal(terminals[0]!.labels[JOB_LABEL_KEY], null);
+    const list = await pi.tools.get('bg_job')!.execute!('tc', { action: 'list' }, undefined, undefined, {}) as {
+      content: Array<{ text: string }>;
+    };
+    assert.match(list.content[0]!.text, /No background jobs/, 'a spent job is not the launcher\'s business');
+  } finally {
+    await root.fiber.dispose();
+  }
+}));
+
 test('mount: a pane that is not a job is ignored', withCleanup(async () => {
   const { pi, root } = await mount({
     listTerminals: async () => [terminalInfo({ id: 't5', labels: { 'piher.session': 'abc' } })],

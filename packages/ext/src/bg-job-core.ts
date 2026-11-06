@@ -49,6 +49,8 @@ export interface JobRecord {
   endedAt: number | null;
   /** One check-in per job: a second one for the same silence adds nothing. */
   checkInSent: boolean;
+  /** The notice reached pi: the job is spent and drops out of the list the launcher reads. */
+  delivered: boolean;
   error?: string;
 }
 
@@ -217,6 +219,7 @@ export function planAdoption(
       endedAt: null,
       // A job that already outlived its budget when it was adopted must not fire a check-in burst.
       checkInSent: elapsed >= timeout * 1000,
+      delivered: false,
     };
     plans.push({
       job,
@@ -340,6 +343,25 @@ export function formatJobStatus(job: JobRecord, now: number): string {
     `pane: ${job.paneId} · log: ${job.logPath}`,
   ];
   return lines.join('\n');
+}
+
+/**
+ * The jobs `list` shows: running ones, plus the ones whose notice has not been handed to pi yet.
+ * A delivered job is spent — its log stays on disk and the notice carries the path — so keeping it
+ * in the list only spends the launcher's context on something it already acted on.
+ */
+export function listedJobs(jobs: Iterable<JobRecord>): JobRecord[] {
+  return [...jobs].filter((job) => !job.delivered).sort((left, right) => right.startedAt - left.startedAt);
+}
+
+/** Delivered records kept for `status`/`log` on an old id; the rest are dropped, the log survives. */
+export const DELIVERED_TAIL = 5;
+
+/** Job ids to drop once `DELIVERED_TAIL` delivered records are kept; oldest delivery first. */
+export function expiredDelivered(jobs: Iterable<JobRecord>, keep = DELIVERED_TAIL): string[] {
+  const delivered = [...jobs].filter((job) => job.delivered)
+    .sort((left, right) => (left.endedAt ?? 0) - (right.endedAt ?? 0));
+  return delivered.slice(0, Math.max(0, delivered.length - Math.max(0, keep))).map((job) => job.id);
 }
 
 /** One line per job for `list`: id, state, label or command, elapsed, log path. */

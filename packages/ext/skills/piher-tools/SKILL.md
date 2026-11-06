@@ -135,7 +135,10 @@ log, so a long build never floods the context.
   re-send the command.
 - Read output with `log` (`mode` head/tail, `lines` 1-400, `grep`); do not read the log file with
   `read` when a bounded slice is enough.
-- `stop` kills the process tree and sends no notice, because whoever stopped it already knows.
+- `stop` kills the process tree and sends no notice, because whoever stopped it already knows — and
+  a stopped job, like a reported one, leaves `list`.
+- Once a job's notice reaches you the job is spent: `list` no longer shows it. Its log stays on disk
+  and the notice carries the path; `read` it if you need more than the tail.
 - The exit code is the pipeline's: `pipefail` is already set for you.
 
 Use `bash` instead for anything short, interactive, or order-dependent.

@@ -9,6 +9,8 @@ import {
   clock,
   decodeJobMeta,
   encodeJobMeta,
+  expiredDelivered,
+  listedJobs,
   planAdoption,
   MAX_LOG_LINES,
   MAX_TIMEOUT_S,
@@ -44,6 +46,7 @@ function job(overrides: Partial<JobRecord> = {}): JobRecord {
     exitCode: 0,
     endedAt: 81_000,
     checkInSent: false,
+    delivered: false,
     ...overrides,
   };
 }
@@ -311,4 +314,30 @@ test('a job from a build without the meta label is still adopted, with what core
   assert.equal(plans[0]!.job.logPath, '');
   assert.match(plans[0]!.job.command, /command unknown/);
   assert.equal(plans[0]!.job.startedAt, now);
+});
+
+test('a delivered job leaves the list: the launcher already acted on its notice', () => {
+  const jobs = [
+    job({ id: 'job-1', delivered: true }),
+    job({ id: 'job-2', status: 'running', exitCode: null, endedAt: null }),
+    job({ id: 'job-3', delivered: false, exitCode: 3 }),
+  ];
+  assert.deepEqual(listedJobs(jobs).map((entry) => entry.id), ['job-2', 'job-3']);
+  assert.deepEqual(listedJobs([]), []);
+});
+
+test('delivered records are kept for a short tail, then dropped while the log survives', () => {
+  const delivered = Array.from({ length: 8 }, (_, i) => job({ id: `job-${i + 1}`, delivered: true, endedAt: 1_000 + i }));
+  const expired = expiredDelivered(delivered, 5);
+  assert.deepEqual(expired, ['job-1', 'job-2', 'job-3'], 'the three oldest deliveries go');
+  assert.deepEqual(expiredDelivered(delivered.slice(0, 3), 5), []);
+  // A delivered running record is impossible, but a `stopped` one is delivered and still sorted.
+  assert.deepEqual(expiredDelivered([job({ id: 'job-9', status: 'stopped', delivered: true, endedAt: 5 })], 0), ['job-9']);
+});
+
+test('a job adopted from a reload starts un-delivered, because its notice is owed', () => {
+  const plans = planAdoption([{
+    id: 't9', cwd: '/repo', labels: { [JOB_LABEL_KEY]: 'job-2x1' }, state: 'finished', exitCode: 0,
+  }], new Set(), Date.now());
+  assert.equal(plans[0]!.job.delivered, false);
 });
