@@ -463,16 +463,22 @@ export default function bgJobPlugin(ctx: Context): void {
     };
   }
 
-  async function executeList() {
+  async function executeList(params: ToolParams, toolCtx: unknown) {
     for (const job of jobs.values()) await refresh(job);
-    const all = listedJobs(jobs.values());
-    if (all.length === 0) {
-      return { content: [{ type: 'text' as const, text: 'No background jobs in this session.' }], details: { count: 0 } };
+    const showAll = params?.all === true;
+    const root = typeof params?.cwd === 'string' && params.cwd.trim() !== '' ? params.cwd.trim() : null;
+    const rows = listedJobs(jobs.values(), { all: showAll, cwd: root });
+    if (rows.length === 0) {
+      return {
+        content: [{ type: 'text' as const, text: showAll ? 'No background jobs in this session, running or finished.' : 'No background jobs in this session.' }],
+        details: { count: 0 },
+      };
     }
     const now = Date.now();
+    const sessionCwd = (toolCtx as { cwd?: string } | undefined)?.cwd ?? process.cwd();
     return {
-      content: [{ type: 'text' as const, text: all.map((job) => formatJobListLine(job, now)).join('\n') }],
-      details: { count: all.length },
+      content: [{ type: 'text' as const, text: rows.map((job) => formatJobListLine(job, now, sessionCwd)).join('\n') }],
+      details: { count: rows.length, all: showAll },
     };
   }
 
@@ -484,7 +490,7 @@ export default function bgJobPlugin(ctx: Context): void {
       'You get the exit code, the last lines and the log path; the whole output stays in the log and is',
       'read on demand with action "log" (head, tail, lines, grep). Do not poll or sleep: keep working or end your turn.',
       'A check-in arrives if the job outlives timeout_s; it is a glance, not a failure, and the job keeps running.',
-      'Actions: start (default), status, log, stop, list.',
+      'Actions: start (default), status, log, stop, list (this session\'s own jobs; all and cwd filter it).',
       'The command runs under bash with pipefail, so the exit code is the pipeline\'s last failing command.',
     ].join(' '),
     promptSnippet: 'bg_job: run a command in the background and be told once when it exits (exit code, last lines, log).',
@@ -505,7 +511,10 @@ export default function bgJobPlugin(ctx: Context): void {
         description: '[start] Short human-readable label, e.g. "build release"',
       })),
       cwd: Type.Optional(Type.String({
-        description: '[start] Working directory (default: the session cwd)',
+        description: '[start] Working directory (default: the session cwd); [list] keep only jobs running there or below',
+      })),
+      all: Type.Optional(Type.Boolean({
+        description: '[list] Include the finished jobs the session still remembers (default false: only what still owes a notice)',
       })),
       timeout_s: Type.Optional(Type.Number({
         description: `[start] Check in if it is still running after this many seconds (default ${DEFAULT_TIMEOUT_S}, 5-3600)`,
@@ -530,7 +539,7 @@ export default function bgJobPlugin(ctx: Context): void {
         case 'status': return executeStatus(params);
         case 'log': return executeLog(params);
         case 'stop': return executeStop(params);
-        case 'list': return executeList();
+        case 'list': return executeList(params, ctx);
         default:
           return fail(`unknown action "${action}" (valid: ${BG_JOB_ACTIONS.join(', ')})`);
       }

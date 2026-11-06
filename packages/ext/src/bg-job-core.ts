@@ -356,8 +356,26 @@ export function formatJobStatus(job: JobRecord, now: number): string {
  * A delivered job is spent — its log stays on disk and the notice carries the path — so keeping it
  * in the list only spends the launcher's context on something it already acted on.
  */
-export function listedJobs(jobs: Iterable<JobRecord>): JobRecord[] {
-  return [...jobs].filter((job) => !job.delivered).sort((left, right) => right.startedAt - left.startedAt);
+/**
+ * What `list` answers: the jobs that still owe this session a notice. `all` also shows the delivered
+ * ones the registry keeps for `status`/`log` (`DELIVERED_TAIL` of them) and any job whose cwd sits
+ * outside `cwd`, so a master working across checkouts can see whose work is whose.
+ */
+export function listedJobs(
+  jobs: Iterable<JobRecord>,
+  opts: { all?: boolean; cwd?: string | null } = {},
+): JobRecord[] {
+  const root = opts.cwd ?? null;
+  return [...jobs]
+    .filter((job) => (opts.all === true ? true : !job.delivered))
+    .filter((job) => (root === null ? true : isInside(root, job.cwd)))
+    .sort((left, right) => right.startedAt - left.startedAt);
+}
+
+/** A job belongs to a directory when it runs there or below it. */
+export function isInside(root: string, dir: string): boolean {
+  const base = root.endsWith('/') ? root : `${root}/`;
+  return dir === root || dir.startsWith(base);
 }
 
 /** Delivered records kept for `status`/`log` on an old id; the rest are dropped, the log survives. */
@@ -371,10 +389,12 @@ export function expiredDelivered(jobs: Iterable<JobRecord>, keep = DELIVERED_TAI
 }
 
 /** One line per job for `list`: id, state, label or command, elapsed, log path. */
-export function formatJobListLine(job: JobRecord, now: number): string {
+export function formatJobListLine(job: JobRecord, now: number, sessionCwd?: string | null): string {
   const ended = job.endedAt ?? now;
   const name = job.label ?? job.command.replace(/\s+/g, ' ').slice(0, 60);
-  return `${job.id} · ${jobOutcome(job)} · ${name} · ${formatDuration(ended - job.startedAt)} · ${job.logPath}`;
+  // A job outside the session's own checkout says where it ran: two projects, two answers.
+  const away = sessionCwd && !isInside(sessionCwd, job.cwd) ? ` · in ${job.cwd}` : '';
+  return `${job.id} · ${jobOutcome(job)} · ${name} · ${formatDuration(ended - job.startedAt)} · ${job.logPath}${away}`;
 }
 
 /** The `details` a renderer needs; never the whole notice text. */

@@ -65,6 +65,31 @@ test('start: a job gets no placement labels, so it never opens a pane beside the
   }
 }));
 
+test('list all: a spent job comes back, so the last runs are still answerable', withCleanup(async () => {
+  const terminals = [jobTerminal({ id: 't9', jobId: 'job-1xk3', state: 'finished', exitCode: 0 })];
+  const { pi, root } = await mount({
+    listTerminals: async () => terminals,
+    getTerminal: async (id: string) => terminals.find((terminal) => terminal.id === id) ?? null,
+  });
+  try {
+    // Adoption is what puts a job that outlived the reload into the registry: it settles the finished
+    // one and delivers the notice it owed.
+    await fire(pi, 'session_start', {}, {});
+    const run = async (params: Record<string, unknown>): Promise<string> => {
+      const res = (await pi.tools.get('bg_job')!.execute!('tc', params, undefined, undefined, { cwd: '/repo' })) as {
+        content: Array<{ text: string }>;
+      };
+      return res.content.map((block) => block.text).join('\n');
+    };
+    const shown = await run({ action: 'list', all: true });
+    assert.match(shown, /job-1xk3/, 'the finished job is listed');
+    assert.match(shown, /exited with code 0/, 'with its own verdict');
+    assert.match(await run({ action: 'list' }), /No background jobs/, 'and the default still hides it');
+  } finally {
+    await root.fiber.dispose();
+  }
+}));
+
 test('mount: another master\'s job is not adopted, listed or announced here', withCleanup(async () => {
   // Core reports every live terminal; the label alone would let a job from another project look like
   // this session's own work. Lineage is the boundary: this master is t0.

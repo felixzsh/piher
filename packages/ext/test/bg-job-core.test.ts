@@ -326,6 +326,34 @@ test('a delivered job leaves the list: the launcher already acted on its notice'
   assert.deepEqual(listedJobs([]), []);
 });
 
+test('list all: the finished tail comes back, newest first', () => {
+  const jobs = [
+    job({ id: 'job-1', delivered: true, startedAt: 1_000 }),
+    job({ id: 'job-2', status: 'running', exitCode: null, endedAt: null, startedAt: 3_000 }),
+    job({ id: 'job-3', delivered: true, startedAt: 2_000 }),
+  ];
+  assert.deepEqual(listedJobs(jobs, { all: true }).map((entry) => entry.id), ['job-2', 'job-3', 'job-1']);
+  assert.deepEqual(listedJobs(jobs).map((entry) => entry.id), ['job-2'], 'the default still hides what is spent');
+});
+
+test('list cwd: only jobs inside that directory, and never a sibling with the same prefix', () => {
+  const jobs = [
+    job({ id: 'here', cwd: '/work/piher' }),
+    job({ id: 'below', cwd: '/work/piher/packages/ext' }),
+    job({ id: 'sibling', cwd: '/work/piher-extra' }),
+    job({ id: 'elsewhere', cwd: '/work/other' }),
+  ];
+  assert.deepEqual(listedJobs(jobs, { cwd: '/work/piher' }).map((entry) => entry.id).sort(), ['below', 'here']);
+  assert.equal(listedJobs(jobs, { cwd: '/work' }).length, 4, 'the parent keeps all of them');
+});
+
+test('a list line says where a job ran when it is outside the session checkout', () => {
+  const inside = formatJobListLine(job({ id: 'job-1', cwd: '/work/piher/packages/ext', label: 'build' }), 81_000, '/work/piher');
+  assert.doesNotMatch(inside, /in \/work/, 'same checkout: no noise');
+  const outside = formatJobListLine(job({ id: 'job-2', cwd: '/work/other', label: 'deploy' }), 81_000, '/work/piher');
+  assert.match(outside, /· in \/work\/other/, 'another project says so');
+});
+
 test('delivered records are kept for a short tail, then dropped while the log survives', () => {
   const delivered = Array.from({ length: 8 }, (_, i) => job({ id: `job-${i + 1}`, delivered: true, endedAt: 1_000 + i }));
   const expired = expiredDelivered(delivered, 5);

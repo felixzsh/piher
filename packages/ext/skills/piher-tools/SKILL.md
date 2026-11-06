@@ -158,7 +158,9 @@ log, so a long build never floods the context.
 - Once a job's notice reaches you the job is spent: `list` no longer shows it. Its log stays on disk
   and the notice carries the path; `read` it if you need more than the tail.
 - `list` is this session's own pending work — a job whose terminal was started by another master is
-  never adopted, listed or announced here, even though core reports every live terminal.
+  never adopted, listed or announced here, even though core reports every live terminal. `list` with
+  `all: true` also shows the finished jobs the session still remembers, and `cwd` keeps only the jobs
+  running there or below; a job outside your checkout is marked `· in <dir>`.
 - The exit code is the pipeline's: `pipefail` is already set for you.
 
 Use `bash` instead for anything short, interactive, or order-dependent.
