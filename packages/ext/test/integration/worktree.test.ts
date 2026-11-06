@@ -26,6 +26,7 @@ import {
 import {
   TempHome, fakeWatch, mountSubagent, runSubagent, runSubagentRejects, terminalInfo, type FakePi,
 } from '../test-utils.ts';
+import type { TerminalInfo } from '../../src/core-client.ts';
 
 /* ── planners ───────────────────────────────────────────────────── */
 
@@ -249,6 +250,8 @@ interface WtHarness {
   port: SubagentPortBox;
   /** `herdr.*` labels handed to `terminal.run`, in spawn order. */
   labels: Array<Record<string, string>>;
+  /** Terminals the fake core lists — the app writes `herdr.tab` back onto a pane it adopted. */
+  listed: TerminalInfo[];
   retired: string[];
   /** Spaces the app was asked to close, and a way to make the app unreachable. */
   spaces: { closed: string[]; fail: boolean };
@@ -287,6 +290,7 @@ async function withHarness(fn: (h: WtHarness) => Promise<void>): Promise<void> {
   await Promise.all(servers.map((s) => new Promise<void>((resolve) => s.once('listening', resolve))));
 
   const labels: Array<Record<string, string>> = [];
+  const listed: TerminalInfo[] = [];
   const retired: string[] = [];
   const spaces: WtHarness['spaces'] = { closed: [], fail: false };
   let paneIndex = 0;
@@ -306,6 +310,7 @@ async function withHarness(fn: (h: WtHarness) => Promise<void>): Promise<void> {
     },
     client: {
       getTerminal: async (id: string) => terminalInfo({ id }),
+      listTerminals: async () => listed,
       // Parked forever: an unparked fake watch makes the poll loop spin on microtasks.
       watchChildren: () => fakeWatch({ terminals: () => [], park: () => new Promise<boolean>(() => {}) }),
       run: async (o) => {
@@ -316,7 +321,7 @@ async function withHarness(fn: (h: WtHarness) => Promise<void>): Promise<void> {
     },
   });
   try {
-    await fn({ repo, home, pi, port, labels, retired, spaces });
+    await fn({ repo, home, pi, port, labels, listed, retired, spaces });
   } finally {
     await root.fiber.dispose();
     for (const sock of sockets) sock.destroy();
@@ -353,6 +358,22 @@ test('spawn worktree: one name makes the checkout, and says where it is', async 
     // The app opens the space from this label alone: no app call, and no tab of the master's.
     assert.equal(h.labels[0]!['herdr.space'], checkoutSpaceId(path));
     assert.equal('herdr.tab' in h.labels[0]!, false, 'the app makes the tab inside the space');
+
+    // A second worker on the same checkout joins that tab instead of asking for one of its own: the
+    // app wrote the tab id back onto the first pane, and the reviewer sits beside the worker it reads.
+    h.listed.push(terminalInfo({
+      id: 'p2',
+      labels: { ...h.labels[0]!, 'herdr.tab': 'wtTab', 'piher.session': '/sessions/a.jsonl' },
+    }));
+    const reviewer = await runSubagent(
+      h.pi,
+      { description: 'review the probe run', prompt: PROMPT, worktree: 'probe' },
+      h.repo,
+    );
+    assert.match(reviewer.content[0]!.text, /^started subagent [a-z0-9-]+@p3 /);
+    assert.equal(h.labels[1]!['herdr.space'], checkoutSpaceId(path), 'still the checkout space');
+    assert.equal(h.labels[1]!['herdr.tab'], 'wtTab', "the second worker joins the first one's tab");
+    h.listed.length = 0;
 
     // The ledger row names the checkout `resume` and `close` depend on.
     await waitFor(() => ledgerRows(h.repo).some((r) => r.via === 'spawn'));

@@ -370,7 +370,9 @@ export function createSpawner(h: SpawnerHost): Spawner {
    * `peek` to watch one on demand. A pane beside the master was noise nobody asked for.
    *
    * Two cases do ask for a pane: a worker in its own checkout names the checkout's `herdr.space`
-   * (the app's worktree button), and an explicit `tab` joins a tab of this master's space.
+   * (the app's worktree button), and an explicit `tab` joins a tab of this master's space. A second
+   * worker on that same checkout also joins the tab the app made there, so a worker and its reviewer
+   * sit in one tab instead of two.
    */
   async function spawnPaneInTaskTab(
     placement: {
@@ -391,8 +393,15 @@ export function createSpawner(h: SpawnerHost): Spawner {
       zone: placement.zone,
     });
     const placementLabels = await h.client.placementLabels();
+    // A second worker on the same checkout joins the tab the app already made in its space, so a
+    // worker and the reviewer that reads it sit side by side instead of in two tabs of one space.
+    const checkoutTab = placement.spaceId ? await tabInCheckoutSpace(placement.spaceId) : '';
     const labels = placement.spaceId
-      ? { ...withoutPlacement(placementLabels), 'herdr.space': placement.spaceId }
+      ? {
+        ...withoutPlacement(placementLabels),
+        'herdr.space': placement.spaceId,
+        ...(checkoutTab ? { 'herdr.tab': checkoutTab } : {}),
+      }
       : !placement.visible
         ? withoutPlacement(placementLabels)
         : plan.tabId ? { ...placementLabels, 'herdr.tab': plan.tabId } : placementLabels;
@@ -403,13 +412,34 @@ export function createSpawner(h: SpawnerHost): Spawner {
       labels,
       noNotify: true,
     });
-    return placement.spaceId || !placement.visible
-      ? { tabId: '', paneId: terminal.id, tabName: '' }
-      : {
-        tabId: plan.tabId ?? placementLabels['herdr.tab'] ?? '',
-        paneId: terminal.id,
-        tabName: plan.tabName,
-      };
+    return placement.spaceId
+      ? { tabId: checkoutTab, paneId: terminal.id, tabName: '' }
+      : !placement.visible
+        ? { tabId: '', paneId: terminal.id, tabName: '' }
+        : {
+          tabId: plan.tabId ?? placementLabels['herdr.tab'] ?? '',
+          paneId: terminal.id,
+          tabName: plan.tabName,
+        };
+  }
+
+  /** The tab the app already made inside a checkout's space, if a terminal is there already.
+   *
+   * A space spawn names only `herdr.space`: the app creates the space and a tab inside it, and writes
+   * the tab id back onto the terminal it adopted. Reading it from the sibling is what keeps the
+   * second spawn of a checkout in that same tab; the first one of a checkout finds nothing here and
+   * lets the app make the tab. A worker of ours wins over an unrelated terminal that happens to sit
+   * in the space, and any failure falls back to today's behaviour (a tab of its own).
+   */
+  async function tabInCheckoutSpace(spaceId: string): Promise<string> {
+    try {
+      const terminals = await h.client.listTerminals({ all: true });
+      const inSpace = terminals.filter((t) => t.labels['herdr.space'] === spaceId && t.labels['herdr.tab']);
+      const ours = inSpace.find((t) => t.labels['piher.session']);
+      return (ours ?? inSpace[0])?.labels['herdr.tab'] ?? '';
+    } catch {
+      return '';
+    }
   }
 
   /** D94: reuse a terminal that already runs the same session instead of competing on one transcript.
