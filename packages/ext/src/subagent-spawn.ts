@@ -665,7 +665,7 @@ export function createSpawnAction(h: SpawnActionHost) {
       return {
         content: [{
           type: 'text',
-          text: `started subagent ${subRef(entry)} (task ${taskId}, ${roleLifecycle === 'one-shot' ? 'one-shot — reports once and exits' : 'persistent — stays until you close it'})${worktreeRecord && worktreeOutcome ? ` ${checkoutAckLine(worktreeRecord, worktreeOutcome)}` : ''}. Its result arrives as a settlement notice at your next turn boundary — do not sleep or poll for it.`,
+          text: `started subagent ${subRef(entry)} (task ${taskId}, ${roleLifecycle === 'one-shot' ? 'one-shot — reports once and exits' : 'persistent — stays until you close it'})${worktreeRecord && worktreeOutcome ? ` ${checkoutAckLine(worktreeRecord, worktreeOutcome)}` : ''}. Your prompt is already its first message — do not resend it. Its result arrives as a settlement notice at your next turn boundary — do not sleep or poll for it.`,
         }],
         details: {
           paneId,
