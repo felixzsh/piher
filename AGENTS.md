@@ -50,37 +50,33 @@ the role forbids it (a worker's manifest denies `bg_job`), to an `hc` terminal (
 `hc wait`) — never to a blocking shell call. `bash` is for short, interactive or order-dependent
 commands.
 
-## Tests: two tiers, and the rule for when to run which
+## Tests: one command, and it is fast enough to just run it
 
-The suite has two tiers. Pick by the size of the change, never by habit — running the full suite
-after a one-line edit wastes the most expensive resource in the loop.
+`npm test` is `tsc --noEmit` plus the whole suite: **439 tests in ~15 s**. Run it — a one-line edit, a
+string, a whole feature. There is no tier to pick and no cheap-loop calculus to rehearse; that
+reasoning used to exist because an unbounded readiness wait made the suite take two minutes, and the
+wait is gone.
 
 | Command | What runs | Time |
 |---|---|---|
-| `node --test --test-timeout=30000 test/<file>.test.ts` | one suite you know you touched | ~1 s |
-| `npm run test:fast` | `packages/ext/test/*.test.ts` — pure planners, roles, config catalog, renderers, transcript folding (322 tests) | ~4 s |
-| `npm run test:integration` | `packages/ext/test/integration/*.test.ts` — boots the extension, real git worktrees, installer subprocesses, core-client sockets (117 tests) | ~9 s |
-| `npm test` | `tsc --noEmit` + both tiers (439 tests) | ~15 s |
+| `npm test` | `tsc --noEmit` + every suite (439 tests) | ~15 s |
+| `node --test --test-timeout=120000 test/<file>.test.ts` | one suite, while iterating on it | ~1-3 s |
 
 Rules:
 
-- **A small edit runs the file you touched, or `test:fast`.** Never the full suite: a string, a
-  comment or one function does not justify 20 s.
-- **`npm test` is for a change that crosses modules, and before every commit and push.** That is
-  where `typecheck` lives too.
-- `test/integration/` is the tier for anything that spawns a process, starts a socket, touches a real
-  git worktree or boots the composition root. A new suite with those properties belongs there, and
-  the fast tier stays fast because of it.
+- **Run `npm test` before every commit and push.** That is where `typecheck` lives too.
+- A single suite by path is fine while you are still editing it, but it is not a cheaper way to
+  validate a change: it is the same runner, one file.
+- `test/integration/` still groups what spawns a process, opens a socket, touches a real git worktree
+  or boots the composition root — directory order, not a separate command: the same `npm test` runs
+  both.
 - **Give the harness its budgets; never force the exit.** `worktree.test.ts` passes
   `policy: { readinessTimeoutMs: 3000 }`, so a spawn whose pipe never answers fails in seconds
-  instead of waiting out the 90 s `PIHER_READY_TIMEOUT_MS` (that wait alone made integration look
-  100 s long). `--test-force-exit` is what made the reported totals lie: `node --test` exits with
-  async stdout writes still pending, so a green run reported 437 tests instead of 439. With the
-  budget in the harness the flag is gone from the root and `packages/ext` scripts, and the
-  totals are stable. `stryker.conf.json` still passes it: a mutant run spawns the suite thousands
-  of times, and nobody has measured whether the truncation matters there. Drop it only after a
-  mutation run shows the same kill counts without it.
-- `--test-timeout` (30 s fast, 120 s integration) is what turns a hang into a failure instead of a
+  instead of waiting out the 90 s `PIHER_READY_TIMEOUT_MS` — that wait is what made the suite look
+  100 s long. `--test-force-exit` was what made the reported totals lie as well: `node --test` exits
+  with async stdout writes still pending, so a green run reported 437 tests instead of 439. No script
+  passes it now. `stryker.conf.json` still does: a mutation run spawns the suite thousands of times
+ is what turns a hang into a failure instead of a
   blocked terminal.
 - Do not add real sleeps to a test to satisfy a timer. Set the budget the code reads
   (`PIHER_SETTLE_WINDOW_MS`, `PIHER_READY_TIMEOUT_MS`, …) to something small in the harness instead.

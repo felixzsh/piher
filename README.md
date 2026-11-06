@@ -275,15 +275,13 @@ install.mjs        # the one-shot installer (npm: piher-setup)
 
 ```sh
 npm install --ignore-scripts
-npm run test:fast         # the loop: pure unit suites (~4 s, 296 tests)
-npm run test:integration  # boots the extension, git worktrees, installer CLI (~9 s)
-npm test                  # typecheck + both tiers (449 tests, ~20 s)
+npm test                  # typecheck + the whole suite (439 tests, ~15 s)
 npm run test:mutation
 ```
 
-The split keeps the tight loop cheap: `test/*.test.ts` is pure logic, and
-`test/integration/*.test.ts` is everything that spawns a process, opens a socket, touches a real
-git worktree or boots the composition root. `AGENTS.md` states when to run which.
+`test/integration/` gathers what spawns a process, opens a socket, touches a real git worktree or
+boots the composition root; the rest is pure logic. That is directory order, not a separate command —
+the same `npm test` runs both, in about fifteen seconds.
 
 ## License
 
