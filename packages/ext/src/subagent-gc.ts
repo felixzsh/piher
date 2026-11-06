@@ -180,6 +180,7 @@ export function createGcController(h: GcHost): GcController {
         consumedAt: e.consumedAt ?? null,
         status: statuses.get(e.paneId),
         prevTurnStart,
+        lifecycle: e.lifecycle,
       })) continue;
       if (statuses.get(e.paneId) === undefined) {
         releaseRow(e);

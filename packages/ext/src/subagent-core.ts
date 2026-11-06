@@ -476,7 +476,12 @@ export function buildLaunchParts(
   opts: { resumeFile?: string | null; roleModel?: string | null; roleThinking?: string | null; approve?: boolean } = {},
   env: { PIHER_TUI?: string | undefined } = process.env,
 ): string[] {
-  const parts = [runtime.nodePath, runtime.cliPath];
+  // A compiled binary is its own entrypoint: `execPath` and `argv[1]` are the same file, and passing
+  // both makes the second one the child's first prompt (observed: the worker greeted "/$bunfs/root/pi"
+  // before its real task). Only an interpreter needs its script named.
+  const parts = runtime.cliPath === '' || runtime.cliPath === runtime.nodePath
+    ? [runtime.nodePath]
+    : [runtime.nodePath, runtime.cliPath];
   if (opts.approve) parts.push('-a');
   parts.push('-e', runtime.extPath);
   if (env.PIHER_TUI !== 'regular') parts.push('--tui-mode', 'fullscreen');

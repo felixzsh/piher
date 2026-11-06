@@ -66,6 +66,20 @@ test('flattenToolParams: nested parameters fill missing top-level ids and do not
   assert.equal(flattenToolParams({ agentId: 'top', parameters: { agentId: 'nested' } })?.agentId, 'top');
 });
 
+test('buildLaunchParts: a compiled binary is not named twice (a duplicate becomes the first prompt)', () => {
+  const binary = { nodePath: '/$bunfs/root/pi', cliPath: '/$bunfs/root/pi', extPath: '/ext/index.ts' };
+  const parts = buildLaunchParts(binary, {}, { PIHER_TUI: 'regular' });
+  assert.equal(parts[0], '/$bunfs/root/pi');
+  assert.equal(parts[1], '-e', 'the entrypoint appears once, then the flags');
+  assert.equal(parts.filter((part) => part === '/$bunfs/root/pi').length, 1);
+  // An interpreter still needs its script.
+  const script = { nodePath: '/usr/bin/node', cliPath: '/opt/pi/cli.js', extPath: '/ext/index.ts' };
+  assert.deepEqual(buildLaunchParts(script, {}, { PIHER_TUI: 'regular' }).slice(0, 2), ['/usr/bin/node', '/opt/pi/cli.js']);
+  // A binary with no script at all (argv[1] missing) must not become an empty argument.
+  const bare = { nodePath: '/$bunfs/root/pi', cliPath: '', extPath: '/ext/index.ts' };
+  assert.equal(buildLaunchParts(bare, {}, { PIHER_TUI: 'regular' })[1], '-e');
+});
+
 test('buildLaunchParts: fullscreen TUI by default (static frames); PIHER_TUI=regular opts out', () => {
   const base = ['/usr/local/bin/node', '/opt/pi/dist/cli.js', '-e', '/ext/index.ts'];
   assert.deepEqual(buildLaunchParts(RT, {}, {}), [...base, '--tui-mode', 'fullscreen']);

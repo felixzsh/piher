@@ -31,9 +31,13 @@ test('shouldCloseTaskTab: closes only when every work pane finished and the grac
   assert.equal(tab({}, ['working']), false);
 });
 
-test('shouldClosePane: explicit status gate, previous-turn grace, vanished terminal recorded closed', () => {
+test('shouldClosePane: only a one-shot pane is reclaimed; a persistent worker is the master\'s', () => {
   const pane = (over: Partial<Parameters<typeof shouldClosePane>[0]> = {}) =>
-    shouldClosePane({ prevTurnStart: NOW, consumedAt: NOW - 1000, status: 'idle', ...over });
+    shouldClosePane({ prevTurnStart: NOW, consumedAt: NOW - 1000, status: 'idle', lifecycle: 'one-shot', ...over });
+  // The same row as a persistent worker is never reclaimed: killing it buys nothing and costs a
+  // cold start on the next `send`, reviving a conversation that was never over.
+  assert.equal(pane({ lifecycle: 'persistent' }), false);
+  assert.equal(pane({ lifecycle: undefined }), false);
   assert.equal(pane(), true);
   assert.equal(pane({ status: 'done' }), true);
   assert.equal(pane({ status: 'error' }), true);
@@ -42,7 +46,7 @@ test('shouldClosePane: explicit status gate, previous-turn grace, vanished termi
   assert.equal(pane({ status: 'unknown' }), false);
   assert.equal(pane({ consumedAt: NOW + 500 }), false, 'consumed this turn keeps the notice visible');
   assert.equal(pane({ consumedAt: null }), false);
-  assert.equal(pane({ consumedAt: null, status: undefined }), true, 'a vanished terminal is recorded closed');
+  assert.equal(pane({ consumedAt: null, status: undefined }), true, 'a vanished terminal is recorded settled');
 });
 
 /* ── plugin-level GC ────────────────────────────────────────────── */
@@ -51,6 +55,7 @@ const pane = (id: string): TerminalInfo => terminalInfo({ id, status: 'idle', la
 const consumed = (paneId: string, cwd: string) => subEntry({
   paneId, taskId: `task-${paneId}`, tabId: 'tMAIN', tabName: 'main', cwd, description: 'pane-gc regression',
   status: 'consumed', consumedAt: Date.now() - 120_000, createdAt: Date.now() - 150_000,
+  lifecycle: 'one-shot',
 });
 
 /** Seeds `subs`, runs one GC pass with `liveTerminals` in the children watch (and core's list),

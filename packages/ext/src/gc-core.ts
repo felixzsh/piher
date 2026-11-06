@@ -36,8 +36,13 @@ export function shouldClosePane(opts: {
   consumedAt: number | null;
   status: string | undefined;
   prevTurnStart: number;
+  /** Only a one-shot spends itself; a persistent worker is the master's to close. */
+  lifecycle?: 'one-shot' | 'persistent';
 }): boolean {
-  if (opts.status === undefined) return true; // terminal gone → record closed
+  if (opts.status === undefined) return true; // terminal gone → record settled
+  // Killing a persistent worker's process buys nothing: it has no pane to reclaim, and the next
+  // `send` would pay a cold start and revive a conversation that was never over.
+  if (opts.lifecycle !== 'one-shot') return false;
   if (opts.status !== 'idle' && opts.status !== 'done' && opts.status !== 'error') return false;
   return (opts.consumedAt ?? 0) > 0 && opts.consumedAt! < opts.prevTurnStart;
 }
