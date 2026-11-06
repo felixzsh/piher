@@ -6,7 +6,7 @@
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { cordisGet } from '../cordis-services.ts';
 import { CORE_REQUIRED, type CoreClientLike, type CoreEnv } from '../core-client.ts';
 import {
@@ -60,6 +60,7 @@ import {
   closeCheckoutSpace,
   releaseCheckout,
   releasedCheckoutLine,
+  checkoutSpaceId,
   type CheckoutIo,
   type CheckoutSpace,
 } from '../worktree.ts';
@@ -444,6 +445,11 @@ export default function subagentPlugin(ctx: Context): void {
         description: entry.description,
         // A revive keeps the visibility the worker was given: only one that had a tab gets a pane.
         visible: entry.tabId !== '',
+        // A revived worker goes back to the window its checkout owns. Without this a spawn carries
+        // no `herdr.space` at all, and the app adopts the pane into whatever space is focused — the
+        // worker reappears in a different workspace than the one its checkout lives in.
+        zone: entry.worktree ? { zone: 'worktree', tabName: basename(entry.worktree.path) } : undefined,
+        spaceId: entry.worktree ? checkoutSpaceId(entry.worktree.path) : null,
       },
       entry.cwd,
       {

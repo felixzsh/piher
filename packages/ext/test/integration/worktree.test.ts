@@ -512,3 +512,26 @@ test('one-shot: a checkout still used by another worker keeps its space', async 
     assert.ok(existsSync(path), 'the checkout stays for the master either way');
   });
 });
+
+test('resume: a revived worker goes back to the space its checkout owns', async () => {
+  await withHarness(async (h) => {
+    const spawn = await runSubagent(h.pi, { description: 'probe run', prompt: PROMPT, worktree: 'shot' }, h.repo);
+    const paneId = spawn.details?.paneId as string;
+    const taskId = spawn.details?.taskId as string;
+    const path = checkoutPath(h, 'shot');
+    const space = checkoutSpaceId(path);
+    assert.equal(h.labels[0]!['herdr.space'], space, 'the first pane names the checkout space');
+    await waitFor(() => h.port.current !== null);
+    // Read the result: unfinished business for a persistent worker, so `resume` revives it.
+    h.port.current!.consumeReply(paneId, 'REPORT: done');
+    h.listed.push(terminalInfo({ id: paneId, labels: { ...h.labels[0]!, 'herdr.tab': 'wtTab' } }));
+
+    const resumed = await runSubagent(h.pi, { action: 'resume', taskId }, h.repo);
+    assert.match(resumed.content[0]!.text, /resumed subagent/);
+    const revived = h.labels.at(-1)!;
+    // Without the space label the app adopts the revived pane into the focused space, and the
+    // worker reappears in a workspace that is not its checkout's.
+    assert.equal(revived['herdr.space'], space, 'the revived pane names the checkout space again');
+    assert.equal(revived['herdr.tab'], 'wtTab', 'and joins the tab already there');
+  });
+});
