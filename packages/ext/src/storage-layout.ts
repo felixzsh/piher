@@ -1,5 +1,5 @@
 /**
- * Storage path layout (delegation ledger, session dirs, role dirs) — the single owner of the
+ * Storage path layout (session dirs, role dirs) — the single owner of the
  * session-dir encoding, so session-tail / role-loader cannot drift apart.
  *
  * Reads try pi core's own directory name first, then piher's collision-resistant encoding
@@ -81,17 +81,6 @@ export function mainWorktreeRoot(cwd: string): string | null {
     if (parent === dir) return null;
     dir = parent;
   }
-}
-
-/**
- * Delegation ledger of the repository containing `cwd`: one file per repository inside the main
- * checkout, so a worker in a linked worktree records into the repository, never into the worktree.
- * Outside a git repository there is no ledger and no fallback location. `.piher/history/` must be
- * git-ignored (never the parent `.piher/`, whose `roles/` are meant to be committed).
- */
-export function ledgerFile(cwd: string): string | null {
-  const root = mainWorktreeRoot(cwd);
-  return root === null ? null : join(root, '.piher', 'history', 'history.jsonl');
 }
 
 export function userRolesDir(): string {

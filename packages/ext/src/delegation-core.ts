@@ -17,9 +17,9 @@ export interface DelegationContext {
   readonly parentPaneId: string;
   /** Master pi session id (cross-locate the parent transcript via /resume). */
   readonly parentSessionId: string;
-  /** SubEntry.taskId — stable across revives. */
+  /** TaskRow.taskId — stable across revives. */
   readonly taskId: string;
-  /** Task short label (SubEntry.description). */
+  /** Task short label (TaskRow.description). */
   readonly description: string;
   /** Role manifest name active at spawn. */
   readonly role: string;

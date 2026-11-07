@@ -9,11 +9,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { CoreClientLike } from '../../src/core-client.ts';
 import { pipeNameFor, startPipeServer, type PipeRequest } from '../../src/pipe-channel.ts';
-import { appendLedger, ledgerFile } from '../../src/history-store.ts';
+import { readTaskRecord, repoTasksDir } from '../../src/task-store.ts';
 import type { SubagentPortBox } from '../../src/subagent-core.ts';
 import { NodeGitAdapter, createSpawner, type GitExecFile } from '../../src/subagent-spawn.ts';
 import {
-  TempHome, fakeCore, fakeWatch, jsonl, mountSubagent, runSubagent, runSubagentRejects, subsSnapshot, terminalInfo, transcriptMessage, type FakePi,
+  TempHome, fakeCore, fakeWatch, fire, jsonl, mountSubagent, readTaskView, runSubagent, runSubagentRejects,
+  seedTaskDocuments, terminalInfo, transcriptMessage, type FakePi,
 } from '../test-utils.ts';
 
 /* ── readiness failures ─────────────────────────────────────────── */
@@ -83,6 +84,8 @@ interface PipeEnv {
   rejectPrompt: boolean;
   /** Milliseconds every pipe answer is delayed: a spawn must not wait for the child. */
   pipeDelayMs: number;
+  /** Simulate a master restart: dispose the session, mount fresh, and restore from the documents. */
+  remount?: (reason: string) => Promise<void>;
 }
 
 /** Mounts the plugin with a loopback pipe server standing in for the worker pane (p2): it records
@@ -90,12 +93,12 @@ interface PipeEnv {
  * `paneSeq` hands out p2, p3, … (one pipe server per id) for multi-worker tests. */
 async function withPipeEnv(
   fn: (env: PipeEnv) => Promise<void>,
-  opts: { childCwd?: string; paneSeq?: boolean; gitRepo?: boolean } = {},
+  opts: { childCwd?: string; paneSeq?: boolean; gitRepo?: boolean; sessionFile?: string | ((cwd: string) => string) } = {},
 ): Promise<void> {
   const home = new TempHome('piher-spawn-home-');
   const cwd = mkdtempSync(join(tmpdir(), 'piher-spawn-cwd-'));
-  // The delegation ledger lives inside the repository, so a main checkout needs a `.git`. The
-  // `gitRepo: false` case is the "not inside a git repository" one: no ledger at all.
+  // The task directory lives inside the repository, so a main checkout needs a `.git`. The
+  // `gitRepo: false` case is the "not inside a git repository" one: no tasks at all.
   if (opts.gitRepo !== false) mkdirSync(join(cwd, '.git'));
   const sessionFile = join(cwd, 'sub-session.jsonl');
   let parked = false;
@@ -134,37 +137,51 @@ async function withPipeEnv(
   ensureServer('p2');
   if (opts.paneSeq) { ensureServer('p3'); ensureServer('p4'); }
   await Promise.all(servers.map((s) => new Promise<void>((resolve) => s.once('listening', resolve))));
-  const { root, pi, port } = await mountSubagent({
-    client: {
-      getTerminal: async (id: string) => env.paneGone ? null : terminalInfo({
+  const clientOpts: Partial<CoreClientLike> = {
+    getTerminal: async (id: string) => env.paneGone ? null : terminalInfo({
+      id,
+      labels: ['p2', 'p3', 'p4'].includes(id) ? { 'piher.session': sessionFile } : {},
+    }),
+    // The poller parks on the children watch: while parked, `changed` never resolves and the
+    // snapshot reports the worker as working, so the row stays running with no polling.
+    watchChildren: () => fakeWatch({
+      terminals: () => ['p2', 'p3', 'p4'].map((id) => terminalInfo({
         id,
-        labels: ['p2', 'p3', 'p4'].includes(id) ? { 'piher.session': sessionFile } : {},
-      }),
-      // The poller parks on the children watch: while parked, `changed` never resolves and the
-      // snapshot reports the worker as working, so the row stays running with no polling.
-      watchChildren: () => fakeWatch({
-        terminals: () => ['p2', 'p3', 'p4'].map((id) => terminalInfo({
-          id,
-          status: parked ? 'working' : 'idle',
-          labels: { 'piher.session': sessionFile },
-        })),
-        park: () => (parked ? new Promise<never>(() => {}) : false),
-      }),
-      read: async () => ({ text: '', complete: true }),
-      run: async (o) => {
-        env.spawnEnvs.push(o.env ?? {});
-        env.spawnLabels.push(o.labels ?? {});
-        return terminalInfo({ id: nextPaneId(), cwd: o.cwd, labels: o.labels });
-      },
-      kill: async (id) => { env.retired.push(id); },
+        status: parked ? 'working' : 'idle',
+        labels: { 'piher.session': sessionFile },
+      })),
+      park: () => (parked ? new Promise<never>(() => {}) : false),
+    }),
+    read: async () => ({ text: '', complete: true }),
+    run: async (o) => {
+      env.spawnEnvs.push(o.env ?? {});
+      env.spawnLabels.push(o.labels ?? {});
+      return terminalInfo({ id: nextPaneId(), cwd: o.cwd, labels: o.labels });
     },
-  });
-  env.pi = pi;
-  env.port = port;
+    kill: async (id) => { env.retired.push(id); },
+  };
+  let root: { fiber: { dispose(): Promise<unknown> } } | null = null;
+  const sessionPath = typeof opts.sessionFile === 'function' ? opts.sessionFile(cwd) : opts.sessionFile ?? null;
+  const mount = async (): Promise<void> => {
+    const mounted = await mountSubagent({
+      client: clientOpts,
+      ...(sessionPath ? { deps: { getSessionFile: () => sessionPath, getCwd: () => cwd } } : {}),
+    });
+    env.pi = mounted.pi;
+    env.port = mounted.port;
+    root = mounted.root;
+  };
+  await mount();
+  env.remount = async (reason: string): Promise<void> => {
+    await root!.fiber.dispose();
+    await mount();
+    // The branch is empty on purpose: the restore reads the view and the records, never it.
+    await fire(env.pi, 'session_start', { reason }, { sessionManager: { getBranch: () => [] } });
+  };
   try {
     await fn(env);
   } finally {
-    await root.fiber.dispose();
+    await root!.fiber.dispose();
     // Destroying the live connections first: a lingering client would keep close() pending forever.
     for (const sock of sockets) sock.destroy();
     await Promise.all(servers.map((s) => new Promise<void>((resolve) => s.close(() => resolve()))));
@@ -206,8 +223,10 @@ test('spawn action: an acknowledgement now, the prompt later, the report as a no
       assert.equal(result.details?.role, 'task');
       await waitFor(() => env.frames.length === 2);
       const running = env.port.current?.listRunningSubs() ?? [];
-      assert.deepEqual(running.map((s) => s.paneId), ['p2']);
-      assert.equal(running[0]!.description, 'long probe');
+      // The harness reuses the pane id across subtests, so the parked first task reads as running
+      // too: one row per task, and the new worker is among them.
+      assert.deepEqual(running.map((s) => s.description).sort(), ['long probe', 'probe']);
+      assert.ok(running.some((s) => s.paneId === 'p2' && s.description === 'long probe'));
       const listed = (await runSubagent(env.pi, { action: 'list' }, env.cwd)).content[0]!.text;
       assert.match(listed, /p2 \[running/);
       assert.match(listed, /long probe/);
@@ -217,13 +236,17 @@ test('spawn action: an acknowledgement now, the prompt later, the report as a no
       env.rejectPrompt = true;
       const text = (await runSubagent(env.pi, { description: 'probe', prompt: PROMPT }, env.cwd)).content[0]!.text;
       assert.match(text, /^started subagent/, 'the start is acknowledged before the pipe answers');
+      const slug = /started subagent ([a-z0-9-]+)@/.exec(text)![1];
+      const failedTaskId = /\(task ([0-9a-f-]+),/.exec(text)![1];
       await waitFor(() => env.retired.length === 1 && env.pi.userSent.length > 0);
       assert.deepEqual(env.retired, ['p2'], 'the failed terminal is killed');
       const notice = env.pi.userSent.at(-1)?.content ?? '';
       assert.match(notice, /failed to start/);
       assert.match(notice, /sim rejected/);
-      assert.ok(!(env.port.current?.listRunningSubs() ?? []).some((s) => s.paneId === 'p2'), 'no ghost running row in the ledger');
-      assert.ok(!subsSnapshot(env.pi)?.subs.some((s) => s.paneId === 'p2'), 'the final snapshot no longer lists the pane');
+      // Scoped by slug: earlier subtests parked their workers on the same harness pane id.
+      assert.ok(!(env.port.current?.listRunningSubs() ?? []).some((s) => s.slug === slug), 'no ghost running row for the failed start');
+      assert.ok(!(env.port.current?.listRows() ?? []).some((s) => s.slug === slug), 'the final board no longer lists the failed task');
+      assert.equal(readTaskRecord(env.cwd, failedTaskId), null, 'a spawn that never started leaves no record');
     });
   });
 });
@@ -279,9 +302,10 @@ test('send: a settled persistent worker is still reachable', async () => {
     assert.match(sent.content[0]!.text, /Message sent to subagent/);
     // A follow_up re-arms the row: the old consume time must go, or GC and the checkout sweep read a
     // worker with a turn in flight as finished.
-    const rearmed = subsSnapshot(env.pi)?.subs.find((s) => s.paneId === paneId);
+    const rearmed = env.port.current!.listRows().find((s) => s.paneId === paneId);
     assert.equal(rearmed?.status, 'running');
-    assert.equal(rearmed?.consumedAt, null, 'the new request clears the settlement time');
+    const taskId = spawned.details?.taskId as string;
+    assert.equal(readTaskRecord(env.cwd, taskId)?.gen.consumedAt, null, 'the new request clears the settlement time');
     // The combined `slug@paneId` form is what spawn prints, so it is what a master copies back.
     const slug = /started subagent ([a-z0-9-]+)@/.exec(spawned.content[0]!.text)![1];
     const combined = await runSubagent(env.pi, { action: 'send', agentId: `${slug}@${paneId}`, message: 'otra vez' }, env.cwd);
@@ -340,11 +364,11 @@ test('send/resume: short prefixes resolve at four characters and report ambiguit
 
     // A second generation sharing the prefix makes the four-character prefix ambiguous.
     const ambiguousTaskId = `${short4}9999-0000-1111-2222-333344445555`;
-    appendLedger(env.cwd, {
-      taskId: ambiguousTaskId, kind: 'task', paneId: 'p3', tabId: 't0', workspaceId: 'w1', cwd: env.cwd,
+    seedTaskDocuments(null, [{
+      taskId: ambiguousTaskId, kind: 'task', paneId: 'p3', tabId: 't0', cwd: env.cwd,
       description: 'ambiguous conflict task', sessionFile: null, launchCommand: ['node', 'cli.js'],
       status: 'settled', createdAt: Date.now() + 10,
-    });
+    }]);
     env.port.current?.consumeReply(String(resumed.details?.paneId), 'done');
     const ambiguous = await runSubagentRejects(env.pi, { action: 'resume', taskId: short4 }, env.cwd);
     assert.match(ambiguous, /ambiguous task id/);
@@ -353,12 +377,12 @@ test('send/resume: short prefixes resolve at four characters and report ambiguit
   });
 });
 
-test('resume: a task spawned from a linked worktree lives in the repository ledger and resumes from the main checkout', async () => {
+test('resume: a task spawned from a linked worktree lives in the repository tasks and resumes from the main checkout', async () => {
   const wt = mkdtempSync(join(tmpdir(), 'piher-resume-wt-'));
   await withPipeEnv(async (env) => {
     env.parkPollers();
     // A linked worktree is a `.git` FILE whose gitdir points into the main checkout and whose
-    // commondir names the shared git dir — the repository, never the worktree, owns the ledger.
+    // commondir names the shared git dir — the repository, never the worktree, owns the tasks.
     const wtGitdir = join(env.cwd, '.git', 'worktrees', 'wt');
     mkdirSync(wtGitdir, { recursive: true });
     writeFileSync(join(wtGitdir, 'commondir'), '../..\n');
@@ -369,30 +393,31 @@ test('resume: a task spawned from a linked worktree lives in the repository ledg
     const taskId = spawned.details?.taskId as string;
     const paneId = spawned.details?.paneId as string;
 
-    const repoLedger = ledgerFile(env.cwd)!;
-    // The spawn must not wait on the ledger write (S41 keeps it off the spawn's critical path), so a
-    // test that reads the file waits for the append instead of assuming it already landed.
-    await waitFor(() => existsSync(repoLedger));
+    const repoLedger = repoTasksDir(env.cwd)!;
+    // The spawn must not wait on the record write (S41 keeps it off the spawn's critical path), so a
+    // test that reads the file waits for the write instead of assuming it already landed.
+    const spawnedRecord = join(repoLedger, `${taskId}.json`);
+    await waitFor(() => existsSync(spawnedRecord));
     assert.deepEqual(
-      JSON.parse(readFileSync(repoLedger, 'utf8').trim().split('\n').at(-1)!).cwd,
+      (JSON.parse(readFileSync(spawnedRecord, 'utf8')) as { rows: Array<{ cwd: string }> }).rows[0]!.cwd,
       wt,
-      'the worktree spawn is recorded in the repository ledger',
+      'the worktree spawn is recorded in the repository tasks',
     );
-    assert.equal(ledgerFile(wt), repoLedger, 'the worktree itself holds no ledger');
+    assert.equal(repoTasksDir(wt), repoLedger, 'the worktree itself holds no tasks');
 
     assert.match(await runSubagent(env.pi, { action: 'resume', taskId }, env.cwd).then((r) => r.content[0]!.text), /already running as pane/);
     env.port.current?.consumeReply(paneId, 'done');
     const resumed = await runSubagent(env.pi, { action: 'resume', taskId }, env.cwd);
     assert.match(resumed.content[0]!.text, /resumed subagent/);
     assert.equal(resumed.details?.taskId, taskId);
-    const row = subsSnapshot(env.pi)?.subs.find((s) => s.taskId === taskId);
+    const row = readTaskRecord(env.cwd, taskId);
     assert.equal(row?.cwd, wt, 'revive keeps the checkout the task was spawned into');
 
-    // A resume asked for from the worktree resolves the same repository ledger (S41): the miss
-    // message names that file, never a directory under the worktree or the agent root.
+    // A resume asked for from the worktree resolves the same task directory (S41): the miss
+    // message names that directory, never one under the worktree or the agent root.
     const miss = await runSubagentRejects(env.pi, { action: 'resume', taskId: 'ffffffff' }, wt);
-    assert.ok(miss.includes(repoLedger), `resume from a worktree reads the repository ledger: ${miss}`);
-    assert.ok(!miss.includes(join(wt, '.piher')), 'never a ledger under the worktree');
+    assert.ok(miss.includes(repoLedger), `resume from a worktree reads the repository tasks: ${miss}`);
+    assert.ok(!miss.includes(join(wt, '.piher')), 'never a task directory under the worktree');
   }, { childCwd: wt });
 });
 
@@ -433,7 +458,7 @@ test('admission: resumes waiting for their pipe cannot hold a spawn behind them'
   });
 });
 
-test('ledger: a spawn outside a git repository still runs, records nothing and says why', async () => {
+test('tasks: a spawn outside a git repository still runs, records nothing and says why', async () => {
   const logged: string[] = [];
   const origError = console.error;
   console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
@@ -443,7 +468,7 @@ test('ledger: a spawn outside a git repository still runs, records nothing and s
       const spawned = await runSubagent(env.pi, { description: 'no-repository task', prompt: PROMPT }, env.cwd);
       await waitFor(() => env.frames.length === 1);
       assert.match(spawned.content[0]!.text, /^started subagent/, 'the spawn is not failed by bookkeeping');
-      assert.equal(ledgerFile(env.cwd), null);
+      assert.equal(repoTasksDir(env.cwd), null);
       assert.match(spawned.details?.taskId as string, /^[0-9a-f-]{8,}$/, 'the task exists even with nowhere to record it');
       await waitFor(() => logged.some((l) => /no delegation ledger/.test(l)));
       assert.ok(logged.some((l) => /no delegation ledger/.test(l) && l.includes(env.cwd)), 'one line names the reason');
@@ -451,7 +476,7 @@ test('ledger: a spawn outside a git repository still runs, records nothing and s
       assert.match(
         await runSubagentRejects(env.pi, { action: 'resume', taskId: 'ffffffff-0000-4111-8222-333333333333' }, env.cwd),
         /resume needs a git repository/,
-        `the ledger cannot answer for ${taskId}`,
+        `no task directory can answer for ${taskId}`,
       );
     }, { gitRepo: false });
   } finally {
@@ -459,7 +484,7 @@ test('ledger: a spawn outside a git repository still runs, records nothing and s
   }
 });
 
-test('ledger: a real git worktree resolves to the main checkout (git, not a simulation)', () => {
+test('tasks: a real git worktree resolves to the main checkout (git, not a simulation)', () => {
   const repo = mkdtempSync(join(tmpdir(), 'piher-ledger-real-'));
   const wt = mkdtempSync(join(tmpdir(), 'piher-ledger-real-wt-'));
   const git = (...args: string[]) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
@@ -468,9 +493,9 @@ test('ledger: a real git worktree resolves to the main checkout (git, not a simu
     git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'init');
     git('worktree', 'add', '-q', wt, '-b', 'ledger-wt');
     mkdirSync(join(repo, 'packages'));
-    assert.equal(ledgerFile(join(repo, 'packages')), ledgerFile(repo), 'a subdirectory resolves to its repository');
-    assert.equal(ledgerFile(wt), join(repo, '.piher', 'history', 'history.jsonl'), 'the worktree writes the repository ledger');
-    assert.equal(ledgerFile(dirname(repo)), null, 'no ledger above the repository');
+    assert.equal(repoTasksDir(join(repo, 'packages')), repoTasksDir(repo), 'a subdirectory resolves to its repository');
+    assert.equal(repoTasksDir(wt), join(repo, '.piher', 'tasks'), 'the worktree writes the repository tasks');
+    assert.equal(repoTasksDir(dirname(repo)), null, 'no tasks above the repository');
   } finally {
     rmSync(wt, { recursive: true, force: true });
     rmSync(repo, { recursive: true, force: true });
@@ -548,4 +573,51 @@ test('slugs: spawn allocates and dedupes; list/send accept slug, slug@paneId, an
     const stale = await runSubagent(env.pi, { action: 'send', agentId: 'fix-auth-flow@pOld', message: 'still me' }, env.cwd);
     assert.match(stale.content[0]!.text, /Message sent to subagent fix-auth-flow@p2/);
   }, { paneSeq: true });
+});
+
+/* ── P1: TaskRow + the two documents ───────────────────────────── */
+
+test('tasks: a reload restores two workers from the records, and both close by the refs list printed', async () => {
+  const sessionStamp = '2026-11-07T00-00-00-000Z_aaaaaaaa-0000-4000-8000-000000000000.jsonl';
+  const sessionFor = (cwd: string): string => join(cwd, sessionStamp);
+  await withPipeEnv(async (env) => {
+    env.parkPollers();
+    const sessionFile = sessionFor(env.cwd);
+    const first = await runSubagent(env.pi, { description: 'reload probe one', prompt: PROMPT }, env.cwd);
+    const second = await runSubagent(env.pi, { description: 'reload probe two', prompt: PROMPT }, env.cwd);
+    await waitFor(() => env.frames.length === 2);
+    const ids = [first.details?.taskId, second.details?.taskId] as string[];
+    const piBefore = env.pi;
+
+    // A master restart: the branch is empty, so whatever `list` shows comes from the view
+    // and the records alone.
+    await env.remount!('reload');
+    const text = (await runSubagent(env.pi, { action: 'list' }, env.cwd)).content[0]!.text;
+    const refs = text.split('\n').map((line) => line.split(' ')[0]!);
+    assert.equal(refs.length, 2, `a reload lists both workers: ${text}`);
+    for (const ref of refs) assert.match(ref, /^[a-z0-9-]+@p[0-9]+$/);
+
+    // Both refs close: settle first (a turn in flight is refused), then reclaim.
+    for (const ref of refs) {
+      const paneId = ref.split('@')[1]!;
+      env.port.current!.consumeReply(paneId, 'REPORT: done');
+      const closed = await runSubagent(env.pi, { action: 'close', agentId: ref }, env.cwd);
+      assert.match(closed.content[0]!.text, /closed — pane and tab gone/);
+    }
+
+    // The view references both ids, and each record file holds its row.
+    assert.deepEqual(readTaskView(sessionFile), ids);
+    for (const [i, taskId] of ids.entries()) {
+      const row = readTaskRecord(env.cwd, taskId);
+      assert.equal(row?.taskId, taskId);
+      assert.equal(row?.description, i === 0 ? 'reload probe one' : 'reload probe two');
+      assert.equal(row?.gen.paneId, refs[i]!.split('@')[1]);
+      assert.ok(row?.closedAt !== null, 'close wrote the decision into the record');
+    }
+
+    // No session entry was appended: the branch is not a document in this model.
+    for (const [n, pi] of [piBefore, env.pi].entries()) {
+      assert.ok(!pi.entries.some(([type]) => type === 'piher.subs'), `mount #${n + 1} appended no piher.subs entry`);
+    }
+  }, { paneSeq: true, sessionFile: sessionFor });
 });

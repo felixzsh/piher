@@ -14,7 +14,8 @@ import {
   resolveSessionFileValue,
   type SubSessionState,
 } from './session-tail.ts';
-import { idParam, reportFingerprint, type AliveProbe, type SubEntry } from './subagent-core.ts';
+import { idParam, reportFingerprint, type AliveProbe } from './subagent-core.ts';
+import type { TaskEntry, TaskStatus } from './task-row.ts';
 import { toolError } from './tool-error.ts';
 import { trace, traceRole } from './trace.ts';
 
@@ -149,7 +150,7 @@ export function computeSubagentOutputDelta(
   return carry(currText, true);
 }
 
-type StatusInput = { localStatus: SubEntry['status']; status?: CoreStatus | null };
+type StatusInput = { localStatus: TaskStatus; status?: CoreStatus | null };
 
 /** First matching rule wins; a worker with no other signal is running. An `error` terminal ended
  *  its turn like `done`, so the transcript decides what came out. */
@@ -439,60 +440,58 @@ async function readBlockedQuestion(client: CoreClientLike, paneId: string): Prom
 
 export async function executeSubagentOutput(
   params: Record<string, unknown> | undefined,
-  toolCtx: unknown,
+  _toolCtx: unknown,
   deps: {
     client: CoreClientLike;
-    resolveEntry: (rawId: string, cwd: string) => { entry: SubEntry } | { error: string };
+    resolveEntry: (rawId: string) => { entry: TaskEntry } | { error: string };
     outputCursors: Map<string, SubagentOutputCursor>;
-    getCwd: (toolCtx: unknown) => string;
     /** Monotonic per-pane read counter shown in the header. */
     nextRevision: (paneId: string) => number;
     /** Last finalized assistant text from the worker's transcript: the pane read alone cannot
      * recover it when the fullscreen TUI shows only the status overlay. Optional for tests. */
     readFinalReport?: (paneId: string, entryCwd: string) => Promise<string | null>;
-    /** Persists `entry.reportDelivered` so the settlement notice can skip a report already shown. */
-    persistSubs?: () => void;
+    /** Persists the generation's `reportDelivered` so the settlement notice can skip a report already shown. */
+    writeRecord?: (entry: TaskEntry) => void;
   },
 ) {
   const rawId = idParam(params, 'agentId', 'taskId');
   if (!rawId) return toolError('Error: missing agentId for output. Pass it as a top-level argument {"action":"output","agentId":"<pane id>"}, not nested under parameters.');
 
-  const cwd = deps.getCwd(toolCtx);
-  const resolved = deps.resolveEntry(rawId, cwd);
+  const resolved = deps.resolveEntry(rawId);
   if ('error' in resolved) return toolError(resolved.error);
 
   const entry = resolved.entry;
   let terminalStatus: CoreStatus | null = null;
   try {
-    terminalStatus = (await deps.client.getTerminal(entry.paneId))?.status ?? null;
+    terminalStatus = (await deps.client.getTerminal(entry.gen.paneId))?.status ?? null;
   } catch {
   }
 
   const status = resolveSubagentStatus({ localStatus: entry.status, status: terminalStatus });
-  const askQuestion = terminalStatus === 'blocked' ? await readBlockedQuestion(deps.client, entry.paneId) : null;
+  const askQuestion = terminalStatus === 'blocked' ? await readBlockedQuestion(deps.client, entry.gen.paneId) : null;
 
   let rawRead: SubagentOutputRead;
   try {
-    const read = await deps.client.read(entry.paneId);
+    const read = await deps.client.read(entry.gen.paneId);
     rawRead = { text: read.text, complete: read.complete };
   } catch (err) {
-    return toolError(`Error: failed to read output for subagent ${entry.paneId}: ${(err as Error).message}`);
+    return toolError(`Error: failed to read output for subagent ${entry.gen.paneId}: ${(err as Error).message}`);
   }
 
-  const prevCursor = deps.outputCursors.get(entry.paneId);
+  const prevCursor = deps.outputCursors.get(entry.gen.paneId);
   const maxChars = typeof params?.max_chars === 'number'
     ? params.max_chars
     : typeof params?.maxChars === 'number' ? params.maxChars : undefined;
   const deltaResult = computeSubagentOutputDelta(prevCursor, cleanPaneChrome(rawRead.text), { maxChars });
   // A resumed process has no cursor; the durable delivery record keeps the report from repeating.
-  deltaResult.nextCursor.reportTail ??= prevCursor?.reportTail ?? entry.reportDelivered?.fingerprint;
+  deltaResult.nextCursor.reportTail ??= prevCursor?.reportTail ?? entry.gen.reportDelivered?.fingerprint;
 
   // Transcript fallback: the terminal delta can be empty (or footer-only) while the finished
   // report exists only in the session file. Surface it once per distinct report.
   let reportSection: string | null = null;
   if ((status === 'settled' || status === 'idle') && deps.readFinalReport) {
     try {
-      const report = await deps.readFinalReport(entry.paneId, entry.cwd);
+      const report = await deps.readFinalReport(entry.gen.paneId, entry.cwd);
       const fingerprint = report ? reportFingerprint(report) : '';
       if (report && fingerprint && fingerprint !== deltaResult.nextCursor.reportTail) {
         const bounded = boundText(report, Math.max(1, Math.min(maxChars ?? OUTPUT_DEFAULT_MAX_CHARS, OUTPUT_HARD_CAP_CHARS)));
@@ -500,14 +499,14 @@ export async function executeSubagentOutput(
         deltaResult.nextCursor.reportTail = fingerprint;
         deltaResult.delta = cutPaneReportCopy(deltaResult.delta, report) ?? deltaResult.delta;
         if (!bounded.truncated) {
-          entry.reportDelivered = { fingerprint, at: Date.now() };
-          deps.persistSubs?.();
+          entry.gen.reportDelivered = { fingerprint, at: Date.now() };
+          deps.writeRecord?.(entry);
         }
       }
     } catch {
     }
   }
-  const revision = deps.nextRevision(entry.paneId);
+  const revision = deps.nextRevision(entry.gen.paneId);
 
   // A finished worker answers with its report; a running one with the last lines it printed. The whole
   // pane buffer is boot chrome (banner, skills, extensions) around the same text, so dumping it by
@@ -516,13 +515,13 @@ export async function executeSubagentOutput(
   // A tail is a fresh view each time, so it must not spend the buffer before someone asks for it in
   // full. A full read and a delivered report still advance the cursor: that is what makes an
   // unchanged report stay delivered exactly once.
-  if (wantFull || reportSection) deps.outputCursors.set(entry.paneId, deltaResult.nextCursor);
+  if (wantFull || reportSection) deps.outputCursors.set(entry.gen.paneId, deltaResult.nextCursor);
   const shown = wantFull || reportSection
     ? deltaResult
     : { ...deltaResult, restart: false, delta: tailOfPaneRead(deltaResult.delta) };
 
   const formatted = formatSubagentOutput({
-    paneId: entry.paneId,
+    paneId: entry.gen.paneId,
     status,
     revision,
     bufferTruncated: !rawRead.complete,
@@ -536,7 +535,7 @@ export async function executeSubagentOutput(
   return {
     content: [{ type: 'text' as const, text: reportSection ? `${formatted}\n${reportSection}` : formatted }],
     details: {
-      paneId: entry.paneId,
+      paneId: entry.gen.paneId,
       status,
       revision,
       truncated: !rawRead.complete || deltaResult.truncated,

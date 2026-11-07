@@ -3,14 +3,14 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import extension from '../../src/index.ts';
 import { pipeNameFor, pipeRequestTo, startPipeServer, type PipeRequest } from '../../src/pipe-channel.ts';
 import { sessionDirName } from '../../src/storage-layout.ts';
 import { WIDGET_MAX_LINES } from '../../src/tree-view.ts';
-import { fakePi, fire, jsonl, subEntry, transcriptMessage, withCleanup, type CleanupContext, type FakePi } from '../test-utils.ts';
+import { fakePi, fire, jsonl, seedTaskDocuments, transcriptMessage, withCleanup, type CleanupContext, type FakePi } from '../test-utils.ts';
 import { readWorkerMarker, writeWorkerMarker } from '../../src/worker-marker.ts';
 
 type IndexMode = 'worker' | 'core-worker' | 'bare' | 'master';
@@ -486,21 +486,21 @@ test('master and delegation-less workers never grow a piher-delegation section',
 
 /* ── resident widget + /piher-tree: the delegation surface the master alone owns ── */
 
-test('widget + /piher-tree: both follow the subagent registry, and only the master renders either', withCleanup(async (cleanup) => {
+test('widget + /piher-tree: both follow the restored tasks, and only the master renders either', withCleanup(async (cleanup) => {
   const cwd = cleanup.tempDir('piher-tree-ws').path;
-  const branch = [
-    { type: 'custom', customType: 'piher.subs', data: { version: 2, subs: [
-      subEntry({ paneId: 'w2', slug: 'harden-pipe', description: 'harden pipe channel', kind: 'worker', createdAt: Date.now() - 120_000 }),
-      subEntry({ taskId: 'task-2', paneId: 'w3', slug: 'run-e2e', description: 'e2e', status: 'settled', consumedAt: Date.now() - 60_000 }),
-    ] } },
-  ];
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const sessionFile = join(cleanup.tempDir('piher-tree-sess').path, '2026-01-01T00-00-00-000Z_dddddddd-0000-4000-8000-000000000000.jsonl');
+  seedTaskDocuments(sessionFile, [
+    { taskId: 'task-1', paneId: 'w2', slug: 'harden-pipe', description: 'harden pipe channel', kind: 'worker', cwd, createdAt: Date.now() - 120_000 },
+    { taskId: 'task-2', paneId: 'w3', slug: 'run-e2e', description: 'e2e', status: 'settled', consumedAt: Date.now() - 60_000, cwd },
+  ]);
   const widgets: Array<{ id: string; lines: string[] | undefined }> = [];
   const master = await mountIndex(cleanup, 'master', { HC_TERMINAL_SOCKET: '/tmp/piher-test-sock-tree', HC_TERMINAL_ID: 't1' });
   try {
     const ctx = {
       cwd,
       ui: { setWidget: (id: string, lines: string[] | undefined) => { widgets.push({ id, lines }); } },
-      sessionManager: { getBranch: () => branch },
+      sessionManager: { getBranch: () => [], getSessionFile: () => sessionFile },
     };
     await fire(master, 'session_start', { reason: 'new' }, ctx);
     // A fresh session starts with an empty registry and pi restores widget state on resume (calling
@@ -509,7 +509,7 @@ test('widget + /piher-tree: both follow the subagent registry, and only the mast
     assert.equal(widgets.at(-1)?.id, 'piher-agents', 'the widget keeps its pi key (a rename would orphan the old one)');
     assert.equal(widgets.at(-1)?.lines, undefined, 'a fresh session carries no agent widget');
 
-    // The registry is folded at session_start; the widget is a view of it, so the first turn
+    // The tasks are restored at session_start; the widget is a view of them, so the first turn
     // boundary is where the running children appear. One line per RUNNING worker: a settled row is
     // history, and history belongs to the tree.
     await fire(master, 'turn_end', { message: { role: 'assistant', stopReason: 'stop' } }, ctx);
@@ -579,21 +579,21 @@ test('widget: a bare or worker pane never sets one (no delegation surface to sho
 
 test('widget cap + overlay scroll: more workers than the budget still renders one honest widget', withCleanup(async (cleanup) => {
   const cwd = cleanup.tempDir('piher-cap-ws').path;
-  const branch = [
-    { type: 'custom', customType: 'piher.subs', data: { version: 2, subs:
-      Array.from({ length: WIDGET_MAX_LINES + 2 }, (_, i) => subEntry({ paneId: `w${i}`, slug: `task-${i}`, description: `task ${i}` })),
-    } },
-  ];
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const sessionFile = join(cleanup.tempDir('piher-cap-sess').path, '2026-01-01T00-00-00-000Z_eeeeeeee-0000-4000-8000-000000000000.jsonl');
+  seedTaskDocuments(sessionFile, Array.from({ length: WIDGET_MAX_LINES + 2 }, (_, i) => ({
+    taskId: `cap-task-${i}`, paneId: `w${i}`, slug: `task-${i}`, description: `task ${i}`, cwd,
+  })));
   const widgets: Array<{ id: string; lines: string[] | undefined }> = [];
   const master = await mountIndex(cleanup, 'master', { HC_TERMINAL_SOCKET: '/tmp/piher-test-sock-cap', HC_TERMINAL_ID: 't1' });
   try {
     const ctx = {
       cwd,
       ui: { setWidget: (id: string, lines: string[] | undefined) => { widgets.push({ id, lines }); } },
-      sessionManager: { getBranch: () => branch },
+      sessionManager: { getBranch: () => [], getSessionFile: () => sessionFile },
     };
     await fire(master, 'session_start', { reason: 'new' }, ctx);
-    // The registry is folded at session_start; the widget paints at the first turn boundary.
+    // The tasks are restored at session_start; the widget paints at the first turn boundary.
     await fire(master, 'turn_end', { message: { role: 'assistant', stopReason: 'stop' } }, ctx);
     const lines = widgets.at(-1)?.lines ?? [];
     // pi slices a string-array widget to ten lines and appends its own `... (widget truncated)`,

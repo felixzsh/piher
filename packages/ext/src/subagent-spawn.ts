@@ -20,10 +20,8 @@ import { composeForRole } from './manifest-compose.ts';
 import type { Lifecycle } from './role-manifest.ts';
 import { runtimePolicy } from './runtime-policy.ts';
 import { toolError } from './tool-error.ts';
-import { appendLedger, type HistoryEntry } from './history-store.ts';
 import {
   Semaphore,
-  allocateSubSlug,
   buildLaunchLine,
   buildLaunchParts,
   classifyWorktreeZone,
@@ -32,56 +30,15 @@ import {
   planLaunchValidation,
   planTabPlacement,
   sleep,
-  subRef,
   withAdmission,
   withoutPlacement,
-  type SubEntry,
   type WorktreeZone,
 } from './subagent-core.ts';
+import { allocateTaskSlug, taskRef, type TaskEntry } from './task-row.ts';
 import type { Poller } from './subagent-poller.ts';
 import type { SessionIo } from './subagent-session.ts';
 
 const statAsync = promisify(statCb);
-
-/* ── the checkout's ledger row (S72) ────────────────────────────── */
-
-/** What a checkout row says about the task, before any pane exists. */
-interface CheckoutRowBase {
-  taskId: string;
-  kind: string;
-  path: string;
-  description: string;
-}
-
-/**
- * S72: the row names the checkout a spawn created, so `resume` and `close` can find it after a
- * restart. `paneId` is empty on purpose: no pane exists yet, and this row's job is the checkout.
- */
-function appendCheckoutRow(
-  ledgerCwd: string,
-  base: CheckoutRowBase,
-  record: WorktreeRecord,
-  opts: { status: 'running' | 'closed'; via: string },
-): void {
-  appendLedger(ledgerCwd, {
-    taskId: base.taskId,
-    kind: base.kind,
-    paneId: '',
-    tabId: '',
-    workspaceId: '',
-    cwd: base.path,
-    description: base.description,
-    sessionFile: null,
-    launchCommand: [],
-    status: opts.status,
-    createdAt: Date.now(),
-    consumedAt: null,
-    closedAt: opts.status === 'closed' ? Date.now() : null,
-    revivedFrom: null,
-    worktree: record,
-    via: opts.via,
-  });
-}
 
 /* ── git adapter ────────────────────────────────────────────────── */
 
@@ -476,9 +433,12 @@ interface SpawnActionHost {
   client: CoreClientLike;
   env: CoreEnv | null;
   subSemaphore: Semaphore;
-  subs: Map<string, SubEntry>;
-  persistSubs(): void;
-  writeHistory(entry: SubEntry, patch?: Partial<HistoryEntry>, via?: string): void;
+  tasks: Map<string, TaskEntry>;
+  panes: Map<string, string>;
+  writeRecord(entry: TaskEntry): void;
+  appendView(taskId: string): void;
+  /** A spawn that never started leaves no record and no view id behind. */
+  dropTask?(taskId: string): void;
   lastRequestIdByPane: Map<string, number | string>;
   /** Pane id → its in-flight boot (pipe readiness, session resolution, prompt injection). */
   boots: Map<string, Promise<void>>;
@@ -497,7 +457,7 @@ interface SpawnActionHost {
 }
 
 export function createSpawnAction(h: SpawnActionHost) {
-  const { client, env, git, subs } = h;
+  const { client, env, git, tasks, panes } = h;
   const { resolveSessionFile } = h.session;
   const { spawnPaneInTaskTab, launchParts, waitSubReady } = h.spawn;
   const { startPoller } = h.poller;
@@ -554,18 +514,14 @@ export function createSpawnAction(h: SpawnActionHost) {
     let cwd = masterCwd;
     let worktreeRecord: WorktreeRecord | null = null;
     let worktreeOutcome: 'created' | 'reused' | null = null;
-    /** S72: what the checkout's ledger rows are written about, once there is a checkout. */
-    let checkoutBase: CheckoutRowBase | null = null;
     /** Only what this call created may be undone by this call (S71). */
     let createdCheckout = false;
     /** A spawn that fails after the checkout was made leaves nothing behind for the human. */
     const discardCheckout = (): void => {
       const record = worktreeRecord;
-      const base = checkoutBase;
-      if (!createdCheckout || !record || !base) return;
+      if (!createdCheckout || !record) return;
       void (async (): Promise<void> => {
         await releaseCheckout(h.checkout, record, h.checkoutSpace).catch(() => null);
-        appendCheckoutRow(masterCwd, base, record, { status: 'closed', via: 'spawn-failed' });
       })();
     };
     if (worktreeParam) {
@@ -580,11 +536,9 @@ export function createSpawnAction(h: SpawnActionHost) {
       createdCheckout = ensured.kind === 'created';
       worktreeOutcome = ensured.kind;
       cwd = planned.plan.path;
-      checkoutBase = { taskId, kind, path: planned.plan.path, description: spec.description };
       worktreeRecord = { path: planned.plan.path, branch: planned.plan.branch };
-      // S72: the ledger row names the checkout, so `resume` and `close` find it after a restart. The
-      // app opens it by listing worktrees, so there is nothing else to record.
-      appendCheckoutRow(masterCwd, checkoutBase, worktreeRecord, { status: 'running', via: 'spawn-worktree' });
+      // S72: the task record names the checkout, so `resume` and `close` find it after a restart.
+      // The app opens it by listing worktrees, so there is nothing else to record.
     } else if (cwdParam) {
       cwd = pathResolve(masterCwd, cwdParam);
       try {
@@ -624,32 +578,40 @@ export function createSpawnAction(h: SpawnActionHost) {
         argv,
       ));
       paneId = spawned.paneId;
-      // Phase 2: allocate once per spawn; revives/history keep the row's slug (stability beats beauty).
-      const slug = allocateSubSlug(
+      // Allocate once per spawn; revives keep the row's slug (stability beats beauty).
+      const slug = allocateTaskSlug(
         spec.description,
         taskId,
-        new Set([...subs.values()].map((s) => s.slug ?? '').filter(Boolean)),
+        new Set([...tasks.values()].map((s) => s.gen.slug ?? '').filter(Boolean)),
       );
-      const entry: SubEntry = {
+      const entry: TaskEntry = {
         taskId,
         kind,
-        paneId,
-        slug,
-        tabId: spawned.tabId,
-        tabName: spawned.tabName,
+        lifecycle: roleLifecycle,
         cwd,
         description: spec.description,
-        status: 'running',
-        sessionFile: null,
-        launchCommand: [buildLaunchLine(argv)],
-        createdAt: Date.now(),
-        revivedFrom: null,
-        ...(roleLifecycle === 'one-shot' ? { lifecycle: roleLifecycle } : {}),
         ...(worktreeRecord ? { worktree: worktreeRecord } : {}),
+        createdAt: Date.now(),
+        closedAt: null,
+        gen: {
+          paneId,
+          slug,
+          tabId: spawned.tabId,
+          tabName: spawned.tabName,
+          sessionFile: null,
+          launchCommand: [buildLaunchLine(argv)],
+          startedAt: Date.now(),
+          consumedAt: null,
+          reportDelivered: null,
+        },
+        status: 'running',
       };
       // A spawn's acknowledgement is the whole answer: what follows happens off the caller's turn.
-      subs.set(paneId, entry);
-      h.persistSubs();
+      // Spawn writes the record and the view, then answers (domain: spawn reads nothing).
+      tasks.set(taskId, entry);
+      panes.set(paneId, taskId);
+      h.writeRecord(entry);
+      h.appendView(taskId);
       // Keep the brief: an upstream failure is nobody's fault in the task, and `retry` re-sends this
       // text instead of making the master spend tokens writing it again.
       saveTaskPrompt(taskId, spec.prompt);
@@ -659,10 +621,10 @@ export function createSpawnAction(h: SpawnActionHost) {
         if (!ready.ok) throw new Error(ready.message);
         // The `piher.session` label lags right after spawn, so the mtime fallback would otherwise adopt
         // the newest PRE-EXISTING session in cwd; only a file written after the terminal existed counts.
-        entry.sessionFile = await resolveSessionFile(paneId, cwd, undefined, { minMtimeMs: spawnedAt - 2_000 });
-        h.persistSubs();
+        entry.gen.sessionFile = await resolveSessionFile(paneId, cwd, undefined, { minMtimeMs: spawnedAt - 2_000 });
+        h.writeRecord(entry);
         // M11: inject through the extension pipe, reserving the PTY keyboard channel for the human;
-        // injection and injectTs must stay together or the spawn leaves a ghost running ledger entry.
+        // injection and injectTs must stay together or the spawn leaves a ghost running row.
         const injectTs = Date.now();
         const injected = await pipeRequestTo(cwd, paneId, {
           type: 'prompt',
@@ -677,14 +639,15 @@ export function createSpawnAction(h: SpawnActionHost) {
         }
         h.lastRequestIdByPane.set(paneId, injectId);
         void startPoller(paneId, cwd, injectTs, spec.description, injectId);
-        h.writeHistory(entry, undefined, 'spawn');
+        h.writeRecord(entry);
       })();
       h.boots.set(paneId, boot);
       void boot.catch(async (err: unknown) => {
         // A worker that never came up leaves nothing behind, and a failed start must not look like a
-        // task that is quietly still running: retire the pane, drop the row, say so.
-        subs.delete(paneId);
-        h.persistSubs();
+        // task that is quietly still running: retire the pane, drop the row and its record, say so.
+        h.dropTask?.(taskId);
+        tasks.delete(taskId);
+        panes.delete(paneId);
         discardCheckout();
         try { await client.kill(paneId); } catch { /* already gone */ }
         try { await client.remove(paneId); } catch { /* core reaps finished terminals */ }
@@ -699,7 +662,7 @@ export function createSpawnAction(h: SpawnActionHost) {
       return {
         content: [{
           type: 'text',
-          text: `started subagent ${subRef(entry)} (task ${taskId}, ${roleLifecycle === 'one-shot' ? 'one-shot — reports once and exits' : 'persistent — stays until you close it'})${worktreeRecord && worktreeOutcome ? ` ${checkoutAckLine(worktreeRecord, worktreeOutcome)}` : ''}. Your prompt is already its first message — do not resend it. Its result arrives as a settlement notice at your next turn boundary — do not sleep or poll for it.`,
+          text: `started subagent ${taskRef(entry.gen)} (task ${taskId}, ${roleLifecycle === 'one-shot' ? 'one-shot — reports once and exits' : 'persistent — stays until you close it'})${worktreeRecord && worktreeOutcome ? ` ${checkoutAckLine(worktreeRecord, worktreeOutcome)}` : ''}. Your prompt is already its first message — do not resend it. Its result arrives as a settlement notice at your next turn boundary — do not sleep or poll for it.`,
         }],
         details: {
           paneId,
@@ -710,10 +673,11 @@ export function createSpawnAction(h: SpawnActionHost) {
         },
       };
     } catch (err) {
-      // A mid-spawn failure must remove the ledger entry and retire its terminal, or a ghost entry never settles.
+      // A mid-spawn failure must remove the task and retire its terminal, or a ghost entry never settles.
       if (paneId) {
-        subs.delete(paneId);
-        h.persistSubs();
+        h.dropTask?.(taskId);
+        tasks.delete(taskId);
+        panes.delete(paneId);
         discardCheckout();
         void (async () => {
           try { await client.kill(paneId); } catch { /* already gone */ }

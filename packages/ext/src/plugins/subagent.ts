@@ -22,26 +22,30 @@ import {
   flattenToolParams,
   isAlive,
   newestPerTaskId,
-  rekeySub,
   resolveTaskIdPrefix,
   taskIdResolutionError,
   tabNameForTask,
-  subRef,
   withAdmission,
   type AliveProbe,
-  type SubEntry,
   type SubagentPort,
   type SubagentPortBox,
 } from '../subagent-core.ts';
 import {
-  appendLedger,
   applyReportedSessionFile,
-  inheritOutcome,
-  latestGeneration,
-  ledgerFile,
-  readLedger,
-  type HistoryEntry,
-} from '../history-store.ts';
+  isClosed,
+  taskForPane,
+  taskRef,
+  type TaskEntry,
+  type TaskRow,
+} from '../task-row.ts';
+import {
+  deleteTaskRecord,
+  listTaskRecords,
+  readTaskRecord,
+  repoTasksDir,
+  writeTaskRecord,
+  writeTaskView,
+} from '../task-store.ts';
 import { platformPaths } from '../platform-paths.ts';
 import { listRoleNames, loadRoleConfig } from '../role-loader.ts';
 import type { RuntimePolicy } from '../runtime-policy.ts';
@@ -66,9 +70,7 @@ import {
   type CheckoutSpace,
 } from '../worktree.ts';
 import { createPoller } from '../subagent-poller.ts';
-import { createGcController, createSubagentRegistry, retirePane } from '../subagent-gc.ts';
-import { sessionStatePath } from '../session-state.ts';
-import { REGISTRY_FILE_NAME } from '../subagent-registry-file.ts';
+import { createGcController, restoreTasks, retirePane, seedForkView, sweepZombieTasks } from '../subagent-gc.ts';
 import { trace, traceRole } from '../trace.ts';
 import { createSessionIo, executeSubagentOutput, type SubagentOutputCursor } from '../subagent-session.ts';
 import type { WorkerWidgetRow } from '../tree-view.ts';
@@ -86,6 +88,10 @@ export interface SubagentDeps {
   getSessionId: () => string;
   /** This session's transcript path, for piher's per-session state root; null when it has none. */
   getSessionFile?: () => string | null;
+  /** Repository the restore reads task records from; the session's own checkout (default: cwd). */
+  getCwd?: () => string;
+  /** Test seam: tasks the session starts out holding, as a restore would have seeded them. */
+  initialTasks?: TaskEntry[];
   claimSettleNotice: (key: string) => boolean;
   /** Settlement notice injector from index: buffer while busy, flush at turn_end. */
   deliverNotice?: (content: string, paneId?: string, card?: SettlementCard | null) => Promise<void>;
@@ -181,8 +187,14 @@ export default function subagentPlugin(ctx: Context): void {
 
   const runtime = { nodePath: process.execPath, cliPath: entryScript(process.argv[1], existsSync), extPath: d.extPath };
   const subSemaphore = new Semaphore(SUBAGENT_CONCURRENCY);
-  /* Registry persisted as custom branch state so a parent restart can rebuild it. */
-  const subs = new Map<string, SubEntry>();
+  /* Tasks this session owns, keyed by taskId: a task outlives its pane (S1). */
+  const tasks = new Map<string, TaskEntry>();
+  /* Pane→task index: the pane id is part of the generation, so calls arriving by pane id
+   * resolve through the task. A revive re-keys it; the task map is never re-keyed. */
+  const panes = new Map<string, string>();
+  /* In-memory session view: the task ids this session delegated, in order (S4). Spawn appends;
+   * without a transcript path it stays in memory only (S25). */
+  const viewIds: string[] = [];
   const outputCursors = new Map<string, SubagentOutputCursor>();
   /** Read counters shown in `subagent output` headers (one monotonic number per worker). */
   const outputRevisions = new Map<string, number>();
@@ -192,48 +204,44 @@ export default function subagentPlugin(ctx: Context): void {
   /** Deduplicates gate notices while blocked but permits a later, distinct human question. */
   const blockedGateNotified = new Set<string>();
 
-  /** B5: latest non-empty outcome per task, so closed generations do not hide settled results. */
-  const lastOutcomeByTask = new Map<string, string>();
-
-  function toHistory(e: SubEntry, outcome: string | null): HistoryEntry {
-    return {
-      taskId: e.taskId,
-      kind: e.kind,
-      paneId: e.paneId,
-      ...(e.slug ? { slug: e.slug } : {}),
-      tabId: e.tabId,
-      tabName: e.tabName,
-      // The ledger keeps the column for older readers; herdr-core has no workspace identity.
-      workspaceId: '',
-      cwd: e.cwd,
-      description: e.description,
-      sessionFile: e.sessionFile,
-      launchCommand: e.launchCommand,
-      status: e.status,
-      ...(e.lifecycle ? { lifecycle: e.lifecycle } : {}),
-      outcome,
-      createdAt: e.createdAt,
-      consumedAt: e.consumedAt ?? null,
-      closedAt: null,
-      revivedFrom: e.revivedFrom ?? null,
-      ...(e.worktree ? { worktree: e.worktree } : {}),
-    };
+  /** Write one task record: the task, its current generation and its decision. */
+  function writeRecord(entry: TaskEntry): void {
+    writeTaskRecord(entry.cwd, entry);
   }
 
-  function writeHistory(e: SubEntry, patch?: Partial<HistoryEntry>, via?: string, ledgerCwd?: string): void {
-    const outcome = inheritOutcome(lastOutcomeByTask.get(e.taskId), patch?.outcome);
-    if (typeof outcome === 'string' && outcome.length > 0) lastOutcomeByTask.set(e.taskId, outcome);
-    appendLedger(ledgerCwd ?? e.cwd, { ...toHistory(e, outcome), ...(patch ?? {}), ...(via ? { via } : {}) });
+  /** A spawn appends its id to the view; every other operation touches one record. */
+  function appendView(taskId: string): void {
+    if (!viewIds.includes(taskId)) viewIds.push(taskId);
+    writeTaskView(d.getSessionFile?.() ?? null, viewIds);
   }
 
-  const registry = createSubagentRegistry({
-    pi,
+  /** A spawn that never started leaves no record and no view id behind. */
+  function dropTask(taskId: string): void {
+    const entry = tasks.get(taskId);
+    if (entry) deleteTaskRecord(entry.cwd, taskId);
+    const at = viewIds.indexOf(taskId);
+    if (at >= 0) {
+      viewIds.splice(at, 1);
+      writeTaskView(d.getSessionFile?.() ?? null, viewIds);
+    }
+  }
+
+  const board = {
     client,
-    subs,
-    writeHistory,
-    registryFile: () => sessionStatePath(d.getSessionFile?.() ?? null, REGISTRY_FILE_NAME),
-  });
-  const { persist: persistSubs } = registry;
+    tasks,
+    panes,
+    writeRecord,
+    restoreCwd: () => d.getCwd?.() ?? process.cwd(),
+    sessionFile: () => d.getSessionFile?.() ?? null,
+    viewIds,
+  };
+
+  // Test seam: the session starts out holding these tasks, the way a restore would have seeded them.
+  for (const seed of d.initialTasks ?? []) {
+    tasks.set(seed.taskId, seed);
+    if (seed.gen.paneId) panes.set(seed.gen.paneId, seed.taskId);
+    if (!viewIds.includes(seed.taskId)) viewIds.push(seed.taskId);
+  }
   const git = createGitIo();
   const checkout = d.checkoutIo ?? createCheckoutIo();
   const checkoutSpace = d.checkoutSpace ?? createCheckoutSpace();
@@ -241,8 +249,8 @@ export default function subagentPlugin(ctx: Context): void {
   /** True while another row of this session still works in the checkout at `path`. The app space is
    *  the checkout's, not the worker's: a reviewer and the worker it reads share one, and closing it
    *  under the survivor takes its tab away while the worker keeps running in it. */
-  function checkoutInUseByAnother(entry: SubEntry, path: string): boolean {
-    for (const other of subs.values()) {
+  function checkoutInUseByAnother(entry: TaskEntry, path: string): boolean {
+    for (const other of tasks.values()) {
       if (other === entry || other.status === 'closed') continue;
       if (other.worktree?.path === path) return true;
     }
@@ -250,43 +258,41 @@ export default function subagentPlugin(ctx: Context): void {
   }
 
   /** S54/S71: a role-declared one-shot reclaims its pane and the checkout its spawn created. */
-  function reclaim(entry: SubEntry): void {
+  function reclaim(entry: TaskEntry): void {
     void (async () => {
       if (entry.worktree) {
         // A one-shot closes its window, never its checkout: the master decides whether to merge, and
         // the working tree is what it reviews. Removing it here would leave only the branch behind.
         const record = entry.worktree;
-        const ledgerCwd = mainWorktreeRoot(entry.cwd) ?? entry.cwd;
         // A checkout can host more than one worker (a reviewer reading its worker's tree), so the
         // space goes only with the last row that works in it — never under a live sibling.
         if (!checkoutInUseByAnother(entry, record.path)) {
           await closeCheckoutSpace(checkoutSpace, record).catch(() => null);
         }
-        writeHistory(entry, { worktree: record }, 'one-shot-reclaim', ledgerCwd);
+        writeRecord(entry);
       }
-      await retirePane(client, entry.paneId);
+      await retirePane(client, entry.gen.paneId);
     })();
   }
 
   const boundPort: SubagentPort = {
     applyReplySession(paneId, sessionFile) {
-      const entry = subs.get(paneId);
+      const entry = taskForPane(tasks, panes, paneId);
       if (!entry) return;
       // Workers self-report a BARE session id over the pipe; the .jsonl-only guard in applyReportedSessionFile
       // would discard it and freeze a mis-attributed sessionFile forever, so map the id to its transcript path.
       const reported = resolveSessionFileValue(entry.cwd, defaultAgentSessionsDir(), sessionFile);
-      const next = applyReportedSessionFile(entry.sessionFile, reported);
-      if (next === entry.sessionFile) return;
-      entry.sessionFile = next;
-      persistSubs();
-      writeHistory(entry, undefined, 'session-report');
+      const next = applyReportedSessionFile(entry.gen.sessionFile, reported);
+      if (next === entry.gen.sessionFile) return;
+      entry.gen.sessionFile = next;
+      writeRecord(entry);
     },
     listRunningSubs() {
-      return [...subs.values()]
+      return [...tasks.values()]
         .filter((s) => s.status === 'running')
         .map((s): WorkerWidgetRow => ({
-          paneId: s.paneId,
-          slug: s.slug,
+          paneId: s.gen.paneId,
+          slug: s.gen.slug,
           role: s.kind,
           state: s.status,
           startedAt: s.createdAt,
@@ -294,32 +300,31 @@ export default function subagentPlugin(ctx: Context): void {
         }));
     },
     listRows() {
-      return [...subs.values()]
+      return [...tasks.values()]
         .filter((s) => s.status !== 'closed')
         .map((s) => ({
-          paneId: s.paneId,
-          slug: s.slug,
+          paneId: s.gen.paneId,
+          slug: s.gen.slug,
           description: s.description,
           kind: s.kind,
           status: s.status,
-          settledAt: s.consumedAt ?? null,
+          settledAt: s.gen.consumedAt ?? null,
         }));
     },
     settlementCard(paneId, outcome) {
-      const entry = subs.get(paneId);
+      const entry = taskForPane(tasks, panes, paneId);
       return settlementCard({
         name: entry ? `${paneId} (${entry.description})` : paneId,
         ...(entry ? { kind: entry.kind, startedAt: entry.createdAt } : {}),
         outcome,
       });
     },
-    consumeReply(paneId, outcome) {
-      const entry = subs.get(paneId);
+    consumeReply(paneId, _outcome) {
+      const entry = taskForPane(tasks, panes, paneId);
       if (!entry || entry.status === 'consumed' || entry.status === 'closed') return;
       entry.status = 'consumed';
-      entry.consumedAt = Date.now();
-      persistSubs();
-      writeHistory(entry, { outcome: outcome ?? null, status: 'consumed' }, 'pipe-reply');
+      entry.gen.consumedAt = Date.now();
+      writeRecord(entry);
       // S54: a one-shot worker exits right after this push; its pane goes now, not at the GC TTL.
       if (entry.lifecycle === 'one-shot') reclaim(entry);
     },
@@ -340,9 +345,9 @@ export default function subagentPlugin(ctx: Context): void {
   const poller = createPoller({
     client,
     sessionRoot,
-    subs,
-    persistSubs,
-    writeHistory,
+    tasks,
+    panes,
+    writeRecord,
     blockedGateNotified,
     session,
     injectNotice,
@@ -354,9 +359,9 @@ export default function subagentPlugin(ctx: Context): void {
   const gc = createGcController({
     client,
     env,
-    subs,
-    persistSubs,
-    writeHistory,
+    tasks,
+    panes,
+    writeRecord,
     terminalState,
     noticePending: d.noticePending,
     checkoutSpace,
@@ -371,7 +376,7 @@ export default function subagentPlugin(ctx: Context): void {
    * and ledger rows stay 'running'. The `recover-*` requestId is never echoed by a worker, so this claim wins. */
   async function recoverRunningPollers(via: string): Promise<void> {
     if (!client.available) return;
-    const running = [...subs.values()].filter((s) => s.status === 'running' && !pollers.has(s.paneId));
+    const running = [...tasks.values()].filter((s) => s.status === 'running' && !pollers.has(s.gen.paneId));
     if (running.length === 0) return;
     let liveTerminalIds: ReadonlySet<string>;
     try {
@@ -381,10 +386,10 @@ export default function subagentPlugin(ctx: Context): void {
     }
     const recovered: string[] = [];
     for (const entry of running) {
-      if (!liveTerminalIds.has(entry.paneId)) continue; // zombie sweep already closed those
+      if (!liveTerminalIds.has(entry.gen.paneId)) continue; // zombie sweep already settled those
       try {
-        await startPoller(entry.paneId, entry.cwd, entry.createdAt, entry.description, `recover-${via}-${entry.paneId}`);
-        recovered.push(`${entry.paneId} (${entry.description})`);
+        await startPoller(entry.gen.paneId, entry.cwd, entry.createdAt, entry.description, `recover-${via}-${entry.gen.paneId}`);
+        recovered.push(`${entry.gen.paneId} (${entry.description})`);
       } catch {
       }
     }
@@ -401,17 +406,21 @@ export default function subagentPlugin(ctx: Context): void {
   scoped.on('session_start', async (event: unknown, eventCtx: unknown) => {
     // The reason is core's own word for it (`startup`, `reload`, `new`, `resume`, `fork`): a fork is
     // the only one that lands on a session file with no state of its own, so it inherits the parent's
-    // registry document before the restore reads it.
+    // view document before the restore reads it.
     const reason = (event as { reason?: string } | undefined)?.reason;
     const previous = (event as { previousSessionFile?: string } | undefined)?.previousSessionFile;
-    if (reason === 'fork' || reason === 'resume') registry.seed(previous ?? null);
-    registry.rebuild(eventCtx, reason ?? 'session_start');
-    await registry.sweepZombieRunning();
+    if (reason === 'fork' || reason === 'resume') seedForkView(d.getSessionFile?.() ?? null, previous ?? null);
+    // Records live in the session's own repository: its checkout from the event context, else the
+    // configured override, else the process checkout.
+    const ctxCwd = (eventCtx as { cwd?: string } | undefined)?.cwd;
+    restoreTasks(board, reason ?? 'session_start', typeof ctxCwd === 'string' ? ctxCwd : undefined);
+    await sweepZombieTasks(board);
     await recoverRunningPollers('session_start');
   });
   scoped.on('session_tree', async (_event: unknown, eventCtx: unknown) => {
-    registry.rebuild(eventCtx, 'session_tree');
-    await registry.sweepZombieRunning();
+    const ctxCwd = (eventCtx as { cwd?: string } | undefined)?.cwd;
+    restoreTasks(board, 'session_tree', typeof ctxCwd === 'string' ? ctxCwd : undefined);
+    await sweepZombieTasks(board);
     await recoverRunningPollers('session_tree');
   });
 
@@ -422,24 +431,24 @@ export default function subagentPlugin(ctx: Context): void {
     if (event.toolName !== 'subagent' || !event.isError) return;
     // Extract only ids of rows we know; leave unrelated errors untouched.
     const errText = (event.content ?? []).map((c) => c.text ?? '').join(' ');
-    const paneId = [...subs.keys()].find((id) => errText.includes(id));
+    const paneId = [...panes.keys()].find((id) => errText.includes(id));
     if (!paneId) return;
-    const entry = subs.get(paneId);
+    const entry = taskForPane(tasks, panes, paneId);
     if (!entry || entry.status === 'settled' || entry.status === 'consumed') return;
     const probe = await probeAlive(paneId, entry.cwd);
     if (!isAlive(probe, Date.now())) return; // keep the original error only when the agent is truly dead
     // Move a live agent to the poller so its eventual result replaces the false error.
     if (!pollers.has(paneId)) {
       startPoller(paneId, entry.cwd, entry.createdAt, entry.description, lastRequestIdByPane.get(paneId) ?? `probe-${paneId}`);
-      persistSubs();
+      writeRecord(entry);
     }
     return {
       content: [{ type: 'text', text: buildAliveNotice({ paneId, description: entry.description, probe }, Date.now()) }],
     };
   });
 
-  async function reviveEntry(entry: SubEntry): Promise<SubEntry> {
-    const latest = latestGeneration(readLedger(entry.cwd), entry.taskId) ?? entry;
+  async function reviveEntry(entry: TaskEntry): Promise<TaskEntry> {
+    const latest: TaskRow = readTaskRecord(entry.cwd, entry.taskId) ?? entry;
     // S71: resume decides by existence, never by a flag — the same refusal whether `close`, a
     // one-shot settlement or a human removed the checkout.
     if (!existsSync(entry.cwd)) {
@@ -450,10 +459,10 @@ export default function subagentPlugin(ctx: Context): void {
       }));
     }
     // Never relaunch the master's own transcript in a worker pane (two pi processes competing on
-    // one jsonl): a mis-attributed ledger entry degrades to a fresh conversation instead.
-    const resumeFile = latest.sessionFile && /\.jsonl$/.test(latest.sessionFile)
-      && bareSessionId(latest.sessionFile) !== bareSessionId(d.getSessionId())
-      ? latest.sessionFile : null;
+    // one jsonl): a mis-attributed record degrades to a fresh conversation instead.
+    const resumeFile = latest.gen.sessionFile && /\.jsonl$/.test(latest.gen.sessionFile)
+      && bareSessionId(latest.gen.sessionFile) !== bareSessionId(d.getSessionId())
+      ? latest.gen.sessionFile : null;
     // D86 trust matches spawn; revive has no tool context, so use the process cwd.
     const approve = await approveFor(entry.cwd, process.cwd());
     const argv = launchParts(resumeFile, null, null, approve);
@@ -462,10 +471,10 @@ export default function subagentPlugin(ctx: Context): void {
     // waiting for its pipe cannot starve a spawn (S50). The wait below runs outside the slot.
     const spawned = await withAdmission(subSemaphore, () => spawnPaneInTaskTab(
       {
-        desiredTab: entry.tabName || latest.tabName || null,
+        desiredTab: entry.gen.tabName || latest.gen.tabName || null,
         description: entry.description,
         // A revive keeps the visibility the worker was given: only one that had a tab gets a pane.
-        visible: entry.tabId !== '',
+        visible: entry.gen.tabId !== '',
         // A revived worker goes back to the window its checkout owns. Without this a spawn carries
         // no `herdr.space` at all, and the app adopts the pane into whatever space is focused — the
         // worker reappears in a different workspace than the one its checkout lives in.
@@ -488,98 +497,53 @@ export default function subagentPlugin(ctx: Context): void {
     ));
     const ready = await waitSubReady(entry.cwd, spawned.paneId);
     if (!ready.ok) throw new Error(ready.message);
-    Object.assign(entry, {
+    const previousPaneId = entry.gen.paneId;
+    Object.assign(entry.gen, {
       paneId: spawned.paneId,
       tabId: spawned.tabId,
       tabName: spawned.tabName,
       sessionFile: resumeFile,
-      status: 'running' as const,
       consumedAt: null,
-      revivedFrom: latest.paneId,
       launchCommand: [buildLaunchLine(argv)],
-      createdAt: Date.now(),
+      startedAt: Date.now(),
     });
+    entry.status = 'running';
+    entry.createdAt = Date.now();
     // A revived row is reclaimed at settlement too when its role still declares one-shot (S54).
-    if (lifecycle === 'one-shot') entry.lifecycle = 'one-shot';
-    else delete entry.lifecycle;
-    writeHistory(entry, undefined, 'revive');
+    entry.lifecycle = lifecycle;
+    // A task outlives its pane: the pane index moves to the new generation, and the dead id must
+    // go, or a later zombie sweep closes the live row.
+    if (previousPaneId !== entry.gen.paneId) panes.delete(previousPaneId);
+    panes.set(entry.gen.paneId, entry.taskId);
+    writeRecord(entry);
     return entry;
   }
 
-  /** Rebuild a registry row from its latest ledger row; `over` carries the caller's own fields
-   *  (status, pane identity, timestamps) so the ledger projection cannot drift between callers. */
-  function entryFromHistory(h: HistoryEntry, over: Partial<SubEntry>): SubEntry {
-    return {
-      taskId: h.taskId,
-      kind: h.kind,
-      paneId: h.paneId,
-      ...(h.slug ? { slug: h.slug } : {}),
-      tabId: h.tabId,
-      tabName: h.tabName ?? '',
-      cwd: h.cwd,
-      description: h.description,
-      // The ledger's verdict, not "closed": a settled or consumed row is unfinished business that
-      // `send`/`resume` may revive, while `closed` means the master was done with it.
-      status: h.status === 'running' ? 'settled' : h.status,
-      ...(h.lifecycle ? { lifecycle: h.lifecycle } : {}),
-      sessionFile: h.sessionFile,
-      launchCommand: h.launchCommand,
-      createdAt: h.createdAt,
-      consumedAt: h.consumedAt ?? null,
-      revivedFrom: h.paneId,
-      ...(h.worktree ? { worktree: h.worktree } : {}),
-      ...over,
-    };
-  }
-
-  function resolveSubEntry(rawId: string, cwd?: string): { entry: SubEntry } | { error: string } {
+  /** Resolve every id `list` prints against the session's tasks: pane id, slug, `slug@paneId`,
+   *  and a taskId prefix (S17). The view and the records seed memory at restore, so every id the
+   *  session offered resolves here — no ledger fallback. */
+  function resolveSubEntry(rawId: string): { entry: TaskEntry } | { error: string } {
     if (!rawId) return { error: 'Error: unknown subagent id "" (see action list)' };
-    const direct = subs.get(rawId);
+    const direct = taskForPane(tasks, panes, rawId);
     if (direct) return { entry: direct };
-    // Phase 2 slug reference: exact match against live rows (paneId stays first for back-compat).
-    // `slug@paneId` accepts both parts; a revived row changed its paneId, so the slug part wins then.
+    // Slug reference: exact match against live rows (paneId stays first for back-compat).
+    // `slug@paneId` accepts both parts; a revived task changed its paneId, so the slug part wins then.
     const at = rawId.indexOf('@');
     const slugPart = at > 0 ? rawId.slice(0, at) : rawId;
     const panePart = at > 0 ? rawId.slice(at + 1) : null;
     const combined = panePart !== null
-      ? (subs.get(panePart) ?? [...subs.values()].find((s) => s.slug === slugPart && s.paneId === panePart) ?? null)
+      ? (taskForPane(tasks, panes, panePart)
+        ?? [...tasks.values()].find((s) => s.gen.slug === slugPart && s.gen.paneId === panePart) ?? null)
       : null;
     if (combined) return { entry: combined };
-    const bySlug = [...subs.values()].find((s) => s.slug === slugPart);
+    const bySlug = [...tasks.values()].find((s) => s.gen.slug === slugPart);
     if (bySlug) return { entry: bySlug };
 
-    const byTaskId = newestPerTaskId(subs.values());
+    const byTaskId = newestPerTaskId(tasks.values());
     const res = resolveTaskIdPrefix(rawId, byTaskId.keys());
     if (res.kind === 'resolved') return { entry: byTaskId.get(res.taskId)! };
     const resError = taskIdResolutionError(res, 'subagent id', rawId);
     if (resError) return { error: resError };
-
-    if (cwd) {
-      const hist = readLedger(cwd);
-      // A row can be missing from `subs` while the master still sees it: `list` merges the repository
-      // ledger, and a reload restores only the branch's bounded tail of settled rows (S73). The ref
-      // `list` printed must address the ledger too, or `close`/`send` answer "unknown subagent id"
-      // for a worker the same session just offered.
-      const rows = newestPerTaskId(hist.map((h) => entryFromHistory(h, {})));
-      const known = [...rows.values()];
-      const ledgerHit = known.find((e) => e.slug === slugPart)
-        ?? known.find((e) => e.paneId === (panePart ?? slugPart));
-      if (ledgerHit) {
-        subs.set(ledgerHit.paneId, ledgerHit);
-        return { entry: ledgerHit };
-      }
-      const histRes = resolveTaskIdPrefix(rawId, Array.from(new Set(hist.map((e) => e.taskId))));
-      if (histRes.kind === 'resolved') {
-        const latest = latestGeneration(hist, histRes.taskId);
-        if (latest) {
-          const entry = entryFromHistory(latest, {});
-          subs.set(entry.paneId, entry);
-          return { entry };
-        }
-      }
-      const histError = taskIdResolutionError(histRes, 'subagent id', rawId);
-      if (histError) return { error: histError };
-    }
     return { error: `Error: unknown subagent id "${rawId}" (see action list)` };
   }
 
@@ -587,7 +551,7 @@ export default function subagentPlugin(ctx: Context): void {
    * `close` is the master's final word on a worker and a one-shot spends itself when its result is
    * consumed: neither may be revived. Resume exists for work that was left unfinished.
    */
-  function spentText(entry: SubEntry): string | null {
+  function spentText(entry: TaskEntry): string | null {
     if (entry.status === 'closed') {
       return `Error: task ${entry.taskId} was closed by the master; close is final, so there is nothing to resume or send to. Start a new subagent for further work.`;
     }
@@ -597,9 +561,9 @@ export default function subagentPlugin(ctx: Context): void {
     return null;
   }
 
-  function targetOf(params: ToolParams, toolCtx: unknown): { entry: SubEntry; cwd: string } {
+  function targetOf(params: ToolParams, toolCtx: unknown): { entry: TaskEntry; cwd: string } {
     const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
-    const resolved = resolveSubEntry(idParam(params, 'agentId', 'taskId'), cwd);
+    const resolved = resolveSubEntry(idParam(params, 'agentId', 'taskId'));
     if ('error' in resolved) toolError(resolved.error);
     return { entry: resolved.entry, cwd };
   }
@@ -611,97 +575,109 @@ export default function subagentPlugin(ctx: Context): void {
    * state. They are different: a closed task is final, a vanished pane is unfinished work.
    */
   /** Returns whether a pane was actually made: only a fresh pane is still booting. */
-  async function ensureLive(entry: SubEntry): Promise<boolean> {
+  async function ensureLive(entry: TaskEntry): Promise<boolean> {
     if (entry.status === 'closed') return false; // final: `send` on it is refused by spentText
     let alive = false;
     try {
-      alive = (await probeAlive(entry.paneId, entry.cwd)).paneExists;
+      alive = (await probeAlive(entry.gen.paneId, entry.cwd)).paneExists;
     } catch {
       alive = true; // a probe that fails must not spawn a second pane over a live one
     }
     if (alive) return false;
-    const previousPaneId = entry.paneId;
     await reviveEntry(entry);
-    rekeySub(subs, previousPaneId, entry);
-    persistSubs();
     return true;
   }
 
   async function executeSubagentResume(params: ToolParams, toolCtx: unknown) {
     if (!client.available) return toolError(`subagent: ${CORE_REQUIRED}`);
     const rawTaskId = idParam(params, 'taskId', 'agentId');
-    // Refuse a spent task by its ledger verdict, before any pane is made for it.
+    // Refuse a spent task by its record verdict, before any pane is made for it.
     {
-      const known = resolveSubEntry(rawTaskId ?? '', (toolCtx as { cwd?: string })?.cwd);
+      const known = resolveSubEntry(rawTaskId ?? '');
       if ('entry' in known) {
         const spent = spentText(known.entry);
         if (spent !== null) return toolError(spent);
       }
     }
-    if (!rawTaskId) return toolError('missing taskId for resume (see action list or delegation ledger).');
-    const running = newestPerTaskId([...subs.values()].filter((s) => s.status === 'running'));
+    if (!rawTaskId) return toolError('missing taskId for resume (see action list).');
+    const running = newestPerTaskId([...tasks.values()].filter((s) => s.status === 'running'));
     const live = resolveTaskIdPrefix(rawTaskId, running.keys());
     const liveError = taskIdResolutionError(live, 'task id', rawTaskId);
     if (liveError) return toolError(liveError);
     if (live.kind === 'resolved') {
       const entry = running.get(live.taskId)!;
       return {
-        content: [{ type: 'text', text: `task ${entry.taskId} is already running as pane ${entry.paneId}. Use action send or output; resume is only for a collected task whose pane is gone.` }],
-        details: { paneId: entry.paneId, taskId: entry.taskId, alreadyRunning: true },
+        content: [{ type: 'text', text: `task ${entry.taskId} is already running as pane ${entry.gen.paneId}. Use action send or output; resume is only for a collected task whose pane is gone.` }],
+        details: { paneId: entry.gen.paneId, taskId: entry.taskId, alreadyRunning: true },
       };
     }
-    // S41: one ledger per repository, so resume resolves against the current one — never a sweep of
-    // other checkouts this master happened to spawn into.
+    // S41: one task directory per repository, so resume resolves against the current one — never a
+    // sweep of other checkouts this master happened to spawn into.
     const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
-    const ledger = ledgerFile(cwd);
-    if (ledger === null) {
+    const dir = repoTasksDir(cwd);
+    if (dir === null) {
       return toolError(
-        `resume needs a git repository: the delegation ledger lives inside the repository (<repo>/.piher/history/history.jsonl) and ${cwd} is not in one.`,
+        `resume needs a git repository: task records live inside the repository (<repo>/.piher/tasks) and ${cwd} is not in one.`,
       );
     }
-    const history = readLedger(cwd);
-    const resolution = resolveTaskIdPrefix(rawTaskId, history.map((e) => e.taskId));
+    const records = listTaskRecords(cwd);
+    const resolution = resolveTaskIdPrefix(rawTaskId, records.map((e) => e.taskId));
     if (resolution.kind !== 'resolved') {
       return toolError(taskIdResolutionError(resolution, 'task id', rawTaskId)
-        ?? `Error: no history for task "${rawTaskId}" in this repository's ledger (${ledger}).`);
+        ?? `Error: no history for task "${rawTaskId}" in this repository's tasks (${dir}).`);
     }
     const taskId = resolution.taskId;
-    const latest = latestGeneration(history, taskId);
-    if (!latest) return toolError(`Error: no history for task "${taskId}" in this repository's ledger (${ledger}).`);
+    const latest = readTaskRecord(cwd, taskId);
+    if (!latest) return toolError(`Error: no history for task "${taskId}" in this repository's tasks (${dir}).`);
+    // Resume needs an unresolved task: a closed one is final, a spent one-shot has no session left.
+    {
+      const verdict = spentText({
+        ...latest,
+        gen: { ...latest.gen },
+        status: latest.gen.consumedAt !== null ? 'consumed' : 'settled',
+      });
+      if (verdict !== null) return toolError(verdict);
+    }
 
     try {
       // D94: reuse an existing pane for the same session to avoid competing pi processes.
-      const existing = await findExistingPane(latest.sessionFile);
-      // A ledger sessionFile mis-attributed to the master's own transcript would match the MASTER terminal here,
+      const existing = await findExistingPane(latest.gen.sessionFile);
+      // A record sessionFile mis-attributed to the master's own transcript would match the MASTER terminal here,
       // registering the master as its own subagent (later consumed, then closed by GC mid-run) — never adopt self.
       if (existing?.paneId === env?.terminalId) {
         return toolError(
-          `Error: task ${taskId} is attributed to the master's own session (mis-recorded sessionFile in the ledger); it cannot be resumed here — spawn a fresh subagent for this work instead.`,
+          `Error: task ${taskId} is attributed to the master's own session (mis-recorded sessionFile in the record); it cannot be resumed here — spawn a fresh subagent for this work instead.`,
         );
       }
-      const entry = entryFromHistory(latest, {
-        paneId: existing?.paneId ?? '',
-        tabId: existing?.tabId ?? '',
-        tabName: latest.tabName ?? tabNameForTask(latest.description),
-        status: 'running',
+      const entry: TaskEntry = {
+        ...latest,
+        gen: {
+          ...latest.gen,
+          paneId: existing?.paneId ?? '',
+          tabId: existing?.tabId ?? '',
+          tabName: latest.gen.tabName || tabNameForTask(latest.description),
+          consumedAt: null,
+        },
         createdAt: Date.now(),
-        consumedAt: null,
-      });
+        status: 'running',
+      };
+      // One row per task: the revived generation replaces whatever the restore seeded, and stale
+      // pane ids for it go so the index never points at the dead generation.
+      for (const [paneId, id] of [...panes]) if (id === taskId) panes.delete(paneId);
+      tasks.set(taskId, entry);
       if (existing) {
-        subs.set(entry.paneId, entry);
-        persistSubs();
-        writeHistory(entry, undefined, 'resume');
+        panes.set(entry.gen.paneId, taskId);
+        writeRecord(entry);
       } else {
         await reviveEntry(entry);
-        subs.set(entry.paneId, entry);
-        persistSubs();
+        tasks.set(entry.taskId, entry);
       }
       const how = existing
         ? 'reused existing pane with same session; pi still running there'
-        : entry.sessionFile ? 'session restored' : 'session file missing; fresh conversation';
+        : entry.gen.sessionFile ? 'session restored' : 'session file missing; fresh conversation';
       return {
-        content: [{ type: 'text', text: `resumed subagent ${subRef(entry)} from task ${taskId} (${how}).` }],
-        details: { paneId: entry.paneId, taskId },
+        content: [{ type: 'text', text: `resumed subagent ${taskRef(entry.gen)} from task ${taskId} (${how}).` }],
+        details: { paneId: entry.gen.paneId, taskId },
       };
     } catch (err) {
       if (err instanceof ToolError) throw err;
@@ -713,7 +689,7 @@ export default function subagentPlugin(ctx: Context): void {
    *  fold failures into the error wording. `interrupt` passes `ready: false`: a worker with no turn in
    *  flight is refused before the pipe instead of being woken to receive a stop. */
   async function pipeAction(
-    entry: SubEntry,
+    entry: TaskEntry,
     opts: {
       /** One request from the closed pipe protocol; its `type`/`id` drive the reply and settle keys. */
       build(): PipeRequest;
@@ -729,7 +705,7 @@ export default function subagentPlugin(ctx: Context): void {
     try {
       if (opts.ready !== false) {
         // A just-spawned worker is still booting: its prompt must reach it before any follow-up.
-        const boot = boots.get(entry.paneId);
+        const boot = boots.get(entry.gen.paneId);
         if (boot) {
           await boot;
           trace('boot');
@@ -740,7 +716,7 @@ export default function subagentPlugin(ctx: Context): void {
       try {
         // The pipe IS the liveness proof: a worker that answers it is alive, so a healthy `send` is
         // one round trip with no liveness RPC and no terminal read in front of it.
-        res = await pipeRequestTo(entry.cwd, entry.paneId, payload);
+        res = await pipeRequestTo(entry.cwd, entry.gen.paneId, payload);
       } catch (err) {
         if (opts.ready === false) throw err;
         // A pipe that did not answer may mean the pane is gone: revive it, and only a pane made right
@@ -750,12 +726,12 @@ export default function subagentPlugin(ctx: Context): void {
         const revived = await ensureLive(entry);
         trace(revived ? 'recovered-liveness' : 'alive-no-pipe');
         if (revived) {
-          const ready = await waitSubReady(entry.cwd, entry.paneId);
+          const ready = await waitSubReady(entry.cwd, entry.gen.paneId);
           trace('recovered-ready');
           if (!ready.ok) throw new Error(ready.message);
         }
         try {
-          res = await pipeRequestTo(entry.cwd, entry.paneId, payload);
+          res = await pipeRequestTo(entry.cwd, entry.gen.paneId, payload);
         } catch (retryErr) {
           throw new Error(await pipeUnreachableText(entry, retryErr));
         }
@@ -766,7 +742,7 @@ export default function subagentPlugin(ctx: Context): void {
       }
       return opts.ok(res, payload.id);
     } catch (err) {
-      const what = opts.fail?.(entry.paneId) ?? `failed to reach subagent ${entry.paneId}`;
+      const what = opts.fail?.(entry.gen.paneId) ?? `failed to reach subagent ${entry.gen.paneId}`;
       return toolError(`Error: ${what}: ${(err as Error).message}`);
     }
   }
@@ -774,16 +750,16 @@ export default function subagentPlugin(ctx: Context): void {
   /** Why a live pane did not take the request: a ping separates "nothing listens" (its extension
    *  host is not running, so the message was lost) from "listens but did not answer" (busy or
    *  rejecting). Both are honest; "retry is safe" is only true for the second. */
-  async function pipeUnreachableText(entry: SubEntry, err: unknown): Promise<string> {
-    const path = pipePathFor(pipeNameFor(entry.cwd, entry.paneId));
+  async function pipeUnreachableText(entry: TaskEntry, err: unknown): Promise<string> {
+    const path = pipePathFor(pipeNameFor(entry.cwd, entry.gen.paneId));
     let listening = false;
     try {
-      listening = (await pipeRequestTo(entry.cwd, entry.paneId, { type: 'ping', id: `ping-${Date.now()}` }, 2_000)).type === 'ok';
+      listening = (await pipeRequestTo(entry.cwd, entry.gen.paneId, { type: 'ping', id: `ping-${Date.now()}` }, 2_000)).type === 'ok';
     } catch {
       listening = false;
     }
-    trace(traceRole, 'pipe-unreachable', { pane: entry.paneId, path, listening, error: String((err as Error)?.message ?? err) });
-    const head = `subagent pane ${entry.paneId} is alive but its message channel is dead (${path})`;
+    trace(traceRole, 'pipe-unreachable', { pane: entry.gen.paneId, path, listening, error: String((err as Error)?.message ?? err) });
+    const head = `subagent pane ${entry.gen.paneId} is alive but its message channel is dead (${path})`;
     const detail = String((err as Error)?.message ?? err);
     return listening
       ? `${head}: it answers a ping but did not take this request (${detail}). Nothing was confirmed delivered — check the pane before resending.`
@@ -814,17 +790,17 @@ export default function subagentPlugin(ctx: Context): void {
         entry.status = 'running';
         // A follow_up re-arms the row: keeping the old consume time would make GC and the checkout
         // sweep read it as finished while a turn is in flight.
-        entry.consumedAt = null;
-        persistSubs();
+        entry.gen.consumedAt = null;
+        writeRecord(entry);
         try {
-          lastRequestIdByPane.set(entry.paneId, reqId);
-          startPoller(entry.paneId, entry.cwd, Date.now(), entry.description, reqId);
+          lastRequestIdByPane.set(entry.gen.paneId, reqId);
+          startPoller(entry.gen.paneId, entry.cwd, Date.now(), entry.description, reqId);
         } catch (inner) {
           entry.status = prevStatus;
-          persistSubs();
+          writeRecord(entry);
           throw inner;
         }
-        return { content: [{ type: 'text', text: `Message sent to subagent ${subRef(entry)}.` }], details: { paneId: entry.paneId } };
+        return { content: [{ type: 'text', text: `Message sent to subagent ${taskRef(entry.gen)}.` }], details: { paneId: entry.gen.paneId } };
       },
     });
   }
@@ -856,10 +832,10 @@ export default function subagentPlugin(ctx: Context): void {
     if (spentText(entry) !== null) {
       // A collected task whose pane is gone: revive the same session, then deliver the stored prompt.
       await executeSubagentResume({ ...params, taskId: entry.taskId }, toolCtx);
-      const revived = newestPerTaskId([...subs.values()].filter((s) => s.taskId === entry.taskId && s.status === 'running'));
+      const revived = newestPerTaskId([...tasks.values()].filter((s) => s.taskId === entry.taskId && s.status === 'running'));
       const target = revived.get(entry.taskId);
       if (!target) return toolError(`Error: retry could not revive task ${entry.taskId}.`);
-      return executeSubagentSend({ ...params, agentId: target.paneId, message: prompt }, toolCtx);
+      return executeSubagentSend({ ...params, agentId: target.gen.paneId, message: prompt }, toolCtx);
     }
     return executeSubagentSend({ ...params, message: prompt }, toolCtx);
   }
@@ -871,14 +847,14 @@ export default function subagentPlugin(ctx: Context): void {
     // success and strands the caller.
     if (entry.status === 'closed') {
       return toolError(
-        `Error: subagent ${subRef(entry)} is closed — its pane and tab are gone, so there is no turn to interrupt. action "resume" with taskId ${entry.taskId} revives its session in a new pane.`,
+        `Error: subagent ${taskRef(entry.gen)} is closed — its pane and tab are gone, so there is no turn to interrupt. action "resume" with taskId ${entry.taskId} revives its session in a new pane.`,
       );
     }
     if (entry.status !== 'running') {
       // The natural move for a finished worker is to reclaim it; a pointer that omits `close` sends the
       // master looking for a turn that will never come back.
       return toolError(
-        `Error: subagent ${subRef(entry)} has no running turn (status: ${entry.status}) — interrupt stops the current turn only, and this worker already finished its last one. Close it with action "close" if its work is accepted, send it a follow-up with action "send" if its pane is still listed, or revive it with action "resume" and taskId ${entry.taskId}.`,
+        `Error: subagent ${taskRef(entry.gen)} has no running turn (status: ${entry.status}) — interrupt stops the current turn only, and this worker already finished its last one. Close it with action "close" if its work is accepted, send it a follow-up with action "send" if its pane is still listed, or revive it with action "resume" and taskId ${entry.taskId}.`,
       );
     }
     return pipeAction(entry, {
@@ -886,9 +862,9 @@ export default function subagentPlugin(ctx: Context): void {
       build: () => ({ type: 'interrupt', id: `int-${Date.now()}` }),
       ok: () => {
         // No settlement notice for an interrupted turn: the requester already knows.
-        const lastId = lastRequestIdByPane.get(entry.paneId);
-        if (lastId) d.claimSettleNotice(`${entry.paneId}:${lastId}`);
-        return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${subRef(entry)} (fire-and-return).` }], details: { paneId: entry.paneId } };
+        const lastId = lastRequestIdByPane.get(entry.gen.paneId);
+        if (lastId) d.claimSettleNotice(`${entry.gen.paneId}:${lastId}`);
+        return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${taskRef(entry.gen)} (fire-and-return).` }], details: { paneId: entry.gen.paneId } };
       },
     });
   }
@@ -904,7 +880,7 @@ export default function subagentPlugin(ctx: Context): void {
       let live = true;
       let finished = false;
       try {
-        const probe = await probeAlive(entry.paneId, entry.cwd);
+        const probe = await probeAlive(entry.gen.paneId, entry.cwd);
         live = probe.paneExists;
         // A row can stay `running` after its turn ended (a settlement the poller missed). Refusing
         // the close then strands the task forever: only a pane with a turn in flight is protected,
@@ -915,116 +891,90 @@ export default function subagentPlugin(ctx: Context): void {
       }
       if (live && !finished) {
         return toolError(
-          `Error: subagent ${subRef(entry)} is still running — close only reclaims a worker that already finished, and a task must not disappear without a report. Use action "interrupt" to stop its current turn (the pane and its session stay), then close it once it settles.`,
+          `Error: subagent ${taskRef(entry.gen)} is still running — close only reclaims a worker that already finished, and a task must not disappear without a report. Use action "interrupt" to stop its current turn (the pane and its session stay), then close it once it settles.`,
         );
       }
       // Nothing to reclaim: fall through and record the decision, so `list` stops offering it.
     }
     if (entry.status === 'closed') {
-      // The registry can be closed while the ledger still holds no such row (a close that happened
-      // elsewhere, or a sweep). Record the decision here too, so the project's history says who ended
-      // it instead of trailing off at `consumed`.
-      const toolCwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
-      const ledgerCwd = mainWorktreeRoot(entry.cwd) ?? mainWorktreeRoot(toolCwd) ?? toolCwd;
-      const latest = latestGeneration(readLedger(ledgerCwd), entry.taskId);
-      if (latest && latest.status !== 'closed') {
-        writeHistory(entry, { status: 'closed', closedAt: Date.now() }, 'close', ledgerCwd);
+      // Memory can be closed while the record still holds no such decision (a close that happened
+      // elsewhere, or a sweep). Record the decision here too, so the record says who ended it
+      // instead of trailing off at `consumed`.
+      const latest = readTaskRecord(entry.cwd, entry.taskId);
+      if (!latest || !isClosed(latest)) {
+        entry.closedAt = Date.now();
+        writeRecord(entry);
       }
       return {
-        content: [{ type: 'text', text: `Subagent ${subRef(entry)} is already closed (pane and tab gone); action resume with taskId ${entry.taskId} revives its session.` }],
-        details: { paneId: entry.paneId, taskId: entry.taskId, alreadyClosed: true },
+        content: [{ type: 'text', text: `Subagent ${taskRef(entry.gen)} is already closed (pane and tab gone); action resume with taskId ${entry.taskId} revives its session.` }],
+        details: { paneId: entry.gen.paneId, taskId: entry.taskId, alreadyClosed: true },
       };
     }
     if (!client.available) return toolError(`subagent: ${CORE_REQUIRED}`);
     // S71: close is terminal for what piher created. The checkout goes first, because a dirty one is
-    // a refusal that must leave the worker reachable. The ledger row is written through the
-    // repository root, since the checkout it records is about to disappear.
+    // a refusal that must leave the worker reachable. The record is resolved through the repository
+    // root before the release, since the checkout it records is about to disappear.
     const toolCwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
     // The checkout a job/worker named can be gone (a removed worktree), and `mainWorktreeRoot` cannot
     // resolve a repository from a path that no longer exists: the decision would be written nowhere.
-    const ledgerCwd = mainWorktreeRoot(entry.cwd) ?? mainWorktreeRoot(toolCwd) ?? toolCwd;
+    const recordCwd = mainWorktreeRoot(entry.cwd) ?? mainWorktreeRoot(toolCwd) ?? toolCwd;
     let checkoutLine = '';
     if (entry.worktree) {
       const released = await releaseCheckout(checkout, entry.worktree, checkoutSpace);
       if (!released.ok) return toolError(released.text);
       checkoutLine = ` ${releasedCheckoutLine(entry.worktree, released.removed)};`;
     }
-    await retirePane(client, entry.paneId);
+    await retirePane(client, entry.gen.paneId);
     entry.status = 'closed';
-    persistSubs();
-    // The ledger row survives the pane: `resume` revives from it, so the session is not lost.
-    writeHistory(entry, { status: 'closed', closedAt: Date.now() }, 'close', ledgerCwd);
+    entry.closedAt = Date.now();
+    // The record survives the pane: `resume` answers from it, so the decision is not lost.
+    writeTaskRecord(recordCwd, entry);
     return {
-      content: [{ type: 'text', text: `Subagent ${subRef(entry)} closed — pane and tab gone;${checkoutLine} action resume with taskId ${entry.taskId} brings its session back.` }],
-      details: { paneId: entry.paneId, taskId: entry.taskId },
+      content: [{ type: 'text', text: `Subagent ${taskRef(entry.gen)} closed — pane and tab gone;${checkoutLine} action resume with taskId ${entry.taskId} brings its session back.` }],
+      details: { paneId: entry.gen.paneId, taskId: entry.taskId },
     };
   }
 
-  /** Live registry, newest row per task; closed rows stay visible so send can revive them. A task
-   *  the bounded registry already pruned answers from the repository ledger, which keeps every row. */
-  async function executeSubagentList(toolCtx: unknown) {
-    const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
+  /** Live tasks; closed rows stay in memory so `close` answers them as final. What the session
+   *  works on is what the restore seeded from the view and the records — `list` reads memory. */
+  async function executeSubagentList() {
     // Only work that is still the master's business: running, settled, or a result not yet read.
     // A closed worker was a decision, and a one-shot whose result was consumed has delivered its
     // verdict — listing either would spend the master's context on something it already handled.
-    const visible = (sub: SubEntry): boolean => sub.status !== 'closed'
+    const visible = (sub: TaskEntry): boolean => sub.status !== 'closed'
       && !(sub.status === 'consumed' && sub.lifecycle === 'one-shot');
-    const allRegistry = newestPerTaskId(subs.values());
-    const byTask = new Map([...allRegistry].filter(([, sub]) => visible(sub)));
-    // Everything the registry knows — closed rows included — so the ledger cannot resurrect a task
-    // the master already ended (the row it would bring back is older than that decision).
-    const registered = new Set(allRegistry.keys());
-    // The ledger is append-only, so its LAST row for a task is the newest word on it — newer than the
-    // branch snapshot this session restored, which is how a worker closed in another session kept
-    // showing up here as settled. `close` is final: a closed row wins over any registry copy.
-    const lastRow = new Map<string, HistoryEntry>();
-    for (const row of readLedger(cwd)) lastRow.set(row.taskId, row);
-    for (const [taskId, row] of lastRow) {
-      const prev = byTask.get(taskId);
-      // A live row outranks a stale copy (a ledger row older than the spawn it describes), while a
-      // close that happened after the snapshot this session restored outranks the snapshot.
-      if (row.status === 'closed' && (!prev || (row.closedAt ?? row.createdAt ?? 0) >= prev.createdAt)) {
-        byTask.delete(taskId);
-        continue;
-      }
-      if (row.status === 'closed') continue;
-      if (registered.has(taskId)) continue;
-      if (prev && prev.createdAt >= (row.createdAt ?? 0)) continue;
-      const entry = entryFromHistory(row, {});
-      if (!visible(entry)) continue;
-      byTask.set(taskId, entry);
-    }
+    const byTask = new Map([...newestPerTaskId(tasks.values())].filter(([, sub]) => visible(sub)));
     if (byTask.size === 0) {
-      return { content: [{ type: 'text', text: 'No subagents started (from this session branch).' }], details: {} };
+      return { content: [{ type: 'text', text: 'No subagents started (from this session view).' }], details: {} };
     }
     const probes = new Map<string, AliveProbe>();
     await Promise.all([...byTask.values()].map(async (sub) => {
       if (sub.status === 'closed') return;
       try {
-        probes.set(sub.paneId, await probeAlive(sub.paneId, sub.cwd));
+        probes.set(sub.gen.paneId, await probeAlive(sub.gen.paneId, sub.cwd));
       } catch { /* best effort for display */ }
     }));
     const now = Date.now();
     const lines: string[] = [];
     for (const sub of byTask.values()) {
-      const tabTag = sub.tabName ? ` [tab: ${sub.tabName}]` : '';
+      const tabTag = sub.gen.tabName ? ` [tab: ${sub.gen.tabName}]` : '';
       if (sub.status === 'consumed' || sub.status === 'settled') {
         const life = sub.lifecycle === 'one-shot' ? 'one-shot' : 'persistent';
         const advice = sub.lifecycle === 'one-shot' ? 'consumed at its next report' : 'action send revives';
-        lines.push(`${subRef(sub)} [idle] (${sub.kind} · ${life}, settled; ${advice})${tabTag} ${sub.description}`);
+        lines.push(`${taskRef(sub.gen)} [idle] (${sub.kind} · ${life}, settled; ${advice})${tabTag} ${sub.description}`);
         continue;
       }
       const state = 'running';
-      const probe = probes.get(sub.paneId);
+      const probe = probes.get(sub.gen.paneId);
       const statusTag = probe?.agentStatus ? ` ${probe.agentStatus}` : '';
       const activityTag = probe?.lastActivityMs != null ? `, active ${agoText(probe.lastActivityMs, now)}` : '';
       let gateTag = '';
       if (probe?.agentStatus === 'blocked') {
-        const question = await readAskFlag(sub.paneId);
+        const question = await readAskFlag(sub.gen.paneId);
         gateTag = question ? ` — AWAITING HUMAN: "${question}"` : ' — AWAITING HUMAN decision';
       }
       const life = sub.lifecycle === 'one-shot' ? 'one-shot' : 'persistent';
-      lines.push(`${subRef(sub)} [${state}${statusTag}${activityTag}${gateTag}] (${sub.kind} · ${life})${tabTag} ${sub.description}`);
+      lines.push(`${taskRef(sub.gen)} [${state}${statusTag}${activityTag}${gateTag}] (${sub.kind} · ${life})${tabTag} ${sub.description}`);
     }
     return { content: [{ type: 'text', text: lines.join('\n') }], details: {} };
   }
@@ -1033,9 +983,11 @@ export default function subagentPlugin(ctx: Context): void {
     client,
     env,
     subSemaphore,
-    subs,
-    persistSubs,
-    writeHistory,
+    tasks,
+    panes,
+    writeRecord,
+    appendView,
+    dropTask,
     lastRequestIdByPane,
     boots,
     notifySpawnFailed: injectNotice,
@@ -1050,25 +1002,24 @@ export default function subagentPlugin(ctx: Context): void {
 
   const outputActionDeps = {
     client,
-    resolveEntry: (rawId: string, cwd: string) => resolveSubEntry(rawId, cwd),
+    resolveEntry: (rawId: string) => resolveSubEntry(rawId),
     outputCursors,
     nextRevision: (paneId: string): number => {
       const next = (outputRevisions.get(paneId) ?? 0) + 1;
       outputRevisions.set(paneId, next);
       return next;
     },
-    getCwd: (toolCtx: unknown): string => (toolCtx as { cwd?: string })?.cwd ?? process.cwd(),
     // Transcript fallback: small worker panes show only the opaque status overlay, so the pane delta can never
     // carry the final report. No preferred file — start from the worker's `piher.session` label, not a stale registry value.
     readFinalReport: async (paneId: string, entryCwd: string) =>
       (await session.subSessionState(paneId, entryCwd, 0)).text,
-    persistSubs,
+    writeRecord,
   };
 
   const ACTIONS: Record<string, (params: ToolParams, toolCtx: unknown, onUpdate?: (u: unknown) => void) => Promise<unknown>> = {
     spawn: (params, toolCtx) => executeSubagentSpawn(params, toolCtx),
     resume: (params, toolCtx) => executeSubagentResume(params, toolCtx),
-    list: (_params, toolCtx) => executeSubagentList(toolCtx),
+    list: () => executeSubagentList(),
     send: (params, toolCtx) => executeSubagentSend(params, toolCtx),
     retry: (params, toolCtx) => executeSubagentRetry(params, toolCtx),
     interrupt: (params, toolCtx) => executeSubagentInterrupt(params, toolCtx),
@@ -1111,7 +1062,7 @@ export default function subagentPlugin(ctx: Context): void {
       role: Type.Optional(Type.String({ description: '[spawn] Role profile name; action help lists the profiles available here (description, tools, lifecycle). Unknown names are display labels only' })),
       tab: Type.Optional(Type.String({ description: '[spawn] Task tab to join or create (default: grouped by worktree)' })),
       allowed_tools: Type.Optional(Type.Array(Type.String(), { description: '[spawn] Extra tools on top of the role baseline' })),
-      taskId: Type.Optional(Type.String({ description: '[resume] Task id from the delegation ledger' })),
+      taskId: Type.Optional(Type.String({ description: '[resume] Task id of a collected task, as printed by list' })),
       agentId: Type.Optional(Type.String({ description: '[send|interrupt|output|close] Slug, pane id, or slug@paneId as printed by spawn/list' })),
       message: Type.Optional(Type.String({ description: '[send] Follow-up message' })),
       max_chars: Type.Optional(Type.Integer({ description: '[output] Output cap (default 6000, 100-16000)' })),

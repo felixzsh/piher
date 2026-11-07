@@ -3,7 +3,7 @@
  * one line that matters. Pure string builders plus an ANSI-aware truncator, so no pi-tui import is
  * needed and older pi builds degrade to "no renderer".
  */
-import { SUBS_CUSTOM_TYPE, subRef, type SubsRegistry } from './subagent-core.ts';
+
 import { DELEGATION_CUSTOM_TYPE } from './delegation-core.ts';
 import { SETTLEMENT_CUSTOM_TYPE, formatElapsed, type SettlementCard } from './settlement-card.ts';
 import { JOB_NOTICE_CUSTOM_TYPE, formatDuration } from './bg-job-core.ts';
@@ -42,38 +42,6 @@ function card(lines: readonly string[]): RenderComponent {
     render: (width: number) => lines.map((line) => truncateStyled(line, width)),
     invalidate() { /* No cached state. */ },
   };
-}
-
-/**
- * How a registry entry renders in the transcript. The registry itself now lives in the session's own
- * document (`subagent-registry-file.ts`), so this only paints the `piher.subs` entries an older build
- * left behind — kept so replaying one of those sessions does not lose the fan-out card. `rows` shows the
- * count and, expanded, one row per worker: the master's fan-out at a glance, which is what someone
- * monitoring a session wants. `summary` is the quiet form — one line while workers run, nothing once
- * they settle — and `off` renders nothing at all. Switch it with `PIHER_SUBAGENT_CARDS=rows|summary|off`.
- */
-export type SubagentCardMode = 'rows' | 'summary' | 'off';
-
-export function subagentCardMode(env: NodeJS.ProcessEnv = process.env): SubagentCardMode {
-  const raw = (env.PIHER_SUBAGENT_CARDS ?? '').trim().toLowerCase();
-  return raw === 'summary' || raw === 'off' ? raw : 'rows';
-}
-
-function subsLines(data: unknown, theme: RenderTheme, expanded: boolean): string[] {
-  const mode = subagentCardMode();
-  if (mode === 'off') return [];
-  const subs = (data as SubsRegistry | undefined)?.subs;
-  const running = Array.isArray(subs) ? subs.filter((sub) => sub.status === 'running').length : 0;
-  if (mode === 'summary') {
-    if (running === 0) return [];
-    return [`${theme.fg('accent', theme.bold('subagents'))} ${theme.fg('dim', `· ${running} running`)}`];
-  }
-  const list = Array.isArray(subs) ? subs : [];
-  const count = list.length === 0 ? 'none' : `${list.length} tracked${running ? ` ${running} running` : ''}`;
-  const head = `${theme.fg('accent', theme.bold('subagents'))} ${theme.fg('dim', `· ${count}`)}`;
-  if (!expanded) return [head];
-  // Every registry row IS a delegated worker (↳ marks the delegation edge; status text carries state).
-  return [head, ...list.map((sub) => theme.fg('dim', `  ↳ ${subRef(sub)} · ${sub.status} · ${clip(String(sub.description ?? ''), 70)}`))];
 }
 
 /** First-frame delegation card in the worker's own transcript (RFC rfc-delegation-identity §2.3). */
@@ -219,7 +187,6 @@ export function installRenderers(pi: unknown): string[] {
     }
   };
 
-  entry(SUBS_CUSTOM_TYPE, subsLines);
   entry(DELEGATION_CUSTOM_TYPE, delegationLines);
   entry(ROLE_MANIFEST_CUSTOM_TYPE, (data, theme) => roleManifestLines(data, theme));
   message(SETTLEMENT_CUSTOM_TYPE, (msg, theme, expanded) => settlementLines(msg, theme, expanded));

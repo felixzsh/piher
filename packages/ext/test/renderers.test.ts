@@ -5,7 +5,6 @@ import { charWidth, styledWidth, truncateStyled } from '../src/ansi-text.ts';
 import {
   ROLE_MANIFEST_CUSTOM_TYPE, installRenderers, type RenderComponent, type RenderTheme,
 } from '../src/renderers.ts';
-import { SUBS_CUSTOM_TYPE } from '../src/subagent-core.ts';
 import { DELEGATION_CUSTOM_TYPE } from '../src/delegation-core.ts';
 import { SETTLEMENT_CUSTOM_TYPE } from '../src/settlement-card.ts';
 import { JOB_NOTICE_CUSTOM_TYPE } from '../src/bg-job-core.ts';
@@ -59,7 +58,6 @@ test('width helpers: escapes are zero-width, wide glyphs take two cells, control
 
 test('every card clips its lines to the requested width', () => {
   const cases: Array<[string, unknown]> = [
-    [SUBS_CUSTOM_TYPE, { version: 2, subs: [{ paneId: 'wD:p4', status: 'running', description: 'y'.repeat(200) }] }],
     [ROLE_MANIFEST_CUSTOM_TYPE, { role: 'worker-default', manifestVersion: 'v1', tools: ['read'], permissions: { read: 'allow' } }],
     [DELEGATION_CUSTOM_TYPE, { parentPaneId: 'wD:p1', description: 'x'.repeat(200) }],
   ];
@@ -80,16 +78,6 @@ interface RenderCase {
 }
 
 const CASES: RenderCase[] = [
-  // rows (default): the count always, one row per worker when expanded — the master's fan-out.
-  { name: 'subagents rows: the count, collapsed', kind: 'entry', type: SUBS_CUSTOM_TYPE, data: { version: 2, subs: [{ paneId: 'wD:p4', status: 'running', description: 'workbench upgrade' }, { paneId: 'wD:p5', status: 'settled', description: 'poll-loop tests' }] }, expect: ['subagents · 2 tracked 1 running'] },
-  { name: 'subagents rows: every worker, settled ones included', kind: 'entry', type: SUBS_CUSTOM_TYPE, expanded: true, data: { version: 2, subs: [{ paneId: 'wD:p4', slug: 'workbench-upgrade', status: 'running', description: 'workbench upgrade' }, { paneId: 'wD:p5', slug: 'poll-loop', status: 'settled', description: 'poll-loop tests' }] }, expect: ['subagents · 2 tracked 1 running', '  ↳ workbench-upgrade@wD:p4 · running · workbench upgrade', '  ↳ poll-loop@wD:p5 · settled · poll-loop tests'] },
-  { name: 'subagents rows: an empty registry still says so', kind: 'entry', type: SUBS_CUSTOM_TYPE, data: { version: 2, subs: [] }, expect: ['subagents · none'] },
-  // summary: one line while workers run, nothing once they settle.
-  { name: 'subagents summary: only the running count', kind: 'entry', type: SUBS_CUSTOM_TYPE, env: { PIHER_SUBAGENT_CARDS: 'summary' }, data: { version: 2, subs: [{ paneId: 'wD:p4', status: 'running' }, { paneId: 'wD:p5', status: 'settled' }] }, expect: ['subagents · 1 running'] },
-  { name: 'subagents summary: all settled renders nothing', kind: 'entry', type: SUBS_CUSTOM_TYPE, env: { PIHER_SUBAGENT_CARDS: 'summary' }, expanded: true, data: { version: 2, subs: [{ paneId: 'wD:p4', status: 'settled' }] }, expect: [] },
-  // off: nothing at all, whatever the registry holds.
-  { name: 'subagents off: nothing, even while running', kind: 'entry', type: SUBS_CUSTOM_TYPE, env: { PIHER_SUBAGENT_CARDS: 'off' }, expanded: true, data: { version: 2, subs: [{ paneId: 'wD:p4', status: 'running' }] }, expect: [] },
-  { name: 'subagents undefined data still renders the head', kind: 'entry', type: SUBS_CUSTOM_TYPE, expect: ['subagents · none'] },
   { name: 'role manifest (marker theme)', kind: 'entry', type: ROLE_MANIFEST_CUSTOM_TYPE, theme: marker, data: { role: 'worker-default', manifestVersion: 'v1', tools: ['read', 'bash', 'write'], permissions: { bash: 'deny', write: 'deny', read: 'allow' } }, expect: ['[accent]**role** worker-default [dim]vv1 · 3 tools[warning] · 2 gated'] },
   { name: 'role manifest switched', kind: 'entry', type: ROLE_MANIFEST_CUSTOM_TYPE, theme: marker, data: { role: 'worker-default', manifestVersion: 'v1', tools: ['read', 'bash', 'write'], permissions: { bash: 'deny', write: 'deny', read: 'allow' }, origin: 'switch', switchedBy: 'p-master' }, expect: ['[accent]**role** worker-default [dim]vv1 · 3 tools[warning] · 2 gated[accent] ⇄ p-master'] },
   { name: 'role manifest missing', kind: 'entry', type: ROLE_MANIFEST_CUSTOM_TYPE, expect: ['role ? v? · 0 tools'] },
@@ -122,7 +110,7 @@ test('card renderers: each custom type renders its lines', async (t) => {
 test('installRenderers: registers every piher custom type when the host API exists', () => {
   const harness = install();
   assert.deepEqual([...harness.entries.keys()].sort(), [
-    DELEGATION_CUSTOM_TYPE, ROLE_MANIFEST_CUSTOM_TYPE, SUBS_CUSTOM_TYPE,
+    DELEGATION_CUSTOM_TYPE, ROLE_MANIFEST_CUSTOM_TYPE,
   ].sort());
   assert.deepEqual([...harness.messages.keys()].sort(), [
     JOB_NOTICE_CUSTOM_TYPE, SETTLEMENT_CUSTOM_TYPE,

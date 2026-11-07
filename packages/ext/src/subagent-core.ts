@@ -1,11 +1,11 @@
 /**
- * Subagent domain: registry rows, launch lines, liveness notices, tab/worktree planning, task-id
+ * Subagent domain: launch lines, liveness notices, tab/worktree planning, task-id
  * resolution, and the outbound port types. Pure: planners decide, adapters do I/O.
+ *
+ * The row itself lives in task-row.ts; the documents in task-store.ts.
  */
-import { normalizeEntryKind } from './history-store.ts';
-import type { Lifecycle } from './role-manifest.ts';
-import type { WorktreeRecord } from './worktree.ts';
-import { foldWorktree } from './worktree.ts';
+import { normalizeEntryKind, taskRef } from './task-row.ts';
+import type { TaskStatus } from './task-row.ts';
 import { CORE_REQUIRED } from './core-client.ts';
 import type { SettlementCard, SettlementOutcome } from './settlement-card.ts';
 import type { WorkerWidgetRow } from './tree-view.ts';
@@ -179,75 +179,6 @@ export function buildBlockedGateNotice(opts: { paneId: string; description: stri
   ].join(' ');
 }
 
-export const SUBS_CUSTOM_TYPE = 'piher.subs';
-
-export interface SubEntry {
-  taskId: string;
-  /** 'task' or a role name; only a display label for GC. */
-  kind: string;
-  paneId: string;
-  /** Phase 2 task slug (kebab-case of description; RFC rfc-delegation-identity §3.1): tool args
-   * accept `slug@paneId` or the bare slug; allocated once at spawn and stable across revives. */
-  slug?: string;
-  tabId: string;
-  tabName: string;
-  cwd: string;
-  description: string;
-  status: 'running' | 'settled' | 'consumed' | 'closed';
-  /** GC grace basis (durable); closed rows keep the original value. */
-  consumedAt?: number | null;
-  sessionFile: string | null;
-  launchCommand: string[];
-  createdAt: number;
-  revivedFrom?: string | null;
-  /** Settle window start (poller state): settlement waits until the transcript settles. */
-  settleWindowStartedAt?: number | null;
-  /** S54: only a role-declared `one-shot` worker is reclaimed at its settlement, not at the GC TTL. */
-  lifecycle?: Lifecycle;
-  /** The final report `subagent output` already returned (tail fingerprint + time): the settlement
-   *  notice then points at that delivery instead of repeating the report. Durable across resume. */
-  reportDelivered?: { fingerprint: string; at: number } | null;
-  /** The closing text already announced for this pane (fingerprint + time). Two pollers can settle the
-   *  same transcript — a recovery re-arm and a live request carry different ids — and the claim is per
-   *  request, so this is what stops the master from reading one settlement twice. */
-  noticeAnnounced?: { fingerprint: string; at: number } | null;
-  /** S71: the checkout this spawn asked piher to create; its record is what authorises a removal. */
-  worktree?: WorktreeRecord;
-}
-
-/* ── task slugs (RFC rfc-delegation-identity §3.1) ───────────────── */
-
-/** Slug cap: short enough for tool args and list rows, long enough to stay distinctive. */
-const SLUG_MAX = 24;
-
-/** Kebab-case a task description; non-ASCII (CJK descriptions) sanitizes to '' — the allocator
- * then falls back to a taskId-derived ascii slug, because tool args must stay typeable. */
-export function slugifyTask(description: string): string {
-  return description
-    .toLowerCase()
-    .replace(/[''']/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, SLUG_MAX)
-    .replace(/-+$/g, '');
-}
-
-/** Allocate a unique slug among live rows: base, then base-2, base-3, …; a description that
- * sanitizes to nothing (CJK, emoji-only) falls back to `task-<taskId prefix>`. */
-export function allocateSubSlug(description: string, taskId: string, taken: ReadonlySet<string>): string {
-  const base = slugifyTask(description) || `task-${taskId.slice(0, 6)}`;
-  if (!taken.has(base)) return base;
-  for (let n = 2; ; n++) {
-    const next = `${base}-${n}`;
-    if (!taken.has(next)) return next;
-  }
-}
-
-/** Stable display/argument form for a subagent row: `slug@paneId` when a slug exists. */
-export function subRef(sub: { paneId: string; slug?: string }): string {
-  return sub.slug ? `${sub.slug}@${sub.paneId}` : sub.paneId;
-}
-
 /** Identity of a final report across the output action and the settlement notice: its tail. */
 export function reportFingerprint(report: string): string {
   return report.slice(-64);
@@ -268,103 +199,23 @@ export function sleepWhileSubsRunningNote(
   if (running.length === 0) return null;
   const longest = Math.max(0, ...[...command.matchAll(/\bsleep\s+(\d+)s?\b/g)].map((m) => Number(m[1])));
   if (longest < SLEEP_NOTE_MIN_SECONDS) return null;
-  return `[piher] ${running.length} background subagent(s) running (${running.map(subRef).join(', ')}): their settlement `
+  return `[piher] ${running.length} background subagent(s) running (${running.map(taskRef).join(', ')}): their settlement `
     + 'notice arrives automatically at your next tool boundary, so do not sleep to wait for them — keep working or end '
     + 'your turn. Sleeping is only needed for other work (builds, logs).';
 }
 
-export interface SubsRegistry {
-  version: 2;
-  subs: SubEntry[];
-}
 
-export function makeRegistry(subs: SubEntry[] = []): SubsRegistry {
-  return { version: 2, subs };
-}
 
-/** Rows the legacy branch entry kept beside the running ones (S73). Superseded by the per-session
- *  registry file, which keeps every row: the constant now only bounds a snapshot written into a
- *  session that predates the file (and the tests that pin that shape). */
-export const SUBS_REGISTRY_TAIL = 10;
-
-/** How recently a row left the running set: `consumedAt` moves forward as GC touches it, creation
- *  is the floor (a settled row that never reached GC keeps its spawn time). */
-function settledAt(sub: SubEntry): number {
-  return Math.max(sub.consumedAt ?? 0, sub.createdAt);
-}
-
-/** The durable registry: every row, kept in registry order so a reader rebuilds the same sequence.
- *  `tail` bounds the non-running ones for the legacy branch entry; `null` keeps them all, which is
- *  what the registry file does — a row the master can still address is a row a reload must not lose. */
-export function registrySnapshot(
-  subs: Iterable<SubEntry>,
-  tail: number | null = SUBS_REGISTRY_TAIL,
-): SubsRegistry {
-  const all = [...subs];
-  const running = all.filter((sub) => sub.status === 'running');
-  const settled = all.filter((sub) => sub.status !== 'running')
-    .sort((a, b) => settledAt(b) - settledAt(a));
-  const keptSettled = tail === null ? settled : settled.slice(0, Math.max(0, tail));
-  const kept = new Set([...running, ...keptSettled]);
-  return makeRegistry(all.filter((sub) => kept.has(sub)));
-}
-
-const SUB_STATUSES: Record<string, true> = { running: true, settled: true, consumed: true, closed: true };
-
-/** Replay `piher.subs` custom branch entries into a registry; last snapshot wins. Tolerant of
- *  v1 rows (missing taskId/kind/tabName) and unknown future fields. */
-export function foldSubsRegistry(entries: ReadonlyArray<{ type?: string; customType?: string; data?: unknown }>): SubsRegistry {
-  let found = makeRegistry();
-  for (const entry of entries) {
-    if (entry.type !== 'custom' || entry.customType !== SUBS_CUSTOM_TYPE) continue;
-    const data = entry.data as { subs?: Array<Partial<SubEntry> & { paneId: string }> } | undefined;
-    if (!data || !Array.isArray(data.subs)) continue;
-    const subs: SubEntry[] = data.subs
-      .filter((s) => typeof s?.paneId === 'string')
-      .map((s) => ({
-        taskId: typeof s.taskId === 'string' ? s.taskId : s.paneId,
-        kind: normalizeEntryKind(typeof s.kind === 'string' ? s.kind : undefined),
-        paneId: s.paneId,
-        slug: typeof s.slug === 'string' && s.slug ? s.slug : undefined,
-        tabId: typeof s.tabId === 'string' ? s.tabId : '',
-        tabName: typeof s.tabName === 'string' ? s.tabName : '',
-        cwd: typeof s.cwd === 'string' ? s.cwd : '',
-        description: typeof s.description === 'string' ? s.description : '',
-        status: typeof s.status === 'string' && SUB_STATUSES[s.status] === true
-          ? (s.status as SubEntry['status'])
-          : 'running',
-        consumedAt: typeof s.consumedAt === 'number' ? s.consumedAt : null,
-        sessionFile: typeof s.sessionFile === 'string' ? s.sessionFile : null,
-        launchCommand: Array.isArray(s.launchCommand) ? s.launchCommand : [],
-        createdAt: typeof s.createdAt === 'number' ? s.createdAt : 0,
-        revivedFrom: typeof s.revivedFrom === 'string' ? s.revivedFrom : null,
-        settleWindowStartedAt: typeof s.settleWindowStartedAt === 'number' ? s.settleWindowStartedAt : null,
-        lifecycle: s.lifecycle === 'one-shot' ? 'one-shot' : undefined,
-        worktree: foldWorktree(s.worktree),
-        reportDelivered: s.reportDelivered && typeof s.reportDelivered === 'object'
-          && typeof s.reportDelivered.fingerprint === 'string' && typeof s.reportDelivered.at === 'number'
-          ? { fingerprint: s.reportDelivered.fingerprint, at: s.reportDelivered.at }
-          : undefined,
-      }));
-    found = { version: 2, subs };
-  }
-  return found;
-}
-
-/** Latest row per taskId (same taskId rows are generations); newest createdAt wins. */
-export function newestPerTaskId(entries: Iterable<SubEntry>): Map<string, SubEntry> {
-  const byTask = new Map<string, SubEntry>();
+/** Latest row per taskId; newest createdAt wins. */
+export function newestPerTaskId<T extends { taskId: string; createdAt: number }>(
+  entries: Iterable<T>,
+): Map<string, T> {
+  const byTask = new Map<string, T>();
   for (const sub of entries) {
     const prev = byTask.get(sub.taskId);
     if (!prev || sub.createdAt >= prev.createdAt) byTask.set(sub.taskId, sub);
   }
   return byTask;
-}
-
-/** Re-key a revived entry under its new pane id; the dead id must go, or a later zombie sweep closes the live row. */
-export function rekeySub(subs: Map<string, SubEntry>, previousPaneId: string, entry: SubEntry): void {
-  if (previousPaneId !== entry.paneId && subs.get(previousPaneId) === entry) subs.delete(previousPaneId);
-  subs.set(entry.paneId, entry);
 }
 
 /** Split `provider/model` on the first '/' only: model ids such as `moonshotai/kimi-k2` carry their own. */
@@ -679,7 +530,7 @@ export interface SubagentPort {
   applyReplySession(paneId: string, sessionFile: string | null): void;
   listRunningSubs(): WorkerWidgetRow[];
   /** D113: non-closed rows for the /piher-tree view (settled nodes carry their settle time). */
-  listRows(): Array<{ paneId: string; slug?: string; description: string; kind: string; status: SubEntry['status']; settledAt: number | null }>;
+  listRows(): Array<{ paneId: string; slug?: string; description: string; kind: string; status: TaskStatus; settledAt: number | null }>;
   /** The `piher.settlement` card for a pipe-delivered settlement (S57). */
   settlementCard(paneId: string, outcome: SettlementOutcome): SettlementCard;
   /** Pipe settlement: drop the row out of listRunningSubs before the finish notice wakes the master. */

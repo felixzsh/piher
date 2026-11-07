@@ -14,8 +14,10 @@ packages/ext/.tsbuildinfo
 .stryker-tmp/
 # /piher-config doc output (machine-truth report; regenerate on demand)
 .piher/config-report.md
-# Delegation ledger: one append-only JSONL per repository, never committed (never the parent
-# .piher/, whose roles/ are meant to be committed)
+# Delegation state: one task record per task plus the session view, per repository, never
+# committed (never the parent .piher/, whose roles/ are meant to be committed)
+.piher/tasks/
+# Legacy delegation ledger (deleted; kept ignored so old checkouts stay clean)
 .piher/history/
 
 # Development-only docs (reviews, RFCs, per-feature design notes) are local artifacts:

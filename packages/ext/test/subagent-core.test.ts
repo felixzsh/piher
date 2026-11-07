@@ -3,21 +3,23 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DisposeLedger } from '../src/ledger.ts';
-import { appendLedger, readLedger, type HistoryEntry } from '../src/history-store.ts';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  TempHome, mountSubagent, runSubagent, runSubagentRejects, subEntry, subsSnapshot, terminalInfo,
+  TempHome, fire, mountSubagent, runSubagent, runSubagentRejects, seedTaskDocuments, readTaskRecord, taskRow,
+  terminalInfo,
 } from './test-utils.ts';
 import { forgetTaskPrompt, readTaskPrompt, saveTaskPrompt } from '../src/prompt-store.ts';
 import {
-  MAIN_TAB_NAME, SUBS_CUSTOM_TYPE, SUBS_REGISTRY_TAIL, TAB_NAME_MAX, Semaphore, agoText, buildAliveNotice, buildBlockedGateNotice,
-  allocateSubSlug, registrySnapshot, slugifyTask, subRef,
-  attachSubagentStructuredContent, buildLaunchLine, buildLaunchParts, entryScript, formatRoleCatalog, classifyWorktreeZone, foldSubsRegistry, formatSpawnFailure, isAlive,
-  rekeySub, planLaunchValidation, planTabPlacement, resolveTaskIdPrefix,
-  flattenToolParams, idParam, sleepWhileSubsRunningNote, tabNameForTask, type AliveProbe, type SubEntry,
+  MAIN_TAB_NAME, TAB_NAME_MAX, Semaphore, agoText, buildAliveNotice, buildBlockedGateNotice,
+  attachSubagentStructuredContent, buildLaunchLine, buildLaunchParts, entryScript, formatRoleCatalog, classifyWorktreeZone, formatSpawnFailure, isAlive,
+  planLaunchValidation, planTabPlacement, resolveTaskIdPrefix,
+  flattenToolParams, idParam, sleepWhileSubsRunningNote, tabNameForTask, type AliveProbe,
 } from '../src/subagent-core.ts';
+import {
+  allocateTaskSlug, isActionable, isClosed, isSpent, slugifyTask, taskRef, type TaskEntry,
+} from '../src/task-row.ts';
 import { planReadyAttempt, readyBackoffMs, readyFailureText } from '../src/subagent-spawn.ts';
 
 const RT = { nodePath: '/usr/local/bin/node', cliPath: '/opt/pi/dist/cli.js', extPath: '/ext/index.ts' };
@@ -41,12 +43,6 @@ test('sleepWhileSubsRunningNote: long sleeps while background workers run get th
     assert.equal(note !== null, expected, name);
     if (note) assert.ok(note.includes('task-0@p0') && /arrives automatically/.test(note), name);
   }
-});
-
-test('foldSubsRegistry: a persisted report delivery survives the fold; a malformed one is dropped', () => {
-  const row = (reportDelivered: unknown) => ({ type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { subs: [{ paneId: 'p1', reportDelivered }] } });
-  assert.deepEqual(foldSubsRegistry([row({ fingerprint: 'tail', at: 5 })]).subs[0]!.reportDelivered, { fingerprint: 'tail', at: 5 });
-  assert.equal(foldSubsRegistry([row({ fingerprint: 3 })]).subs[0]!.reportDelivered, undefined);
 });
 
 test('buildLaunchLine: win32 uses PowerShell & syntax, POSIX starts via sh', () => {
@@ -149,105 +145,22 @@ test('attachSubagentStructuredContent: stamps the action onto details; non-objec
   assert.equal(attachSubagentStructuredContent('output', undefined), undefined);
 });
 
-test('rekeySub: a revived entry drops its dead pane id so it is listed (and swept) once', () => {
-  const entry = subEntry({ paneId: 'w1:p3', status: 'closed' });
-  const other = subEntry({ paneId: 'w1:p4' });
-  const subs = new Map([['w1:p3', entry], ['w1:p4', other]]);
-  entry.paneId = 'w1:p9'; // what reviveEntry does in place
-  entry.status = 'running';
-  rekeySub(subs, 'w1:p3', entry);
-  assert.deepEqual([...subs.keys()].sort(), ['w1:p4', 'w1:p9']);
-  assert.equal(subs.get('w1:p9'), entry);
-  // A row that took over the old key in the meantime is not ours to delete.
-  const squatter = subEntry({ paneId: 'w1:p9' });
-  const map2 = new Map([['w1:p9', squatter]]);
-  const moved = subEntry({ paneId: 'w1:p10' });
-  rekeySub(map2, 'w1:p9', moved);
-  assert.deepEqual([...map2.keys()].sort(), ['w1:p10', 'w1:p9']);
-});
-
-const mkSub = (over: Record<string, unknown>) => ({
-  taskId: 't1', kind: 'short', paneId: 'w1:p1', tabId: 'w1:t9', cwd: 'F:\\piher', description: 'task',
-  status: 'running', sessionFile: null, launchCommand: ['x'], createdAt: 1, ...over,
-});
-
-const registry = (...rows: unknown[]) => [{ type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { version: 2, subs: rows } }];
-
-const entryFrom = (row: Record<string, unknown>): SubEntry => foldSubsRegistry(registry(row)).subs[0]!;
-
-test('foldSubsRegistry: last snapshot wins; legacy kinds normalize; v1 rows migrate', () => {
-  const reg = foldSubsRegistry([
-    { type: 'session' },
-    { type: 'custom', customType: 'other', data: { x: 1 } },
-    ...registry(mkSub({ paneId: 'w1:p1', status: 'settled' })),
-    ...registry(mkSub({ paneId: 'w1:p2', status: 'consumed', kind: 'resident', tabName: 'research' })),
-  ]);
-  assert.equal(reg.version, 2);
-  assert.equal(reg.subs.length, 1);
-  assert.equal(reg.subs[0]!.paneId, 'w1:p2');
-  assert.equal(reg.subs[0]!.status, 'consumed');
-  assert.equal(reg.subs[0]!.kind, 'task', 'resident folds to task');
-  assert.equal(reg.subs[0]!.tabName, 'research');
-
-  assert.equal(entryFrom(mkSub({ paneId: 'w1:p3', kind: 'advisor' })).kind, 'advisor', 'unknown role names pass through');
-
-  const v1 = entryFrom({ paneId: 'w1:p9', description: 'old', status: 'settled', createdAt: 5 });
-  assert.equal(v1.taskId, 'w1:p9', 'v1 rows default taskId to the pane id');
-  assert.equal(v1.kind, 'task');
-  assert.equal(v1.cwd, '');
-  assert.deepEqual(v1.launchCommand, []);
-
-  assert.deepEqual(foldSubsRegistry([{ type: 'session' }] as never), { version: 2, subs: [] });
-});
-
-test('foldSubsRegistry: the settle window and the delivered report survive a persist/rebuild round-trip', () => {
-  const row = entryFrom(mkSub({
-    paneId: 'w1:p1',
-    status: 'running',
-    settleWindowStartedAt: 1234567890,
-    reportDelivered: { fingerprint: 'abc', at: 7 },
-  }));
-  assert.equal(row.settleWindowStartedAt, 1234567890);
-  assert.deepEqual(row.reportDelivered, { fingerprint: 'abc', at: 7 });
-
-  const legacy = entryFrom(mkSub({ paneId: 'w1:p1', status: 'settled' }));
-  assert.equal(legacy.settleWindowStartedAt, null);
-  assert.equal(legacy.tabName, '', 'rows without a tab name fall back to empty');
-  assert.equal(entryFrom(mkSub({ reportDelivered: { fingerprint: 1 } })).reportDelivered, undefined);
-});
-
-test('foldSubsRegistry: a one-shot lifetime survives the replay; any other row folds back to persistent', () => {
-  assert.equal(entryFrom(mkSub({ lifecycle: 'one-shot' })).lifecycle, 'one-shot');
-  assert.equal(entryFrom(mkSub({ lifecycle: 'forever' })).lifecycle, undefined);
-  assert.equal(entryFrom(mkSub({})).lifecycle, undefined, 'a row from before the field stays persistent');
-});
-
-test('registrySnapshot: every running row plus a bounded tail of the most recently settled ones', () => {
-  const running = [
-    entryFrom(mkSub({ paneId: 'w1:p1', taskId: 'run-1', status: 'running' })),
-    entryFrom(mkSub({ paneId: 'w1:p2', taskId: 'run-2', status: 'running' })),
-  ];
-  const settled = Array.from({ length: SUBS_REGISTRY_TAIL + 3 }, (_, i) =>
-    entryFrom(mkSub({ paneId: `w1:s${i}`, taskId: `settled-${i}`, status: 'closed', createdAt: i + 1, consumedAt: i + 1 })));
-
-  const snapshot = registrySnapshot([...running, ...settled]);
-  const keptRunning = snapshot.subs.filter((s) => s.status === 'running').map((s) => s.paneId);
-  assert.deepEqual(keptRunning, ['w1:p1', 'w1:p2'], 'a running worker is never pruned, however long the session');
-  const keptSettled = snapshot.subs.filter((s) => s.status !== 'running').map((s) => s.paneId);
-  assert.equal(keptSettled.length, SUBS_REGISTRY_TAIL, 'the tail is bounded');
-  assert.deepEqual(keptSettled, settled.slice(3).map((s) => s.paneId), 'the newest settled rows are the ones kept, in order');
-
-  const folded = foldSubsRegistry([{ type: 'custom', customType: SUBS_CUSTOM_TYPE, data: snapshot }]);
-  assert.deepEqual(folded.subs.map((s) => s.paneId), snapshot.subs.map((s) => s.paneId), 'a restart rebuilds the same registry');
-});
-
-test('registrySnapshot: a settled row that never reached GC still counts by when it ran', () => {
-  const rows = Array.from({ length: SUBS_REGISTRY_TAIL }, (_, i) =>
-    entryFrom(mkSub({ paneId: `w1:s${i}`, taskId: `settled-${i}`, status: 'settled', createdAt: i + 1, consumedAt: 0 })));
-  const late = entryFrom(mkSub({ paneId: 'w1:late', taskId: 'late', status: 'settled', createdAt: 99, consumedAt: null }));
-  const kept = registrySnapshot([...rows, late]).subs.map((s) => s.paneId);
-  assert.ok(kept.includes('w1:late'), 'the row that just settled is the one a caller still wants');
-  assert.ok(!kept.includes('w1:s0'), 'and the oldest one is the one that goes');
+test('task predicates: closed, spent and actionable derive from the row alone', () => {
+  const open = taskRow({ taskId: 't-open', status: 'running' });
+  assert.equal(isClosed(open), false);
+  assert.equal(isSpent(open), false);
+  assert.equal(isActionable(open), true);
+  const closed = taskRow({ taskId: 't-closed', status: 'closed', closedAt: 7 });
+  assert.equal(isClosed(closed), true);
+  assert.equal(isActionable(closed), false);
+  const spent = taskRow({
+    taskId: 't-spent', status: 'consumed', lifecycle: 'one-shot', consumedAt: 9,
+  });
+  assert.equal(isSpent(spent), true);
+  assert.equal(isActionable(spent), false);
+  const persistent = taskRow({ taskId: 't-p', status: 'consumed', consumedAt: 9 });
+  assert.equal(isSpent(persistent), false, 'a persistent worker is never spent');
+  assert.equal(isActionable(persistent), true);
 });
 
 test('Semaphore: queues past the cap, releases in order, reusable after drain', async () => {
@@ -486,114 +399,98 @@ test('subagent plugin: ledger tombstone makes the tool inert', async () => {
   await root.fiber.dispose();
 });
 
-test('subagent plugin: list answers for a task the registry already pruned, from the repository ledger', async () => {
-  // A main checkout is a directory holding `.git`; the ledger lives inside it.
-  const repo = mkdtempSync(join(tmpdir(), 'piher-list-ledger-'));
+test('subagent plugin: a reload restores the session view from the records and drops closed rows', async () => {
+  // A main checkout is a directory holding `.git`; the task directory lives inside it.
+  const repo = mkdtempSync(join(tmpdir(), 'piher-list-restore-'));
   mkdirSync(join(repo, '.git'), { recursive: true });
+  const home = new TempHome('piher-list-restore-');
   try {
-    const pruned: HistoryEntry = {
-      taskId: 'a1b2c3d4-0000-4000-8000-000000000001',
-      kind: 'task',
-      paneId: 'w1:p9',
-      tabId: 'tb9',
-      workspaceId: 'w1',
-      cwd: repo,
-      description: 'pruned worker',
-      sessionFile: null,
-      launchCommand: [],
-      status: 'closed',
-      createdAt: 5,
-      consumedAt: 6,
-    };
-    assert.deepEqual(appendLedger(repo, pruned), { ok: true });
-    // Unfinished business in the same ledger: a settled row is resumable, so it must still show.
-    assert.deepEqual(appendLedger(repo, {
-      ...pruned,
-      taskId: 'b2c3d4e5-0000-4000-8000-000000000002',
-      paneId: 'w1:p8',
-      description: 'settled worker',
-      status: 'settled',
-    }), { ok: true });
-    // The same task the registry holds, recorded once more in the ledger: the live row must win.
-    assert.deepEqual(appendLedger(repo, {
-      ...pruned,
-      taskId: 'live-1',
-      paneId: 'w1:p4',
-      description: 'stale ledger copy',
-      createdAt: 1,
-    }), { ok: true });
+    const sessionFile = join(home.dir('sessions'), '2026-01-01T00-00-00-000Z_aaaaaaaa-0000-4000-8000-000000000000.jsonl');
+    seedTaskDocuments(sessionFile, [
+      {
+        taskId: 'a1b2c3d4-0000-4000-8000-000000000001', paneId: 'w1:p9', cwd: repo,
+        description: 'pruned worker', status: 'running', closedAt: Date.now(), tabName: '',
+      },
+      // Unfinished business in the same directory: a consumed row is resumable, so it must still show.
+      {
+        taskId: 'b2c3d4e5-0000-4000-8000-000000000002', paneId: 'w1:p8', cwd: repo,
+        description: 'settled worker', status: 'settled', consumedAt: 6, tabName: '',
+      },
+      {
+        taskId: 'live-1', paneId: 'w1:p4', cwd: repo, description: 'live worker',
+        status: 'running', tabName: '',
+      },
+    ]);
     const { root, pi } = await mountSubagent({
-      // No core in a ledger-merge test: the startup zombie sweep would close the running row (its fake
+      // No core in a restore test: the startup zombie sweep would settle the running rows (its fake
       // terminal list is empty), and a live row would arm a recovery poll.
       client: { available: false },
-      subs: [subEntry({ taskId: 'live-1', paneId: 'w1:p4', cwd: repo, description: 'live worker' })],
+      deps: { getSessionFile: () => sessionFile, getCwd: () => repo },
     });
     try {
+      await fire(pi, 'session_start', { reason: 'reload' }, {});
       const text = (await runSubagent(pi, { action: 'list' }, repo)).content[0]!.text;
       assert.doesNotMatch(text, /pruned worker/, 'a closed task was a decision: it is not listed');
       assert.match(text, /w1:p8 \[idle\] \(task · persistent, settled; action send revives\) settled worker/);
       assert.match(text, /w1:p4 \[running[^\n]*live worker/);
-      assert.doesNotMatch(text, /stale ledger copy/, 'a row the registry still holds is not repeated from the ledger');
-      assert.equal(text.split('\n').filter((line) => line.includes('live worker')).length, 1);
-
-      // The ledger read is the repository's: another checkout's history cannot leak in.
-      const elsewhere = mkdtempSync(join(tmpdir(), 'piher-no-ledger-'));
-      assert.doesNotMatch((await runSubagent(pi, { action: 'list' }, elsewhere)).content[0]!.text, /pruned worker/);
     } finally {
       await root.fiber.dispose();
     }
   } finally {
+    home.dispose();
     rmSync(repo, { recursive: true, force: true });
   }
 });
 
-test('subagent plugin: a row only the ledger holds answers the ref `list` printed', async () => {
-  // A reload restores the branch's bounded tail of settled rows (S73), so a worker the master still
-  // sees in `list` can be gone from the registry. The ref list printed must still be addressable.
-  const repo = mkdtempSync(join(tmpdir(), 'piher-ledger-ref-'));
+test('subagent plugin: a restored row answers the ref `list` printed, and its close lands in the record', async () => {
+  // A reload restores the session's tasks from the view and the records, so a worker the master
+  // still sees in `list` is addressable by the ref it printed — and closing it writes `closedAt`.
+  const repo = mkdtempSync(join(tmpdir(), 'piher-record-ref-'));
   mkdirSync(join(repo, '.git'), { recursive: true });
+  const home = new TempHome('piher-record-ref-');
   try {
-    const pruned: HistoryEntry = {
-      taskId: '407ca2e0-0000-4000-8000-000000000001',
+    const sessionFile = join(home.dir('sessions'), '2026-01-02T00-00-00-000Z_bbbbbbbb-0000-4000-8000-000000000000.jsonl');
+    const taskId = '407ca2e0-0000-4000-8000-000000000001';
+    seedTaskDocuments(sessionFile, [{
+      taskId,
       kind: 'task',
       paneId: 't195',
       slug: 't2-8a-2-shared-escalatio',
       tabId: '',
-      workspaceId: '',
       cwd: repo,
       description: 'T2 8A.2 shared escalation log',
-      sessionFile: null,
-      launchCommand: [],
       status: 'consumed',
       createdAt: 5,
       consumedAt: 6,
-    };
-    assert.deepEqual(appendLedger(repo, pruned), { ok: true });
+    }]);
     const { root, pi } = await mountSubagent({
-      subs: [subEntry({ taskId: 'live-1', paneId: 'w1:p4', cwd: repo, description: 'live worker' })],
+      tasks: [taskRow({ taskId: 'live-1', paneId: 'w1:p4', cwd: repo, description: 'live worker' })],
+      deps: { getSessionFile: () => sessionFile, getCwd: () => repo },
     });
     try {
+      await fire(pi, 'session_start', { reason: 'reload' }, {});
       const listed = (await runSubagent(pi, { action: 'list' }, repo)).content[0]!.text;
-      assert.match(listed, /t2-8a-2-shared-escalatio@t195 \[idle\]/, 'list offers the ledger row');
+      assert.match(listed, /t2-8a-2-shared-escalatio@t195 \[idle\]/, 'list offers the restored row');
       // The combined ref spawn prints is what a master copies back, and it used to answer "unknown".
       const closed = await runSubagent(pi, { action: 'close', agentId: 't2-8a-2-shared-escalatio@t195' }, repo);
       assert.match(closed.content[0]!.text, /Subagent t2-8a-2-shared-escalatio@t195 closed/);
-      assert.equal(readLedger(repo).filter((r) => r.taskId === pruned.taskId && r.status === 'closed').length, 1,
-        'the decision lands in the ledger');
+      const record = readTaskRecord(repo, taskId);
+      assert.ok(record && record.closedAt !== null, 'the decision lands in the record');
       // The bare pane id is the other form the master reached for.
       const again = await runSubagent(pi, { action: 'close', agentId: 't195' }, repo);
-      assert.match(again.content[0]!.text, /already closed/, 'the adopted row now answers by pane id too');
+      assert.match(again.content[0]!.text, /already closed/, 'the restored row now answers by pane id too');
     } finally {
       await root.fiber.dispose();
     }
   } finally {
+    home.dispose();
     rmSync(repo, { recursive: true, force: true });
   }
 });
 
 test('subagent plugin: tool_result hook only rewrites our errors, and stays silent for a dead pane', async () => {
   const { root, pi } = await mountSubagent({
-    subs: [subEntry({ paneId: 'w1:p2', cwd: '/tmp', description: 'dead worker', createdAt: 1 })],
+    tasks: [taskRow({ paneId: 'w1:p2', cwd: '/tmp', description: 'dead worker', createdAt: 1 })],
   });
   const hook = (pi.listeners.get('tool_result') ?? [])[0]!;
   const call = (event: Record<string, unknown>) => hook(event) as Promise<unknown>;
@@ -632,52 +529,62 @@ test('subagent plugin: help returns the manual, and a missing action normalizes 
   await root.fiber.dispose();
 });
 
-test('subagent plugin: close records the decision even when the registry is already closed', async () => {
-  // A registry row can be closed while the ledger trails off at `consumed`: the project's history
-  // should still say who ended it, or the row looks like work that stopped by itself.
+test('subagent plugin: close records the decision even when the memory row is already closed', async () => {
+  // A memory row can be closed while the record trails off at `consumed`: the record should still
+  // say who ended it, or the row looks like work that stopped by itself.
   const repo = mkdtempSync(join(tmpdir(), 'piher-close-idem-'));
   mkdirSync(join(repo, '.git'), { recursive: true });
-  appendLedger(repo, {
-    taskId: 'task-idem', description: 'already closed', status: 'consumed', paneId: 'pGone',
-    createdAt: 1, consumedAt: 2, via: 'pipe-reply', kind: 'worker', cwd: repo,
-    tabId: 't1', tabName: 'w', lifecycle: 'persistent',
-  } as unknown as HistoryEntry);
-  const { root, pi } = await mountSubagent({
-    client: { listTerminals: async () => [] },
-    subs: [subEntry({ paneId: 'pGone', taskId: 'task-idem', cwd: repo, status: 'closed' })],
-  });
   try {
-    const res = await runSubagent(pi, { action: 'close', agentId: 'task-idem' }, repo);
-    assert.match(res.content[0]!.text, /already closed/);
-    const rows = readLedger(repo).filter((row) => row.taskId === 'task-idem');
-    assert.equal(rows.at(-1)!.status, 'closed', 'the ledger now records the decision');
+    seedTaskDocuments(null, [{
+      taskId: 'task-idem', description: 'already closed', status: 'consumed', paneId: 'pGone',
+      createdAt: 1, consumedAt: 2, kind: 'worker', cwd: repo,
+      tabId: 't1', tabName: 'w', lifecycle: 'persistent',
+    }]);
+    const { root, pi } = await mountSubagent({
+      client: { listTerminals: async () => [] },
+      tasks: [taskRow({ paneId: 'pGone', taskId: 'task-idem', cwd: repo, status: 'closed' })],
+    });
+    try {
+      const res = await runSubagent(pi, { action: 'close', agentId: 'task-idem' }, repo);
+      assert.match(res.content[0]!.text, /already closed/);
+      const record = readTaskRecord(repo, 'task-idem');
+      assert.ok(record && record.closedAt !== null, 'the record now carries the decision');
+    } finally {
+      await root.fiber.dispose();
+    }
   } finally {
-    await root.fiber.dispose();
     rmSync(repo, { recursive: true, force: true });
   }
 });
 
 test('subagent plugin: a task closed in another session does not come back as settled', async () => {
-  // The branch snapshot a session restores can be older than the ledger; the ledger is append-only, so
-  // its last row is the newest word. Without this the row a master closed yesterday keeps offering
-  // `action send revives` in every new session of that project.
-  const cwd = mkdtempSync(join(tmpdir(), 'piher-closed-ledger-'));
+  // The restore reads the view, then each referenced record: a record that says closed retires its
+  // memory row. Without this the row a master closed yesterday keeps offering `action send revives`
+  // in every new session of that project.
+  const cwd = mkdtempSync(join(tmpdir(), 'piher-closed-record-'));
   mkdirSync(join(cwd, '.git'), { recursive: true });
-  appendLedger(cwd, {
-    taskId: 'task-closed', description: 'already handled', status: 'closed', paneId: 'pGone',
-    createdAt: Date.now() - 60_000, closedAt: Date.now() - 30_000, via: 'close', kind: 'worker',
-    cwd, tabId: 't1', tabName: 'w', lifecycle: 'persistent',
-  } as unknown as HistoryEntry);
-  const { root, pi } = await mountSubagent({
-    client: { listTerminals: async () => [] },
-    // The session restored a settled copy of the same task from its branch.
-    subs: [subEntry({ paneId: 'pGone', taskId: 'task-closed', tabId: 't1', tabName: 'w', status: 'settled' })],
-  });
+  const home = new TempHome('piher-closed-record-');
   try {
-    const res = await runSubagent(pi, { action: 'list' }, cwd);
-    assert.doesNotMatch(res.content[0]!.text, /already handled/, 'a closed task is not offered again');
+    const sessionFile = join(home.dir('sessions'), '2026-01-03T00-00-00-000Z_cccccccc-0000-4000-8000-000000000000.jsonl');
+    seedTaskDocuments(sessionFile, [{
+      taskId: 'task-closed', description: 'already handled', status: 'running', paneId: 'pGone',
+      createdAt: Date.now() - 60_000, closedAt: Date.now() - 30_000, kind: 'worker',
+      cwd, tabId: 't1', tabName: 'w', lifecycle: 'persistent',
+    }]);
+    const { root, pi } = await mountSubagent({
+      client: { listTerminals: async () => [] },
+      // The session holds a settled copy of the same task; the restore retires it from the record.
+      tasks: [taskRow({ paneId: 'pGone', taskId: 'task-closed', tabId: 't1', tabName: 'w', status: 'settled', cwd })],
+      deps: { getSessionFile: () => sessionFile, getCwd: () => cwd },
+    });
+    try {
+      const res = await runSubagent(pi, { action: 'list' }, cwd);
+      assert.doesNotMatch(res.content[0]!.text, /already handled/, 'a closed task is not offered again');
+    } finally {
+      await root.fiber.dispose();
+    }
   } finally {
-    await root.fiber.dispose();
+    home.dispose();
     rmSync(cwd, { recursive: true, force: true });
   }
 });
@@ -692,10 +599,12 @@ test('subagent plugin: close reclaims a running row whose pane is already gone',
       kill: async (id: string) => { retired.push(id); },
       remove: async (id: string) => { retired.push(id); },
     },
-    subs: [subEntry({ paneId: 'pZombie', taskId: 'task-zombie', tabId: 't1', tabName: 'w', status: 'running' })],
+    tasks: [taskRow({ paneId: 'pZombie', taskId: 'task-zombie', tabId: 't1', tabName: 'w', status: 'running' })],
   });
   try {
-    const res = await runSubagent(pi, { action: 'close', agentId: 'pZombie' });
+    // Outside any repository the decision has nowhere to land, so the test checkout stays clean.
+    const cwd = mkdtempSync(join(tmpdir(), 'piher-close-cwd-'));
+    const res = await runSubagent(pi, { action: 'close', agentId: 'pZombie' }, cwd);
     assert.match(res.content[0]!.text, /closed — pane and tab gone/);
     assert.deepEqual(retired, ['pZombie', 'pZombie'], 'the dead pane is still retired best-effort');
   } finally {
@@ -709,7 +618,7 @@ test('subagent plugin: send to a live pane with a dead pipe fails fast and says 
   // while the message never arrived (a real session spent 92 s on it, twice).
   const { root, pi } = await mountSubagent({
     client: { getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'working' }) },
-    subs: [subEntry({ paneId: 't-dead-pipe', taskId: 'task-dead-pipe', status: 'running', cwd: '/test/no-pipe' })],
+    tasks: [taskRow({ paneId: 't-dead-pipe', taskId: 'task-dead-pipe', status: 'running', cwd: '/test/no-pipe' })],
   });
   try {
     const startedAt = Date.now();
@@ -734,7 +643,7 @@ test('subagent plugin: retry re-sends the stored prompt instead of asking the ma
     assert.equal(readTaskPrompt(taskId), 'the original brief');
     const { root, pi } = await mountSubagent({
       client: { getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'idle' }) },
-      subs: [subEntry({ paneId: 't-retry', taskId, status: 'running', cwd: '/test/no-pipe' })],
+      tasks: [taskRow({ paneId: 't-retry', taskId, status: 'running', cwd: '/test/no-pipe' })],
     });
     try {
       // No pipe server behind that cwd: the send path reports the dead channel, which proves the stored
@@ -763,7 +672,7 @@ test('subagent plugin: retry on a spent one-shot spawns the same brief instead o
     saveTaskPrompt(taskId, 'the review brief');
     const { root, pi } = await mountSubagent({
       client: { available: false },
-      subs: [subEntry({
+      tasks: [taskRow({
         paneId: 't-shot', taskId, status: 'consumed', lifecycle: 'one-shot', kind: 'reviewer',
         description: 'review X', cwd: '/test/checkout',
       })],
@@ -790,7 +699,7 @@ test('subagent plugin: retry works from a closed row too, by starting a new work
     saveTaskPrompt(taskId, 'a brief');
     const { root, pi } = await mountSubagent({
       client: { available: false },
-      subs: [subEntry({ paneId: 't-closed', taskId, status: 'closed', kind: 'reviewer', description: 'review Y' })],
+      tasks: [taskRow({ paneId: 't-closed', taskId, status: 'closed', kind: 'reviewer', description: 'review Y' })],
     });
     try {
       const text = await runSubagentRejects(pi, { action: 'retry', agentId: 't-closed' });
@@ -808,6 +717,8 @@ test('subagent plugin: retry works from a closed row too, by starting a new work
 test('subagent plugin: close reclaims a running row whose pane has no turn in flight', async () => {
   // A settlement the poller missed leaves the row `running` while the agent is idle: refusing the
   // close then strands the task forever, and `interrupt` cannot help because there is no turn to stop.
+  const repo = mkdtempSync(join(tmpdir(), 'piher-close-repo-'));
+  mkdirSync(join(repo, '.git'), { recursive: true });
   for (const status of ['idle', 'done', 'error'] as const) {
     const retired: string[] = [];
     const { root, pi } = await mountSubagent({
@@ -816,16 +727,17 @@ test('subagent plugin: close reclaims a running row whose pane has no turn in fl
         kill: async (id: string) => { retired.push(id); },
         remove: async (id: string) => { retired.push(id); },
       },
-      subs: [subEntry({ paneId: 'p-idle', taskId: 'task-idle', status: 'running', consumedAt: null })],
+      tasks: [taskRow({ paneId: 'p-idle', taskId: 'task-idle', status: 'running', consumedAt: null, cwd: repo })],
     });
     try {
-      const res = await runSubagent(pi, { action: 'close', agentId: 'p-idle' });
+      const res = await runSubagent(pi, { action: 'close', agentId: 'p-idle' }, repo);
       assert.match(res.content[0]!.text, /closed — pane and tab gone/, `status ${status} must be closable`);
-      assert.equal(subsSnapshot(pi)!.subs.find((s) => s.paneId === 'p-idle')?.status, 'closed');
+      assert.ok(readTaskRecord(repo, 'task-idle')?.closedAt !== null, 'the record carries the decision');
     } finally {
       await root.fiber.dispose();
     }
   }
+  rmSync(repo, { recursive: true, force: true });
 });
 
 test('subagent plugin: close refuses a running worker with a pointer at interrupt', async () => {
@@ -838,7 +750,7 @@ test('subagent plugin: close refuses a running worker with a pointer at interrup
       kill: async (id: string) => { retired.push(`kill:${id}`); },
       remove: async (id: string) => { retired.push(`remove:${id}`); },
     },
-    subs: [subEntry({ paneId: 'p-busy', taskId: 'task-busy', status: 'running', consumedAt: null })],
+    tasks: [taskRow({ paneId: 'p-busy', taskId: 'task-busy', status: 'running', consumedAt: null })],
   });
   try {
     assert.match(await runSubagentRejects(pi, { action: 'close', agentId: 'p-busy' }), /still running[\s\S]*interrupt/);
@@ -852,9 +764,9 @@ test('subagent plugin: interrupt names the way back for a settled and for a clos
   const { root, pi } = await mountSubagent({
     // Both refusals happen before anything touches a pane: no pipe, no core calls.
     client: { available: false },
-    subs: [
-      subEntry({ paneId: 'p-settled', taskId: 'task-settled', status: 'settled', consumedAt: 1 }),
-      subEntry({ paneId: 'p-closed', taskId: 'task-closed', status: 'closed' }),
+    tasks: [
+      taskRow({ paneId: 'p-settled', taskId: 'task-settled', status: 'settled', consumedAt: 1 }),
+      taskRow({ paneId: 'p-closed', taskId: 'task-closed', status: 'closed' }),
     ],
   });
   try {
@@ -877,17 +789,19 @@ test('subagent plugin: close reclaims a finished worker and keeps its task resum
       kill: async (id: string) => { retired.push(`kill:${id}`); },
       remove: async (id: string) => { retired.push(`remove:${id}`); },
     },
-    subs: [subEntry({ paneId: 'p-done', taskId: 'task-done', status: 'consumed', consumedAt: 5 })],
+    tasks: [taskRow({ paneId: 'p-done', taskId: 'task-done', status: 'consumed', consumedAt: 5 })],
   });
   try {
-    const closed = await runSubagent(pi, { action: 'close', agentId: 'p-done' });
+    // Outside any repository the decision has nowhere to land, so the test checkout stays clean.
+    const cwd = mkdtempSync(join(tmpdir(), 'piher-close-cwd-'));
+    const closed = await runSubagent(pi, { action: 'close', agentId: 'p-done' }, cwd);
     assert.match(closed.content[0]!.text, /p-done.*closed/);
     assert.match(closed.content[0]!.text, /resume/);
     assert.deepEqual(retired, ['kill:p-done', 'remove:p-done'], 'the kill+rm pair the GC uses: pane and tab go');
-    assert.equal(closed.details?.taskId, 'task-done', 'the ledger row keeps the taskId, so resume can revive it');
+    assert.equal(closed.details?.taskId, 'task-done', 'the record keeps the taskId, so resume answers from it');
 
     // Closing an already-closed row is a no-op, with the way back spelled out.
-    const again = await runSubagent(pi, { action: 'close', agentId: 'p-done' });
+    const again = await runSubagent(pi, { action: 'close', agentId: 'p-done' }, cwd);
     assert.match(again.content[0]!.text, /already closed/);
     assert.deepEqual(retired, ['kill:p-done', 'remove:p-done']);
   } finally {
@@ -896,7 +810,7 @@ test('subagent plugin: close reclaims a finished worker and keeps its task resum
 });
 
 test('subagent plugin: list shows every row with its live state', async () => {
-  const worker = (paneId: string, taskId: string, description: string): SubEntry => subEntry({
+  const worker = (paneId: string, taskId: string, description: string): TaskEntry => taskRow({
     paneId, taskId, tabId: 't-1', tabName: '', cwd: '/workspace/repo', description, createdAt: 1,
   });
   const { root, pi } = await mountSubagent({
@@ -904,7 +818,7 @@ test('subagent plugin: list shows every row with its live state', async () => {
       available: false, // keeps the session-recovery pollers out of a rendering-only test
       getTerminal: async (id) => terminalInfo({ id, status: 'working', labels: { 'herdr.tab': 't-1' } }),
     },
-    subs: [worker('p-1', 'task-1', 'Worker 1'), worker('p-2', 'task-2', 'Worker 2')],
+    tasks: [worker('p-1', 'task-1', 'Worker 1'), worker('p-2', 'task-2', 'Worker 2')],
   });
   try {
     const lines = (await runSubagent(pi, { action: 'list' })).content[0]!.text.split('\n');
@@ -917,47 +831,38 @@ test('subagent plugin: list shows every row with its live state', async () => {
 
 /* ── Phase 2 task slugs (RFC rfc-delegation-identity §3.1) ──────── */
 
-test('slugifyTask / allocateSubSlug / subRef: kebab-case, non-ASCII fallback, dedupe, display form', () => {
+test('slugifyTask / allocateTaskSlug / taskRef: kebab-case, non-ASCII fallback, dedupe, display form', () => {
   const CJK = '\u4e2d\u6587'; // a non-ASCII (CJK) word: wide glyphs, no ASCII letters
   assert.equal(slugifyTask('Fix Auth Flow!'), 'fix-auth-flow');
   assert.equal(slugifyTask('  read--me  '), 'read-me');
   assert.equal(slugifyTask('a'.repeat(40)), 'a'.repeat(24), 'slug caps at 24 chars');
   assert.equal(slugifyTask(CJK), '', 'non-ASCII words sanitize to nothing');
   const taken = new Set(['fix-auth']);
-  assert.equal(allocateSubSlug('fix auth', 'taskid', taken), 'fix-auth-2');
-  assert.equal(allocateSubSlug('fix auth', 'taskid', new Set(['fix-auth', 'fix-auth-2'])), 'fix-auth-3');
-  assert.equal(allocateSubSlug(CJK, '9faaa0e5-rest', new Set()), 'task-9faaa0', 'non-ASCII falls back to a taskId prefix');
-  assert.equal(subRef({ paneId: 'p2', slug: 'fix-auth' }), 'fix-auth@p2');
-  assert.equal(subRef({ paneId: 'p2' }), 'p2', 'slug-less rows keep the bare paneId (back-compat)');
+  assert.equal(allocateTaskSlug('fix auth', 'taskid', taken), 'fix-auth-2');
+  assert.equal(allocateTaskSlug('fix auth', 'taskid', new Set(['fix-auth', 'fix-auth-2'])), 'fix-auth-3');
+  assert.equal(allocateTaskSlug(CJK, '9faaa0e5-rest', new Set()), 'task-9faaa0', 'non-ASCII falls back to a taskId prefix');
+  assert.equal(taskRef({ paneId: 'p2', slug: 'fix-auth' }), 'fix-auth@p2');
+  assert.equal(taskRef({ paneId: 'p2', slug: '' }), 'p2', 'slug-less rows keep the bare paneId (back-compat)');
 });
 
-test('foldSubsRegistry: slug parses, survives replay, and old rows without it stay undefined', () => {
-  const entries = [
-    { type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { version: 2, subs: [{ paneId: 'p2', taskId: 't1' }] } },
-    { type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { version: 2, subs: [{ paneId: 'p2', taskId: 't1', slug: 'fix-auth' }, { paneId: 'p3', taskId: 't2' }] } },
-  ];
-  const registry = foldSubsRegistry(entries);
-  assert.equal(registry.subs.find((s) => s.paneId === 'p2')?.slug, 'fix-auth');
-  assert.equal(registry.subs.find((s) => s.paneId === 'p3')?.slug, undefined);
-});
 
-test('subagent plugin: a closed registry row is not resurrected from the ledger', async () => {
-  // The merge used to drop closed rows before it looked for registry knowledge, so the ledger brought
-  // the task straight back as `consumed` — a close that never took effect on screen.
+test('subagent plugin: a closed memory row is not resurrected from its record', async () => {
+  // The restore seeds only unresolved rows, so a record left at `consumed` never brings back a
+  // task the master already ended — a close that never took effect on screen.
   const repo = mkdtempSync(join(tmpdir(), 'piher-no-resurrect-'));
   mkdirSync(join(repo, '.git'), { recursive: true });
-  appendLedger(repo, {
+  seedTaskDocuments(null, [{
     taskId: 'task-ended', description: 'ended worker', status: 'consumed', paneId: 'pGone',
-    createdAt: 10, consumedAt: 20, via: 'pipe-reply', kind: 'worker', cwd: repo,
+    createdAt: 10, consumedAt: 20, kind: 'worker', cwd: repo,
     tabId: 't1', tabName: 'w', lifecycle: 'persistent',
-  } as unknown as HistoryEntry);
+  }]);
   const { root, pi } = await mountSubagent({
     client: { listTerminals: async () => [] },
-    subs: [subEntry({ paneId: 'pGone', taskId: 'task-ended', cwd: repo, status: 'closed' })],
+    tasks: [taskRow({ paneId: 'pGone', taskId: 'task-ended', cwd: repo, status: 'closed' })],
   });
   try {
     const text = (await runSubagent(pi, { action: 'list' }, repo)).content[0]!.text;
-    assert.doesNotMatch(text, /ended worker/, 'closed is closed, whatever the ledger still holds');
+    assert.doesNotMatch(text, /ended worker/, 'closed is closed, whatever the record still holds');
   } finally {
     await root.fiber.dispose();
     rmSync(repo, { recursive: true, force: true });

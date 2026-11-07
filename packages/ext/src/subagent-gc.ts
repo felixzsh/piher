@@ -1,5 +1,5 @@
 /**
- * Subagent board hygiene: registry projection + recovery and terminal collection. Predicates live in
+ * Subagent board hygiene: task restore + recovery and terminal collection. Predicates live in
  * gc-core.ts; this adapter owns core kill/remove I/O and the ticker.
  */
 import type { Context } from '@deepseek-ai/cordis';
@@ -18,14 +18,14 @@ import type { SettlementCard } from './settlement-card.ts';
 import { checkoutSpaceId, type CheckoutSpace } from './worktree.ts';
 import { trace, traceRole } from './trace.ts';
 import { sessionStatePath } from './session-state.ts';
-import { REGISTRY_FILE_NAME, readRegistryFile, seedRegistryFile, writeRegistryFile } from './subagent-registry-file.ts';
 import { pipeRequestTo } from './pipe-channel.ts';
 import { runtimePolicy } from './runtime-policy.ts';
-import { swallow } from './swallow.ts';
-import { foldSubsRegistry, registrySnapshot, sleep, SUBS_CUSTOM_TYPE, type SubEntry } from './subagent-core.ts';
+import { sleep } from './subagent-core.ts';
+import { isClosed, type TaskEntry, type TaskRow } from './task-row.ts';
+import { readTaskRecord, readTaskView, seedTaskView, TASK_VIEW_NAME } from './task-store.ts';
 import type { PaneStateSlot } from './plugins/bg-job.ts';
 
-/* ── registry projection + recovery ─────────────────────────────── */
+/* ── task restore + recovery ─────────────────────────────── */
 
 /** S53: `terminal.kill` then `terminal.rm` — the app closes the pane, and its tab goes with the last
  *  terminal. A terminal that already exited is not an error, and neither is one core reaped itself. */
@@ -37,118 +37,94 @@ export async function retirePane(
   try { await client.remove(paneId); } catch { /* core reaps finished terminals */ }
 }
 
-interface SubagentRegistryHost {
-  pi: { appendEntry?: (customType: string, data: unknown) => void };
+export interface TaskBoardHost {
   client: CoreClientLike;
-  subs: Map<string, SubEntry>;
-  writeHistory: (entry: SubEntry, patch?: { status?: SubEntry['status']; closedAt?: number }, via?: string) => void;
-  /** `<sessionDir>/piher/<sessionId>/registry.json`, or null when this session has nowhere to sit. */
-  registryFile: () => string | null;
+  tasks: Map<string, TaskEntry>;
+  panes: Map<string, string>;
+  writeRecord(entry: TaskEntry): void;
+  /** Repository the restore reads records from (the session's own checkout). */
+  restoreCwd: () => string;
+  /** This session's transcript path; null when it has none (S25: the view stays in memory). */
+  sessionFile: () => string | null;
+  /** In-memory view: the task ids this session delegated, in order. */
+  viewIds: string[];
 }
 
-interface SubagentRegistry {
-  /** Replace the registry document; an unchanged registry is not rewritten. */
-  persist(): void;
-  rebuild(eventCtx: unknown, via?: string): void;
-  /** A fork inherits the state it branched from; pi names the previous transcript. */
-  seed(previousSessionFile: string | null | undefined): void;
-  sweepZombieRunning(): Promise<void>;
+/** Seed one memory entry from its record. Unresolved rows arrive running when no report was
+ *  delivered yet, consumed when it was — so the recovery never re-arms a settled row. */
+function seedEntryFromRow(host: Pick<TaskBoardHost, 'tasks' | 'panes'>, row: TaskRow): void {
+  if (isClosed(row) || host.tasks.has(row.taskId)) return;
+  const entry: TaskEntry = {
+    ...row,
+    gen: { ...row.gen },
+    ...(row.worktree ? { worktree: { ...row.worktree } } : {}),
+    status: row.gen.consumedAt !== null ? 'consumed' : 'running',
+  };
+  host.tasks.set(row.taskId, entry);
+  if (row.gen.paneId) host.panes.set(row.gen.paneId, row.taskId);
 }
 
-export function createSubagentRegistry(host: SubagentRegistryHost): SubagentRegistry {
-  let lastSnapshot = '';
-
-  function persist(): void {
-    try {
-      const file = host.registryFile();
-      // `null` tail: the file keeps every row. Nothing addressable may be dropped on the way to disk —
-      // the whole point of leaving the session branch (S73 bounded that copy to ten settled rows).
-      const registry = file
-        ? registrySnapshot(host.subs.values(), null)
-        // A session with no transcript directory (a bare `PI_SESSION_FILE=oneshot-sess-0001` id) has
-        // nowhere to put a file, so the branch entry stays the durable copy and keeps its old bound:
-        // such a session is one process, and a reload of it is the process ending.
-        : registrySnapshot(host.subs.values());
-      const snapshot = JSON.stringify(registry);
-      if (snapshot === lastSnapshot) return;
-      if (file) writeRegistryFile(file, registry);
-      else host.pi.appendEntry?.(SUBS_CUSTOM_TYPE, registry);
-      lastSnapshot = snapshot;
-    } catch (err) {
-      // Session logging must not break delegation; a silent failure here shows up as a ghost running row.
-      swallow('subagent.persist-subs', err);
-    }
-  }
-
-  /** Load the registry: the session's own document when there is one, else replay the branch what a
-   *  session written by an older build left there. The file is authoritative and skips the branch
-   *  scan entirely, which is also what keeps a reload cheap. */
-  function rebuild(eventCtx: unknown, via = 'branch'): void {
-    try {
-      const before = host.subs.size;
-      const file = host.registryFile();
-      const fromFile = readRegistryFile(file);
-      if (fromFile) {
-        for (const entry of fromFile.subs) host.subs.set(entry.paneId, entry);
-        lastSnapshot = ''; // the file is the truth now; force the next persist to rewrite it
-        trace(traceRole, 'registry-rebuild', {
-          via,
-          source: 'file',
-          before,
-          restored: fromFile.subs.length,
-          rows: host.subs.size,
-        });
-        return;
+/**
+ * Restore on `session_start` (and `session_tree`): read the view, then each referenced record,
+ * drop closed rows, seed memory. Additive: rows this session already holds are kept, and a
+ * record that now says closed retires its memory row so every surface drops it. A record the
+ * session's own repository does not hold reads as "no record" (S6) and is skipped.
+ */
+export function restoreTasks(host: TaskBoardHost, via = 'session_start', cwd?: string): void {
+  try {
+    const ids = readTaskView(host.sessionFile());
+    if (ids) for (const id of ids) if (!host.viewIds.includes(id)) host.viewIds.push(id);
+    const repo = cwd ?? host.restoreCwd();
+    let restored = 0;
+    for (const taskId of [...host.viewIds]) {
+      const row = readTaskRecord(repo, taskId);
+      if (!row) continue;
+      const known = host.tasks.get(taskId);
+      if (isClosed(row)) {
+        if (known) known.status = 'closed';
+        continue;
       }
-      const entries = (eventCtx as { sessionManager?: { getBranch?: () => readonly unknown[] } })
-        ?.sessionManager?.getBranch?.() ?? [];
-      const registry = foldSubsRegistry(entries as Parameters<typeof foldSubsRegistry>[0]);
-      for (const entry of registry.subs) host.subs.set(entry.paneId, entry);
-      lastSnapshot = ''; // branch replay replaced live state; force the next persist
-      // `before` is what tells the two regimes apart: a positive count means the same instance kept
-      // its rows and the fold is additive, while `before=0` is a reload — a NEW instance whose whole
-      // memory was the branch snapshot, the case that used to drop rows older than the tail (S73).
-      trace(traceRole, 'registry-rebuild', {
-        via,
-        source: 'branch',
-        before,
-        restored: registry.subs.length,
-        rows: host.subs.size,
-      });
-    } catch {
-      /* registry recovery failure must not block the live session */
+      if (!known) {
+        seedEntryFromRow(host, row);
+        restored += 1;
+      }
     }
+    trace(traceRole, 'tasks-restore', { via, view: host.viewIds.length, restored, rows: host.tasks.size });
+  } catch {
+    /* recovery failure must not block the live session */
   }
+}
 
-  function seed(previousSessionFile: string | null | undefined): void {
-    const to = host.registryFile();
-    const from = sessionStatePath(previousSessionFile ?? null, REGISTRY_FILE_NAME);
-    if (!seedRegistryFile(to, from)) return;
-    trace(traceRole, 'registry-seed', { from: from ?? null, to: to ?? null });
+/**
+ * A fork inherits the state it branched from: copy the parent's view document once, before the
+ * restore reads it. Records are shared, not copied: the fork continues the same tasks.
+ */
+export function seedForkView(sessionFile: string | null, previousSessionFile: string | null | undefined): void {
+  const to = sessionStatePath(sessionFile ?? null, TASK_VIEW_NAME);
+  const from = sessionStatePath(previousSessionFile ?? null, TASK_VIEW_NAME);
+  if (!seedTaskView(to, from)) return;
+  trace(traceRole, 'tasks-seed', { from: from ?? null, to: to ?? null });
+}
+
+/** Startup sweep: a row still marked running whose pane core no longer lists is not running —
+ *  but nothing ended it. A vanished pane is unfinished work, and unfinished work is what
+ *  `resume` exists for. Only `close` may write `closed`. */
+export async function sweepZombieTasks(
+  host: Pick<TaskBoardHost, 'client' | 'tasks' | 'writeRecord'>,
+): Promise<void> {
+  if (!host.client.available || host.tasks.size === 0) return;
+  let liveTerminalIds: ReadonlySet<string>;
+  try {
+    liveTerminalIds = new Set((await host.client.listTerminals()).map((terminal) => terminal.id));
+  } catch {
+    return; // do not close agents when the liveness lookup itself failed
   }
-
-  async function sweepZombieRunning(): Promise<void> {
-    if (!host.client.available || host.subs.size === 0) return;
-    let liveTerminalIds: ReadonlySet<string>;
-    try {
-      liveTerminalIds = new Set((await host.client.listTerminals()).map((terminal) => terminal.id));
-    } catch {
-      return; // do not close agents when the liveness lookup itself failed
-    }
-    let changed = false;
-    for (const [paneId, entry] of host.subs) {
-      if (entry.status !== 'running' || liveTerminalIds.has(paneId)) continue;
-      // Its pane is gone, so it is not running — but nothing ended it: a vanished pane is unfinished
-      // work, and unfinished work is what `resume` exists for. Only `close` may write `closed`.
-      entry.status = 'settled';
-      host.writeHistory(entry, { status: 'settled' }, 'zombie-sweep');
-      trace(traceRole, 'gc-release', { pane: entry.paneId, via: 'zombie-sweep', taskId: entry.taskId });
-      changed = true;
-    }
-    if (changed) persist();
+  for (const entry of host.tasks.values()) {
+    if (entry.status !== 'running' || (entry.gen.paneId && liveTerminalIds.has(entry.gen.paneId))) continue;
+    entry.status = 'settled';
+    host.writeRecord(entry);
+    trace(traceRole, 'gc-release', { pane: entry.gen.paneId, via: 'zombie-sweep', taskId: entry.taskId });
   }
-
-  return { persist, rebuild, seed, sweepZombieRunning };
 }
 
 /* ── GC ─────────────────────────────────────────────────────────── */
@@ -156,9 +132,9 @@ export function createSubagentRegistry(host: SubagentRegistryHost): SubagentRegi
 interface GcHost {
   client: CoreClientLike;
   env: CoreEnv | null;
-  subs: Map<string, SubEntry>;
-  persistSubs(): void;
-  writeHistory(e: SubEntry, patch?: { outcome?: string | null; status?: SubEntry['status']; closedAt?: number }, via?: string): void;
+  tasks: Map<string, TaskEntry>;
+  panes: Map<string, string>;
+  writeRecord(e: TaskEntry): void;
   terminalState: PaneStateSlot;
   noticePending?: () => ReadonlySet<string>;
   /** The app's window on a checkout. Closing it ends the terminals inside, so only an empty one goes. */
@@ -184,12 +160,12 @@ export function createGcController(h: GcHost): GcController {
   /** A checkout's space is nobody else's to sweep: close it when empty, and remind the master once
    *  about the window a finished-but-open worker left behind. Never ends a task, never ends a pane. */
   async function sweepCheckoutSpaces(ttlMs: number): Promise<void> {
-    const rows: CheckoutRowLike[] = [...h.subs.values()]
+    const rows: CheckoutRowLike[] = [...h.tasks.values()]
       .filter((e) => e.worktree?.path)
       .map((e) => ({
         kind: e.kind,
         status: e.status,
-        consumedAt: e.consumedAt ?? null,
+        consumedAt: e.gen.consumedAt ?? null,
         worktreePath: e.worktree?.path ?? null,
       }));
     if (rows.length === 0) return;
@@ -198,14 +174,14 @@ export function createGcController(h: GcHost): GcController {
       await h.checkoutSpace?.close(checkoutSpaceId(path)).catch(() => null);
     }
     for (const { path, since } of sweep.remind) {
-      const idle = [...h.subs.values()].filter((e) => e.worktree?.path === path);
+      const idle = [...h.tasks.values()].filter((e) => e.worktree?.path === path);
       const notice = formatIdleCheckoutNotice({
         name: basename(path),
         minutes: Math.round(ttlMs / 60000),
-        panes: idle.map((e) => e.paneId),
+        panes: idle.map((e) => e.gen.paneId),
       });
       try {
-        await h.deliverNotice?.(notice, idle[0]?.paneId);
+        await h.deliverNotice?.(notice, idle[0]?.gen.paneId);
       } catch {
         continue; // refused (master mid-turn): the next tick retries the same reminder
       }
@@ -214,7 +190,7 @@ export function createGcController(h: GcHost): GcController {
   }
 
   async function gcPass(): Promise<void> {
-    if (h.subs.size === 0) return;
+    if (h.tasks.size === 0) return;
     const ttlMs = runtimePolicy.sessionTtlSeconds * 1000;
     const autoCloseTabs = ttlMs > 0;
     // The periodic pass reads the children snapshot instead of listing terminals every tick; a
@@ -229,22 +205,22 @@ export function createGcController(h: GcHost): GcController {
     // shows a desync (`hc` sees `done`, the row still says `running`).
     trace(traceRole, 'gc-view', {
       panes: terminals.length,
-      running: [...h.subs.values()]
+      running: [...h.tasks.values()]
         .filter((e) => e.status === 'running')
         .slice(0, 8)
-        .map((e) => `${e.paneId}:${statuses.get(e.paneId) ?? 'absent'}`)
+        .map((e) => `${e.gen.paneId}:${statuses.get(e.gen.paneId) ?? 'absent'}`)
         .join(','),
       watch: watch.connected,
     });
     const termPaneIds = h.terminalState.activePaneIds();
     const pendingNoticeIds = h.noticePending?.() ?? new Set<string>();
 
-    const byTab = new Map<string, SubEntry[]>();
-    for (const e of h.subs.values()) {
-      if (!e.tabId) continue;
-      const arr = byTab.get(e.tabId) ?? [];
+    const byTab = new Map<string, TaskEntry[]>();
+    for (const e of h.tasks.values()) {
+      if (!e.gen.tabId) continue;
+      const arr = byTab.get(e.gen.tabId) ?? [];
       arr.push(e);
-      byTab.set(e.tabId, arr);
+      byTab.set(e.gen.tabId, arr);
     }
     const mainTabId = (await h.client.placementLabels())['herdr.tab'] ?? '';
 
@@ -254,11 +230,11 @@ export function createGcController(h: GcHost): GcController {
      * that stamped `closed` used to be undone by `send` reviving it, which is exactly the coupling
      * that made "close is final" contradictory.
      */
-    const releaseRow = (e: SubEntry): void => {
+    const releaseRow = (e: TaskEntry): void => {
       if (e.status !== 'running') return;
       e.status = 'settled';
-      h.writeHistory(e, { status: 'settled' }, 'gc');
-      trace(traceRole, 'gc-release', { pane: e.paneId, via: 'gc', taskId: e.taskId });
+      h.writeRecord(e);
+      trace(traceRole, 'gc-release', { pane: e.gen.paneId, via: 'gc', taskId: e.taskId });
     };
     /** The pair `close` and a one-shot settlement use as well. */
     const retire = (id: string): Promise<void> => retirePane(h.client, id);
@@ -272,7 +248,7 @@ export function createGcController(h: GcHost): GcController {
       }
       if (!autoCloseTabs) continue;
       if (!shouldCloseTaskTab({
-        entries,
+        entries: entries.map((e) => ({ kind: e.kind, status: e.status, consumedAt: e.gen.consumedAt })),
         paneStatuses: tabTerminals.map((t) => t.status),
         ttlMs,
         now: Date.now(),
@@ -285,60 +261,59 @@ export function createGcController(h: GcHost): GcController {
     }
 
     const closableTaskTabIds = new Set([...byTab.keys()].filter((t) => t !== mainTabId));
-    const candidates = [...h.subs.values()].filter(
-      (e) => e.status === 'consumed' && !(e.tabId && closableTaskTabIds.has(e.tabId)),
+    const candidates = [...h.tasks.values()].filter(
+      (e) => e.status === 'consumed' && !(e.gen.tabId && closableTaskTabIds.has(e.gen.tabId)),
     );
     for (const e of candidates) {
-      if (termPaneIds.has(e.paneId) || pendingNoticeIds.has(e.paneId)) continue;
-      // Never collect self, whatever the registry says: a poisoned entry once closed the master's terminal.
-      if (h.env?.terminalId && e.paneId === h.env.terminalId) continue;
+      if (termPaneIds.has(e.gen.paneId) || pendingNoticeIds.has(e.gen.paneId)) continue;
+      // Never collect self, whatever the board says: a poisoned entry once closed the master's terminal.
+      if (h.env?.terminalId && e.gen.paneId === h.env.terminalId) continue;
       if (!shouldClosePane({
-        consumedAt: e.consumedAt ?? null,
-        status: statuses.get(e.paneId),
+        consumedAt: e.gen.consumedAt ?? null,
+        status: statuses.get(e.gen.paneId),
         prevTurnStart,
         lifecycle: e.lifecycle,
       })) continue;
-      if (statuses.get(e.paneId) === undefined) {
+      if (statuses.get(e.gen.paneId) === undefined) {
         releaseRow(e);
         continue;
       }
-      await retire(e.paneId);
+      await retire(e.gen.paneId);
       releaseRow(e);
       await sleep(300);
     }
     await sweepCheckoutSpaces(ttlMs);
     await sweepChannels(statuses);
-    h.persistSubs();
   }
 
   /** A worker's message channel is what makes a follow-up possible at all. Ping it and say so once
    *  when it is gone: the alternative is the master finding out on the next `send`, which is exactly
    *  when the message matters. Never settles, never closes, never touches the row. */
   async function sweepChannels(statuses: ReadonlyMap<string, string>): Promise<void> {
-    for (const e of [...h.subs.values()]) {
-      if (!e.paneId) continue;
-      const status = statuses.get(e.paneId);
+    for (const e of [...h.tasks.values()]) {
+      if (!e.gen.paneId) continue;
+      const status = statuses.get(e.gen.paneId);
       if (planChannelCheck({ rowStatus: e.status, terminalStatus: status }) === 'skip') continue;
       // Past the planner the terminal is listed and reported: the notice may name its state.
       const reported = status ?? 'unknown';
       let ok = false;
       try {
-        ok = (await pipeRequestTo(e.cwd, e.paneId, { type: 'ping', id: `hb-${Date.now()}` }, 1_500)).type === 'ok';
+        ok = (await pipeRequestTo(e.cwd, e.gen.paneId, { type: 'ping', id: `hb-${Date.now()}` }, 1_500)).type === 'ok';
       } catch {
         ok = false;
       }
-      trace(traceRole, 'pipe-heartbeat', { pane: e.paneId, ok, status: reported });
+      trace(traceRole, 'pipe-heartbeat', { pane: e.gen.paneId, ok, status: reported });
       if (ok) {
-        deadChannelNotified.delete(e.paneId);
+        deadChannelNotified.delete(e.gen.paneId);
         continue;
       }
-      if (deadChannelNotified.has(e.paneId)) continue;
-      deadChannelNotified.add(e.paneId);
+      if (deadChannelNotified.has(e.gen.paneId)) continue;
+      deadChannelNotified.add(e.gen.paneId);
       try {
-        await h.deliverNotice?.(formatDeadChannelNotice({ paneId: e.paneId, taskId: e.taskId, status: reported }), e.paneId, null);
+        await h.deliverNotice?.(formatDeadChannelNotice({ paneId: e.gen.paneId, taskId: e.taskId, status: reported }), e.gen.paneId, null);
       } catch {
-        /* the next pass re-announces: the latch is only set for a delivered notice */ 
-        deadChannelNotified.delete(e.paneId);
+        /* the next pass re-announces: the latch is only set for a delivered notice */
+        deadChannelNotified.delete(e.gen.paneId);
       }
     }
   }

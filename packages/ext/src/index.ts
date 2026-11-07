@@ -490,7 +490,7 @@ export default async function (pi: ExtensionAPI) {
       deliverNotice,
       noticePending: notices.noticePending,
       getSessionId: () => sessionId,
-      // The registry lives beside the transcript; the reported path is authoritative, and the scan by
+      // The task view lives beside the transcript; the reported path is authoritative, and the scan by
       // id is only the fallback for a host that reports an id instead of a file.
       getSessionFile: () => ownSessionPath
         ?? (sessionId ? resolveSessionFileValue(process.cwd(), agentSessionsDir(), sessionId) : null),

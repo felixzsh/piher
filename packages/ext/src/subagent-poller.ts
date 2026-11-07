@@ -5,11 +5,11 @@
  */
 import { Context } from '@deepseek-ai/cordis';
 import type { CoreClientLike, CoreStatus, TerminalInfo } from './core-client.ts';
-import { applyReportedSessionFile } from './history-store.ts';
+import { applyReportedSessionFile, taskForPane, type TaskEntry } from './task-row.ts';
 import { runtimePolicy, type RuntimePolicy } from './runtime-policy.ts';
 import { formatFailureNotice, formatSettlementNotice, type SettlementNullReason } from './vocab.ts';
 import { settlementCard, type SettlementCard, type SettlementOutcome } from './settlement-card.ts';
-import { buildBlockedGateNotice, reportFingerprint, type SubEntry } from './subagent-core.ts';
+import { buildBlockedGateNotice, reportFingerprint } from './subagent-core.ts';
 import { retirePane } from './subagent-gc.ts';
 import type { SessionIo } from './subagent-session.ts';
 import { trace, traceRole } from './trace.ts';
@@ -154,14 +154,14 @@ export async function disposeSessionRoot(root: Context): Promise<void> {
 export interface PollerHost {
   client: CoreClientLike;
   sessionRoot: Context;
-  subs: Map<string, SubEntry>;
-  persistSubs(): void;
-  writeHistory(e: SubEntry, patch?: { outcome?: string | null; status?: SubEntry['status']; closedAt?: number }, via?: string): void;
+  tasks: Map<string, TaskEntry>;
+  panes: Map<string, string>;
+  writeRecord(e: TaskEntry): void;
   blockedGateNotified: Set<string>;
   session: SessionIo;
   injectNotice(content: string, paneId?: string, card?: SettlementCard | null): Promise<void>;
   /** S54/S71: what a one-shot settlement reclaims — the pane, and any checkout its spawn created. */
-  reclaim?(entry: SubEntry): void;
+  reclaim?(entry: TaskEntry): void;
   claimSettleNotice(key: string): boolean;
   now?: () => number;
   policy?: Partial<RuntimePolicy>;
@@ -190,7 +190,7 @@ export function createPoller(h: PollerHost): Poller {
    * does, so the two never read as different kinds of event.
    */
   const cardFor = (
-    entry: SubEntry | undefined,
+    entry: TaskEntry | undefined,
     paneId: string,
     description: string,
     outcome: SettlementOutcome,
@@ -236,14 +236,13 @@ export function createPoller(h: PollerHost): Poller {
     /** Claimed settle key: on a rejected injection the claim stays ours, so the next wake retries
      *  the notice instead of suppressing it as someone else's. */
     let claimedKey: string | null = null;
-    /** Stop watching this pane: persist + ledger first, or a restart replays a ghost running row. */
-    const consume = (outcome: string | null, via: string, at: number): void => {
-      const row = h.subs.get(paneId);
+    /** Stop watching this pane: write the record first, or a restart replays a ghost running row. */
+    const consume = (at: number): void => {
+      const row = taskForPane(h.tasks, h.panes, paneId);
       if (!row) return;
       row.status = 'consumed';
-      row.consumedAt = at;
-      h.persistSubs();
-      h.writeHistory(row, { outcome }, via);
+      row.gen.consumedAt = at;
+      h.writeRecord(row);
       // S54: a one-shot worker exits after pushing its report, so its pane is reclaimed here — the
       // notice already carries the text, and the pane must not linger for the GC TTL.
       if (row.lifecycle === 'one-shot') {
@@ -256,7 +255,7 @@ export function createPoller(h: PollerHost): Poller {
      *  not strand a finished worker as `running` with no notice, nor consume the row while the result
      *  is still undelivered. Returns 'retry' when the notice was refused. */
     async function handOver(
-      entry: SubEntry,
+      entry: TaskEntry,
       closing: string | null,
       activity: boolean,
       request: { injectTs: number; description: string; requestId: string },
@@ -268,9 +267,9 @@ export function createPoller(h: PollerHost): Poller {
       // silent — so the transcript is the only signal: no readable candidate at all (activity false)
       // makes "left no closing message" a lie.
       const nullReason: SettlementNullReason = closing == null && !activity ? 'attribution-suspect' : 'silent';
-      if (!entry.sessionFile) {
-        entry.sessionFile = applyReportedSessionFile(
-          entry.sessionFile,
+      if (!entry.gen.sessionFile) {
+        entry.gen.sessionFile = applyReportedSessionFile(
+          entry.gen.sessionFile,
           await h.session.resolveSessionFile(paneId, cwd, undefined, { minMtimeMs: request.injectTs - 2_000 }),
         );
       }
@@ -279,7 +278,7 @@ export function createPoller(h: PollerHost): Poller {
         const claimed = h.claimSettleNotice(claimKey);
         trace(traceRole, 'claim', { pane: paneId, key: claimKey, claimed, closingLen: closing?.length ?? null });
         if (!claimed) {
-          consume(closing, 'poll-settle', now());
+          consume(now());
           return 'done';
         }
         claimedKey = claimKey;
@@ -292,12 +291,12 @@ export function createPoller(h: PollerHost): Poller {
       if (fingerprint !== null && announced && announced.fingerprint === fingerprint
         && now() - announced.at < NOTICE_DEDUPE_WINDOW_MS) {
         trace(traceRole, 'notice-dup', { pane: paneId, request: request.requestId, at: announced.at });
-        consume(closing, 'poll-settle', now());
+        consume(now());
         return 'done';
       }
       // `subagent output` may already have returned this exact report: point there, don't repeat it.
-      const delivered = closing && entry.reportDelivered?.fingerprint === reportFingerprint(closing)
-        ? entry.reportDelivered.at
+      const delivered = closing && entry.gen.reportDelivered?.fingerprint === reportFingerprint(closing)
+        ? entry.gen.reportDelivered.at
         : null;
       const notice = failure !== null
         ? formatFailureNotice(`${paneId} (${request.description})`, failure)
@@ -313,22 +312,21 @@ export function createPoller(h: PollerHost): Poller {
       }
       if (fingerprint !== null) {
         entry.noticeAnnounced = { fingerprint, at: now() };
-        h.persistSubs();
       }
-      consume(closing, 'poll-settle', now());
+      consume(now());
       trace(traceRole, 'consumed', { pane: paneId, via: 'poll-settle', request: request.requestId });
       return 'done';
     }
 
     const watchReady = await watch.ready();
     trace(traceRole, 'poll-start', {
-      pane: paneId, since: injectTs, request: requestId, cwd, file: h.subs.get(paneId)?.sessionFile ?? null,
-      watchReady, watchConnected: watch.connected, row: h.subs.get(paneId)?.status ?? null,
+      pane: paneId, since: injectTs, request: requestId, cwd, file: taskForPane(h.tasks, h.panes, paneId)?.gen.sessionFile ?? null,
+      watchReady, watchConnected: watch.connected, row: taskForPane(h.tasks, h.panes, paneId)?.status ?? null,
     });
     try {
       while (true) {
         const current = requestByPane.get(paneId) ?? { injectTs, description, requestId };
-        const entry = h.subs.get(paneId);
+        const entry = taskForPane(h.tasks, h.panes, paneId);
         if (!entry || entry.status === 'settled' || entry.status === 'consumed' || entry.status === 'closed') {
           trace(traceRole, 'poll-exit', {
             pane: paneId, reason: entry ? entry.status : 'row-gone', request: current.requestId,
@@ -349,7 +347,6 @@ export function createPoller(h: PollerHost): Poller {
         if (state === 'working' && entry.settleWindowStartedAt) {
           // A new turn restarts the settle window from scratch.
           entry.settleWindowStartedAt = null;
-          h.persistSubs();
         }
         const gate = planBlockedGate(waitState, h.blockedGateNotified.has(paneId));
         if (gate.kind === 'stay-blocked') {
@@ -369,26 +366,26 @@ export function createPoller(h: PollerHost): Poller {
         if (gate.kind === 'clear-gate') h.blockedGateNotified.delete(paneId);
 
         if (state === 'idle' || state === 'done' || state === 'error') {
-          // Spawn can mis-attribute entry.sessionFile (the `piher.session` label lags; the mtime
-          // fallback records the newest PRE-EXISTING session), freezing settlement detection until
-          // the vacuum timeout.
-          if (entry.sessionFile) {
-            const fixed = await h.session.reattributeStaleSessionFile(paneId, cwd, current.injectTs, entry.sessionFile);
-            if (fixed && fixed !== entry.sessionFile) {
-              entry.sessionFile = fixed;
-              h.persistSubs();
+          // Spawn can mis-attribute the generation's sessionFile (the `piher.session` label lags;
+          // the mtime fallback records the newest PRE-EXISTING session), freezing settlement
+          // detection until the vacuum timeout.
+          if (entry.gen.sessionFile) {
+            const fixed = await h.session.reattributeStaleSessionFile(paneId, cwd, current.injectTs, entry.gen.sessionFile);
+            if (fixed && fixed !== entry.gen.sessionFile) {
+              entry.gen.sessionFile = fixed;
+              h.writeRecord(entry);
             }
           } else {
-            entry.sessionFile = applyReportedSessionFile(
-              entry.sessionFile,
+            entry.gen.sessionFile = applyReportedSessionFile(
+              entry.gen.sessionFile,
               await h.session.resolveSessionFile(paneId, cwd, undefined, { minMtimeMs: current.injectTs - 2_000 }),
             );
           }
-          const s = await h.session.subSessionState(paneId, cwd, current.injectTs, entry.sessionFile);
+          const s = await h.session.subSessionState(paneId, cwd, current.injectTs, entry.gen.sessionFile);
           trace(traceRole, 'poll', {
             pane: paneId, state, textLen: s.text ? s.text.length : null, pend: s.pendingTool,
             act: s.activity, ended: s.turnEnded ?? null, window: entry.settleWindowStartedAt ?? null,
-            since: current.injectTs, request: current.requestId, file: entry.sessionFile,
+            since: current.injectTs, request: current.requestId, file: entry.gen.sessionFile,
             watch: watch.connected, row: entry.status,
           });
 
@@ -415,7 +412,6 @@ export function createPoller(h: PollerHost): Poller {
             });
             if (tick.kind === 'start-settle-window') {
               entry.settleWindowStartedAt = now();
-              h.persistSubs();
               await park(settleWindowMs);
               continue;
             }
@@ -440,7 +436,7 @@ export function createPoller(h: PollerHost): Poller {
         const vacuum = planVacuumTick({ waitState, paneAlive: alive, now: now(), lastActivityAt, timeoutMs });
         if (vacuum.refreshActivity) lastActivityAt = now();
         if (vacuum.action === 'pane-closed') {
-          consume('pane closed before settling', 'poll-pane-closed', now());
+          consume(now());
           try {
             await h.injectNotice(formatPaneClosedNotice(paneId, current.description), paneId,
               cardFor(entry, paneId, current.description, 'failed'));
@@ -452,12 +448,12 @@ export function createPoller(h: PollerHost): Poller {
           // pane answering in the same second, a transcript re-attributed mid-run). Before declaring
           // `failed`, read the transcript once more with no boundary: an assistant answer sitting at
           // the end of it IS the settlement, and "failed" for a worker that finished is a lie.
-          const late = await h.session.subSessionState(paneId, cwd, 0, entry.sessionFile).catch(() => null);
+          const late = await h.session.subSessionState(paneId, cwd, 0, entry.gen.sessionFile).catch(() => null);
           const lateClosing = late?.text ?? late?.why ?? null;
           trace(traceRole, 'timeout', {
             pane: paneId, request: current.requestId, idleMs: now() - lastActivityAt,
             lateTextLen: lateClosing?.length ?? null, latePend: late?.pendingTool ?? null,
-            lateAct: late?.activity ?? null, file: entry.sessionFile,
+            lateAct: late?.activity ?? null, file: entry.gen.sessionFile,
           });
           if (late && lateClosing != null && !late.pendingTool) {
             entry.settleWindowStartedAt = null;
@@ -468,7 +464,7 @@ export function createPoller(h: PollerHost): Poller {
             }
             return;
           }
-          consume('settle timeout', 'poll-timeout', now());
+          consume(now());
           trace(traceRole, 'consumed', { pane: paneId, via: 'poll-timeout', request: current.requestId });
           const notice = formatSettleTimeoutNotice({
             paneId,

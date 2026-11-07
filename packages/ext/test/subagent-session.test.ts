@@ -2,20 +2,20 @@
  * derivation with cache invalidation, the output delta, the `output` action and reply healing. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CoreClientLike } from '../src/core-client.ts';
-import { SUBS_CUSTOM_TYPE, type SubEntry } from '../src/subagent-core.ts';
+import type { TaskEntry } from '../src/task-row.ts';
 import { sessionDirName } from '../src/session-tail.ts';
 import {
   cleanPaneChrome, computeSubagentOutputDelta, createSessionIo, cutPaneReportCopy, formatSubagentOutput, resolveSubagentStatus, tailOfPaneRead,
   type SubagentOutputCursor,
 } from '../src/subagent-session.ts';
-import { appendHistory, ledgerFile } from '../src/history-store.ts';
+import { readTaskRecord } from '../src/task-store.ts';
 import {
-  TempHome, fakeCore, fire, jsonl, mountSubagent, runSubagent, runSubagentRejects, subsSnapshot, subEntry, terminalInfo,
-  transcriptMessage,
+  TempHome, fakeCore, fire, jsonl, mountSubagent, runSubagent, runSubagentRejects,
+  seedTaskDocuments, taskRow, terminalInfo, transcriptMessage,
   type FakePi,
 } from './test-utils.ts';
 
@@ -307,8 +307,8 @@ test('formatSubagentOutput: header, body, empty-delta notice and flags', () => {
 
 /* ── output action ──────────────────────────────────────────────── */
 
-const worker = (paneId: string, status: SubEntry['status'] = 'running') =>
-  subEntry({ paneId, taskId: `task-${paneId}`, tabId: 't1', tabName: 'worker', status });
+const worker = (paneId: string, status: TaskEntry['status'] = 'running') =>
+  taskRow({ paneId, taskId: `task-${paneId}`, tabId: 't1', tabName: 'worker', status });
 
 /** A throwing terminal list stands the zombie sweep and the settlement-watch recovery down, so
  * neither can rewrite a seeded row mid-test (no poller is armed to consume it). */
@@ -318,9 +318,9 @@ const NO_TERMINALS = { listTerminals: async (): Promise<never> => { throw new Er
 async function withWorker(
   body: (pi: FakePi) => Promise<void>,
   client: Partial<CoreClientLike> = {},
-  status: SubEntry['status'] = 'running',
+  status: TaskEntry['status'] = 'running',
 ): Promise<void> {
-  const { root, pi } = await mountSubagent({ client: { ...NO_TERMINALS, ...client }, subs: [worker('pWorker', status)] });
+  const { root, pi } = await mountSubagent({ client: { ...NO_TERMINALS, ...client }, tasks: [worker('pWorker', status)] });
   try {
     await body(pi);
   } finally {
@@ -463,7 +463,17 @@ test('output action: the transcript report replaces the pane copy and the delive
   const dir = home.dir('sessions', 'sub-dedupe');
   const session = join(dir, '2026-10-27T05-12-00-000Z_66666666-6666-4777-8888-999999999999.jsonl');
   writeSession(session, [transcriptMessage('assistant', TRANSCRIPT_REPORT, Date.now())]);
-  await withWorker(async (pi) => {
+  const repo = mkdtempSync(join(tmpdir(), 'piher-out-record-'));
+  mkdirSync(join(repo, '.git'), { recursive: true });
+  const taskId = 'task-pWorker';
+  const { root, pi } = await mountSubagent({
+    client: {
+      ...NO_TERMINALS,
+      ...outputPane(() => RENDERED_PANE, { status: 'idle', labels: { 'piher.session': session } }),
+    },
+    tasks: [taskRow({ paneId: 'pWorker', taskId, cwd: repo })],
+  });
+  try {
     const res = await runSubagent(pi, { action: 'output', agentId: 'pWorker' });
     const text = res.content[0]!.text;
     assert.equal(res.details!.reportDelivered, true);
@@ -471,17 +481,19 @@ test('output action: the transcript report replaces the pane copy and the delive
     assert.equal(text.match(/extractTalentToMq/g)?.length, 1, 'the report appears once, from the transcript');
     assert.doesNotMatch(text, /↑43k|R820k|──/, 'TUI chrome is stripped');
     assert.match(text, /`_source\.region` stays/, 'the complete transcript text, not the cut pane line');
-    const row = subsSnapshot(pi)?.subs.find((s) => s.paneId === 'pWorker');
-    assert.equal(row?.reportDelivered?.fingerprint, TRANSCRIPT_REPORT.slice(-64), 'the delivery survives a resume');
-  }, outputPane(() => RENDERED_PANE, { status: 'idle', labels: { 'piher.session': session } }));
+    const record = readTaskRecord(repo, taskId);
+    assert.equal(record?.gen.reportDelivered?.fingerprint, TRANSCRIPT_REPORT.slice(-64),
+      'the delivery survives a resume');
+  } finally {
+    await root.fiber.dispose();
+  }
   home.dispose();
+  rmSync(repo, { recursive: true, force: true });
 });
 
 /* ── reply-session healing ──────────────────────────────────────── */
 
-const branchOf = (entry: SubEntry) => [{ type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { subs: [entry] } }] as never;
-
-test('resume: a ledger row pointing at the master session is refused; another pane is reused', async () => {
+test('resume: a record pointing at the master session is refused; another pane is reused', async () => {
   const home = new TempHome('piher-resume-self-');
   const cwd = mkdtempSync(join(tmpdir(), 'piher-resume-self-cwd-'));
   const masterFile = join(cwd, 'master-session.jsonl');
@@ -489,7 +501,7 @@ test('resume: a ledger row pointing at the master session is refused; another pa
   writeFileSync(masterFile, '{}\n');
   writeFileSync(otherFile, '{}\n');
 
-  const { root, pi } = await mountSubagent({
+  const { root, pi, port } = await mountSubagent({
     env: { terminalId: 'p0' },
     client: {
       listTerminals: async () => [
@@ -503,18 +515,19 @@ test('resume: a ledger row pointing at the master session is refused; another pa
     },
   });
   try {
-    // The ledger belongs to the repository: a main checkout is a directory holding `.git`.
+    // The records belong to the repository: a main checkout is a directory holding `.git`.
     mkdirSync(join(cwd, '.git'), { recursive: true });
-    const histFile = ledgerFile(cwd)!;
     const base = {
-      kind: 'task' as const, tabId: 't0', workspaceId: 'w1', cwd,
+      kind: 'task' as const, tabId: 't0', cwd,
       launchCommand: ['node', 'cli.js'], status: 'settled' as const,
     };
-    appendHistory(histFile, { ...base, taskId: '8183022d-a733-4292-911b-850e6dffba5a', paneId: 'wA:p25', description: 'Investigate bug 19812', sessionFile: masterFile, createdAt: Date.now() });
-    appendHistory(histFile, { ...base, taskId: '937f4abf-0000-4111-8222-333333333333', paneId: 'wA:p2old', description: 'healthy task', sessionFile: otherFile, createdAt: Date.now() + 1 });
+    seedTaskDocuments(null, [
+      { ...base, taskId: '8183022d-a733-4292-911b-850e6dffba5a', paneId: 'wA:p25', description: 'Investigate bug 19812', sessionFile: masterFile, createdAt: Date.now() },
+      { ...base, taskId: '937f4abf-0000-4111-8222-333333333333', paneId: 'wA:p2old', description: 'healthy task', sessionFile: otherFile, createdAt: Date.now() + 1 },
+    ]);
 
     assert.match(await runSubagentRejects(pi, { action: 'resume', taskId: '8183022d' }, cwd), /master's own session/);
-    assert.ok(!subsSnapshot(pi)?.subs.some((s) => s.paneId === 'p0'), 'the master pane never enters the registry');
+    assert.ok(!port.current!.listRows().some((s) => s.paneId === 'p0'), 'the master pane never enters the board');
 
     const ok = await runSubagent(pi, { action: 'resume', taskId: '937f4abf' }, cwd);
     assert.match(ok.content[0]!.text, /reused existing pane/);
@@ -534,22 +547,27 @@ test('applyReplySession: a bare session id self-report repairs a poisoned sessio
   const poisoned = join(cwd, 'stale-01a0bd34.jsonl');
   writeFileSync(poisoned, '{}\n');
 
+  // Records belong to a repository: the reply heals the generation's sessionFile through them.
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const viewFile = join(home.dir('views'), '2026-09-20T05-14-07-064Z_99999999-9999-4999-8999-999999999999.jsonl');
+  const taskId = '11111111-2222-4333-8444-555555555555';
+  seedTaskDocuments(viewFile, [{
+    taskId, paneId: 'p2', tabId: 't0', tabName: 'main',
+    cwd, description: 'Investigate bug 19803', status: 'settled',
+    sessionFile: poisoned, createdAt: Date.now() - 60_000,
+  }]);
   const { root, pi, port } = await mountSubagent({
     client: { getTerminal: async (id) => terminalInfo({ id, labels: { 'piher.session': realFile } }) },
-    deps: { getSessionId: () => '99999999-9999-4999-8999-999999999999' },
+    deps: {
+      getSessionId: () => '99999999-9999-4999-8999-999999999999',
+      getSessionFile: () => viewFile,
+      getCwd: () => cwd,
+    },
   });
   try {
-    await fire(pi, 'session_start', {}, {
-      sessionManager: {
-        getBranch: () => branchOf(subEntry({
-          taskId: '11111111-2222-4333-8444-555555555555', paneId: 'p2', tabId: 't0', tabName: 'main',
-          cwd, description: 'Investigate bug 19803', status: 'settled',
-          sessionFile: poisoned, createdAt: Date.now() - 60_000,
-        })),
-      },
-    });
+    await fire(pi, 'session_start', { reason: 'reload' }, {});
     port.current!.applyReplySession('p2', '01a0bd3c-6557-746b-adf6-5128f2326c57');
-    assert.equal(subsSnapshot(pi)!.subs.find((s) => s.paneId === 'p2')!.sessionFile, realFile);
+    assert.equal(readTaskRecord(cwd, taskId)?.gen.sessionFile, realFile);
   } finally {
     await root.fiber.dispose();
     home.dispose();
@@ -564,6 +582,16 @@ test('session recovery: a still-running subagent gets its settlement watch re-ar
   writeFileSync(workerFile, jsonl(transcriptMessage('assistant', 'RECOVERED_REPORT: fix committed, 199 tests green', Date.now())));
 
   const notices: string[] = [];
+  // The task's record belongs to a repository: the restore reads it from there.
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const viewFile = join(home.dir('views'), '2026-09-20T06-10-00-000Z_bbbb2222-3333-4444-8555-666666666666.jsonl');
+  const taskId = 'cccc3333-4444-4555-8666-777777777777';
+  const createdAt = Date.now() - 120_000;
+  seedTaskDocuments(viewFile, [{
+    taskId, paneId: 'pAlive', tabId: 't0', tabName: 'main',
+    cwd, description: 'Fix bugs in a separate checkout', status: 'running',
+    sessionFile: null, createdAt,
+  }]);
   const { root, pi } = await mountSubagent({
     client: {
       listTerminals: async () => [terminalInfo({ id: 'pAlive', status: 'idle', labels: { 'piher.session': workerFile } })],
@@ -571,27 +599,18 @@ test('session recovery: a still-running subagent gets its settlement watch re-ar
     },
     deps: {
       getSessionId: () => 'bbbb2222-3333-4444-8555-666666666666',
+      getSessionFile: () => viewFile,
+      getCwd: () => cwd,
       deliverNotice: async (content: string) => { notices.push(content); },
     },
   });
   try {
-    const createdAt = Date.now() - 120_000;
-    await fire(pi, 'session_start', {}, {
-      sessionManager: {
-        getBranch: () => branchOf(subEntry({
-          taskId: 'cccc3333-4444-4555-8666-777777777777', paneId: 'pAlive', tabId: 't0', tabName: 'main',
-          cwd, description: 'Fix bugs in a separate checkout', status: 'running',
-          sessionFile: null, createdAt,
-          // An already-elapsed settle window lets the recovered poller settle on its first tick.
-          settleWindowStartedAt: createdAt,
-        })),
-      },
-    });
+    await fire(pi, 'session_start', { reason: 'reload' }, {});
     assert.ok(notices.some((n) => n.includes('settlement watch re-armed')), `missing recovery notice: ${JSON.stringify(notices)}`);
     const settle = notices.find((n) => n.includes('Its report, in its own words'));
     assert.ok(settle, `missing settlement notice: ${JSON.stringify(notices)}`);
     assert.match(settle!, /RECOVERED_REPORT/);
-    assert.equal(subsSnapshot(pi)!.subs.find((s) => s.paneId === 'pAlive')!.status, 'consumed');
+    assert.ok(readTaskRecord(cwd, taskId)?.gen.consumedAt !== null, 'the settlement lands in the record');
   } finally {
     await root.fiber.dispose();
     home.dispose();

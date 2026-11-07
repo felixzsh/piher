@@ -9,7 +9,11 @@ import { PiSurface } from '../src/pi-surface.ts';
 import type { DisposeLedger } from '../src/ledger.ts';
 import subagentPlugin from '../src/plugins/subagent.ts';
 import type { SubagentDeps } from '../src/plugins/subagent.ts';
-import { SUBS_CUSTOM_TYPE, emptySubagentPortBox, type SubEntry, type SubagentPortBox } from '../src/subagent-core.ts';
+import { emptySubagentPortBox, type SubagentPortBox } from '../src/subagent-core.ts';
+import type { TaskEntry, TaskRow, TaskStatus } from '../src/task-row.ts';
+import { writeTaskRecord, writeTaskView } from '../src/task-store.ts';
+
+export { listTaskRecords, readTaskRecord, readTaskView, repoTasksDir } from '../src/task-store.ts';
 
 export interface CleanupContext {
   /** Temp dir removed when the test body settles. */
@@ -284,41 +288,95 @@ export function fakeCore(over: Partial<CoreClientLike> = {}): CoreClientLike {
   };
 }
 
-export function subEntry(over: Partial<SubEntry> = {}): SubEntry {
+/** Flat overrides for a resident task row: generation identity stays top-level so seeds read
+ *  like the rows they replace, and the factory nests them. */
+export type TaskSeed = Partial<Omit<TaskRow, 'gen' | 'lifecycle' | 'closedAt'>> & {
+  lifecycle?: TaskRow['lifecycle'];
+  closedAt?: number | null;
+  /** Memory-only turn state (never written to a document). */
+  status?: TaskStatus;
+  paneId?: string;
+  slug?: string;
+  tabId?: string;
+  tabName?: string;
+  sessionFile?: string | null;
+  launchCommand?: string[];
+  startedAt?: number;
+  consumedAt?: number | null;
+  reportDelivered?: { fingerprint: string; at: number } | null;
+  settleWindowStartedAt?: number | null;
+  noticeAnnounced?: { fingerprint: string; at: number } | null;
+};
+
+export function taskRow(over: TaskSeed = {}): TaskEntry {
+  const {
+    status = 'running',
+    paneId = 't2',
+    slug = '',
+    tabId = 'tb0',
+    tabName = 'main',
+    sessionFile = null,
+    launchCommand = [],
+    consumedAt = null,
+    reportDelivered = null,
+    settleWindowStartedAt,
+    noticeAnnounced,
+    lifecycle = 'persistent',
+    taskId = 'task-1',
+    kind = 'task',
+    cwd = '/test/cwd',
+    description = 'test worker subagent',
+    createdAt = Date.now(),
+    closedAt = null,
+    ...rest
+  } = over;
   return {
-    taskId: 'task-1',
-    kind: 'task',
-    paneId: 't2',
-    tabId: 'tb0',
-    tabName: 'main',
-    cwd: '/test/cwd',
-    description: 'test worker subagent',
-    status: 'running',
-    consumedAt: null,
-    sessionFile: null,
-    launchCommand: [],
-    createdAt: Date.now(),
-    revivedFrom: null,
-    ...over,
+    taskId,
+    kind,
+    lifecycle,
+    cwd,
+    description,
+    createdAt,
+    closedAt,
+    gen: {
+      paneId,
+      slug,
+      tabId,
+      tabName,
+      sessionFile,
+      launchCommand,
+      startedAt: over.startedAt ?? createdAt,
+      consumedAt,
+      reportDelivered,
+    },
+    status,
+    ...(settleWindowStartedAt !== undefined ? { settleWindowStartedAt } : {}),
+    ...(noticeAnnounced !== undefined ? { noticeAnnounced } : {}),
+    ...rest,
   };
 }
 
-/** Custom-branch snapshot the plugin folds the registry from. */
-function subsBranch(subs: SubEntry[]): never {
-  return [{ type: 'custom', customType: SUBS_CUSTOM_TYPE, data: { version: 2, subs } }] as never;
-}
-
-/** The registry snapshot the plugin most recently appended. */
-export function subsSnapshot(pi: FakePi): { subs: SubEntry[] } | undefined {
-  return pi.entries.filter(([type]) => type === SUBS_CUSTOM_TYPE).at(-1)?.[1] as { subs: SubEntry[] } | undefined;
+/**
+ * Write task records plus the session view straight to disk: what a reload restores from.
+ * Records resolve their repository from each row's cwd, so seeds need a real checkout there.
+ */
+export function seedTaskDocuments(sessionFile: string | null, seeds: TaskSeed[]): TaskEntry[] {
+  const rows = seeds.map((seed) => taskRow(seed));
+  for (const row of rows) {
+    if (!writeTaskRecord(row.cwd, row)) {
+      throw new Error(`seedTaskDocuments: cannot write a record for ${row.taskId} (no repository at ${row.cwd})`);
+    }
+  }
+  if (sessionFile !== null) writeTaskView(sessionFile, rows.map((row) => row.taskId));
+  return rows;
 }
 
 export interface SubagentMountOptions {
   pi?: FakePi;
   client?: Partial<CoreClientLike>;
   ledger?: DisposeLedger;
-  /** Seeds the registry through a session_start branch lookup. */
-  subs?: SubEntry[];
+  /** Seeds the session's tasks in memory (as a restore from the view and the records would). */
+  tasks?: TaskEntry[];
   env?: Partial<CoreEnv>;
   extPath?: string;
   deps?: Partial<SubagentDeps>;
@@ -342,11 +400,12 @@ export async function mountSubagent(opts: SubagentMountOptions = {}): Promise<Su
     getSessionId: () => '',
     claimSettleNotice: () => true,
     terminalState: { activePaneIds: () => new Set<string>() },
+    ...(opts.tasks?.length ? { initialTasks: opts.tasks } : {}),
     ...opts.deps,
   });
   await root.plugin(subagentPlugin);
-  if (opts.subs?.length) {
-    await fire(pi, 'session_start', {}, { sessionManager: { getBranch: () => subsBranch(opts.subs!) } });
+  if (opts.tasks?.length) {
+    await fire(pi, 'session_start', {}, {});
   }
   return { root, pi, port, client };
 }

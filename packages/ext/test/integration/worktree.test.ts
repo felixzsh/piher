@@ -4,11 +4,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import type { Server, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { ledgerFile } from '../../src/history-store.ts';
+import { listTaskRecords } from '../../src/task-store.ts';
 import { pipeNameFor, startPipeServer } from '../../src/pipe-channel.ts';
 import type { SubagentPortBox } from '../../src/subagent-core.ts';
 import { NodeCheckoutIo, parsePorcelain } from '../../src/worktree-io.ts';
@@ -234,11 +234,14 @@ test('ensureCheckout: git decides what a branch name may be, and a slash is allo
 /* ── herdr-app adapter ──────────────────────────────────────────── */
 
 /** What `execFile` rejects with: the exit code, and whatever the process wrote before it exited. */
-function ledgerRows(repo: string): Array<Record<string, unknown>> {
-  const file = ledgerFile(repo);
-  if (file === null || !existsSync(file)) return [];
-  return readFileSync(file, 'utf8').trim().split('\n').filter(Boolean)
-    .map((line) => JSON.parse(line) as Record<string, unknown>);
+function taskRows(repo: string): Array<{
+  taskId: string; worktree?: { path: string; branch: string }; consumed: boolean;
+}> {
+  return listTaskRecords(repo).map((row) => ({
+    taskId: row.taskId,
+    ...(row.worktree ? { worktree: row.worktree } : {}),
+    consumed: row.gen.consumedAt !== null,
+  }));
 }
 
 const PROMPT = 'probe the checkout';
@@ -375,9 +378,10 @@ test('spawn worktree: one name makes the checkout, and says where it is', async 
     assert.equal(h.labels[1]!['herdr.tab'], 'wtTab', "the second worker joins the first one's tab");
     h.listed.length = 0;
 
-    // The ledger row names the checkout `resume` and `close` depend on.
-    await waitFor(() => ledgerRows(h.repo).some((r) => r.via === 'spawn'));
-    const forPath = ledgerRows(h.repo).filter((r) => (r.worktree as { path?: string } | undefined)?.path === path);
+    // The task record names the checkout `resume` and `close` depend on.
+    const spawnTaskId = result.details?.taskId as string;
+    await waitFor(() => taskRows(h.repo).some((r) => r.taskId === spawnTaskId));
+    const forPath = taskRows(h.repo).filter((r) => r.worktree?.path === path);
     assert.deepEqual(forPath.at(-1)!.worktree, { path, branch: 'probe' });
 
     // Repeating the same name reuses it instead of failing on the occupied path.
@@ -481,10 +485,11 @@ test('one-shot: its settlement closes the space and keeps the checkout for the m
     assert.ok(branches(h.repo).includes('shot'), 'the branch survives');
 
     // The reclaim records the checkout it left behind, so a later close or resume reads the truth.
-    await waitFor(() => ledgerRows(h.repo).some((r) => r.via === 'one-shot-reclaim'));
-    const reclaimed = ledgerRows(h.repo).filter((r) => r.via === 'one-shot-reclaim').at(-1)!;
+    const sweptTaskId = spawn.details?.taskId as string;
+    await waitFor(() => taskRows(h.repo).some((r) => r.taskId === sweptTaskId && r.consumed));
+    const reclaimed = taskRows(h.repo).find((r) => r.taskId === sweptTaskId)!;
     assert.deepEqual(reclaimed.worktree, { path, branch: 'shot' });
-    assert.notEqual(reclaimed.status, 'running');
+    assert.equal(reclaimed.consumed, true);
   });
 });
 
@@ -507,7 +512,8 @@ test('one-shot: a checkout still used by another worker keeps its space', async 
     await waitFor(() => h.port.current !== null);
 
     h.port.current!.consumeReply(reviewer.details?.paneId as string, 'REPORT: swept');
-    await waitFor(() => ledgerRows(h.repo).some((r) => r.via === 'one-shot-reclaim'));
+    const reviewerTaskId = reviewer.details?.taskId as string;
+    await waitFor(() => taskRows(h.repo).some((r) => r.taskId === reviewerTaskId && r.consumed));
     assert.deepEqual(h.spaces.closed, [], 'the worker is still in that space, so its tab stays');
     assert.ok(existsSync(path), 'the checkout stays for the master either way');
   });

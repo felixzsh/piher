@@ -11,9 +11,10 @@ import { createPlatformPaths } from '../src/platform-paths.ts';
 import { OPTION_SPECS, formatOptionRows, optionValue, optionRows } from '../src/options.ts';
 import { createRuntimePolicy, type RuntimePolicy } from '../src/runtime-policy.ts';
 import {
-  ledgerFile, mainWorktreeRoot, piCoreSessionDirName,
+  mainWorktreeRoot, piCoreSessionDirName,
   piSessionDirCandidates, sessionDirName,
 } from '../src/storage-layout.ts';
+import { repoTasksDir } from '../src/task-store.ts';
 import { SWALLOW_BUFFER_MAX, formatSwallowedErrors, resetSwallowedErrors, swallow, swallowedErrors } from '../src/swallow.ts';
 import { ToolError, toolError } from '../src/tool-error.ts';
 import { withCleanup, type CleanupContext } from './test-utils.ts';
@@ -66,10 +67,10 @@ test('sessionDirName: percent-encoded separators (a/b ≠ a-b)', () => {
   assert.equal(sessionDirName('/home/u/proj'), '--%2Fhome%2Fu%2Fproj--'); assert.equal(sessionDirName('a%b/c'), '--a%25b%2Fc--');
 });
 
-test('mainWorktreeRoot/ledgerFile: the main checkout owns the ledger, a linked worktree points at it', withCleanup((cleanup) => {
+test('mainWorktreeRoot/repoTasksDir: the main checkout owns the tasks, a linked worktree points at it', withCleanup((cleanup) => {
   const main = cleanup.tempDir('ledger-main').path;
   mkdirSync(join(main, '.git'));
-  assert.equal(ledgerFile(main), join(main, '.piher', 'history', 'history.jsonl'), 'the main checkout records into itself');
+  assert.equal(repoTasksDir(main), join(main, '.piher', 'tasks'), 'the main checkout records into itself');
   const nested = join(main, 'packages', 'deep');
   mkdirSync(nested, { recursive: true });
   assert.equal(mainWorktreeRoot(nested), main, 'a subdirectory resolves to its repository');
@@ -82,13 +83,13 @@ test('mainWorktreeRoot/ledgerFile: the main checkout owns the ledger, a linked w
   writeFileSync(join(wt, '.git'), `gitdir: ${wtGitdir}\n`);
   assert.equal(mainWorktreeRoot(wt), main, 'never the worktree');
   mkdirSync(join(wt, 'src'), { recursive: true });
-  assert.equal(ledgerFile(join(wt, 'src')), ledgerFile(main), 'the worktree writes the repository ledger');
+  assert.equal(repoTasksDir(join(wt, 'src')), repoTasksDir(main), 'the worktree writes the repository tasks');
 
-  // No working tree: no ledger at all, and no fallback location.
+  // No working tree: no tasks at all, and no fallback location.
   const outside = cleanup.tempDir('ledger-out').path;
   assert.equal(mainWorktreeRoot(outside), null);
-  assert.equal(ledgerFile(outside), null);
-  assert.equal(ledgerFile(join(outside, 'gone')), null, 'a collected checkout resolves to nothing');
+  assert.equal(repoTasksDir(outside), null);
+  assert.equal(repoTasksDir(join(outside, 'gone')), null, 'a collected checkout resolves to nothing');
 
   // A gitdir redirect without a commondir (submodule) owns no working tree here.
   const sub = cleanup.tempDir('ledger-sub').path;
