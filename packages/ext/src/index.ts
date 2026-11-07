@@ -38,6 +38,7 @@ import { handlePipeRequest, type MachineRequest } from './index-pipe.ts';
 import { installWriteLocks } from './index-locks.ts';
 import { installConfigCommand } from './config-command.ts';
 import { composeMasterRuntime, createRoleRuntime } from './index-roles.ts';
+import { trace, traceRole } from './trace.ts';
 
 function agentSessionsDir(): string {
   return process.env.PI_CODING_AGENT_DIR ? join(process.env.PI_CODING_AGENT_DIR, 'sessions') : platformPaths.sessionsDir;
@@ -200,11 +201,15 @@ export default async function (pi: ExtensionAPI) {
    *  master must not exit as if it had (S54 — the push comes first, the shutdown after). */
   async function pushSettleReply(aborted = false): Promise<boolean> {
     const req = pendingMachineRequest;
-    if (!req || !req.from) return false;
+    if (!req || !req.from) {
+      trace(traceRole, 'push-skip', { why: 'no-request', hasReq: req !== null, from: req?.from ?? null });
+      return false;
+    }
     // An aborted settle is not a settlement: the closing message is still coming, and answering now
     // would burn the one-shot request + the parent's claim latch on a null-text reply ("left no
     // closing message") — the real closing message then never gets delivered. Keep the request armed.
     if (!shouldPushSettleReply({ aborted, lastStopReason })) {
+      trace(traceRole, 'push-skip', { why: 'aborted-or-error', aborted, lastStopReason });
       return false;
     }
     pendingMachineRequest = null;
@@ -223,7 +228,15 @@ export default async function (pi: ExtensionAPI) {
           text = state.text ?? state.why ?? null;
         }
       }
-      if (text === null) return false;
+      if (text === null) {
+        trace(traceRole, 'push-skip', {
+          why: 'no-text', request: req.id, since: req.sinceTs, file: ownFile, hasFile: ownFile !== null,
+        });
+        return false;
+      }
+      trace(traceRole, 'push-try', {
+        request: req.id, since: req.sinceTs, file: ownFile, textLen: text.length, to: req.from,
+      });
       await pipeRequest(req.from, {
         type: 'reply',
         id: req.id,
@@ -234,9 +247,11 @@ export default async function (pi: ExtensionAPI) {
       }, 5000);
     } catch (err) {
       /* The requester's pollLoop is the fallback; surface the dead letter for triage. */
+      trace(traceRole, 'push-failed', { request: req.id, to: req.from, error: String((err as Error)?.message ?? err) });
       console.error(`piher: settle reply push to ${req.from} failed: ${(err as Error)?.message ?? err}`);
       return false;
     }
+    trace(traceRole, 'push-ok', { request: req.id, to: req.from });
     return true;
   }
 
@@ -356,6 +371,10 @@ export default async function (pi: ExtensionAPI) {
     // S54: a role-declared `one-shot` worker exits once its report is in the master's hands. The
     // ordering is the whole risk — shutting down first loses the report the parent waits for — so the
     // exit hangs off the push, and never off an aborted turn (S52: an interrupted turn reports nothing).
+    trace(traceRole, 'settle', {
+      aborted, lastStopReason, isSubagent, lifecycle: delegation?.lifecycle ?? null,
+      pushed: await Promise.resolve(pushed), hasRequest: pendingMachineRequest !== null,
+    });
     if (isSubagent && !aborted && delegation?.lifecycle === 'one-shot') {
       void pushed.then((sent) => { if (sent) ctx.shutdown(); });
     } else {

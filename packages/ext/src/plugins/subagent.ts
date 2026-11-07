@@ -66,6 +66,7 @@ import {
 } from '../worktree.ts';
 import { createPoller } from '../subagent-poller.ts';
 import { createGcController, createSubagentRegistry, retirePane } from '../subagent-gc.ts';
+import { trace, traceRole } from '../trace.ts';
 import { createSessionIo, executeSubagentOutput, type SubagentOutputCursor } from '../subagent-session.ts';
 import type { WorkerWidgetRow } from '../tree-view.ts';
 
@@ -374,6 +375,7 @@ export default function subagentPlugin(ctx: Context): void {
       } catch {
       }
     }
+    trace(traceRole, 'recover', { via, running: running.length, rearmed: recovered.length, panes: recovered.join('|') });
     if (recovered.length > 0) {
       try {
         await injectNotice(

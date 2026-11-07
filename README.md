@@ -272,7 +272,7 @@ docs/              # install guide, configuration overview, decision index, rele
 
 ```sh
 npm install --ignore-scripts
-npm test                  # typecheck + the whole suite (449 tests, ~15 s)
+npm test                  # typecheck + the whole suite (455 tests, ~15 s)
 npm run test:mutation
 ```
 

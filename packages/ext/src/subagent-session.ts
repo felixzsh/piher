@@ -16,6 +16,7 @@ import {
 } from './session-tail.ts';
 import { idParam, reportFingerprint, type AliveProbe, type SubEntry } from './subagent-core.ts';
 import { toolError } from './tool-error.ts';
+import { trace, traceRole } from './trace.ts';
 
 /* ── subagent output delta (pure) ───────────────────────────────── */
 
@@ -311,6 +312,12 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     push(resolveSessionFileValue(cwd, h.sessionsDir(), preferred));
     push(resolveSessionFileValue(cwd, h.sessionsDir(), reported));
     for (const f of listSessionFiles(cwd, h.sessionsDir(), 4)) push(f);
+    // Which transcript this pane may be read from, and where each candidate came from: the wrong
+    // file is indistinguishable from a silent worker unless the choice is on the record.
+    trace(traceRole, 'resolve-session', {
+      pane: paneId, cwd, preferred: preferred ?? null, reported: reported ?? null,
+      candidates: out.map((f) => bareSessionId(f)).join(','), count: out.length,
+    });
     return out;
   }
 

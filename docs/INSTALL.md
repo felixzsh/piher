@@ -40,6 +40,9 @@ running anything — the preflight is in the tool result, not in a separate inst
 The old one-shot installer (`piher-setup`) is retired and no longer published: it only wrapped the
 commands in the table above, and the `hc` preflight now travels with the package itself.
 
+If a settlement notice ever arrives late or not at all, the trace in [`TRACE.md`](TRACE.md) records
+every decision that led there (it is on by default and rotated at 4 MB).
+
 Hot reload while developing needs node's `--expose-internals` flag before pi's own entry point and
 `PIHER_HMR=1`; without both there is no watcher.
 

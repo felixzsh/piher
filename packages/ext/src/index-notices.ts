@@ -4,6 +4,7 @@
  * while busy; flush at turn_end (steer) / agent_settled (followUp), collapsing large batches. */
 
 import type { SettlementCard } from './settlement-card.ts';
+import { trace, traceRole } from './trace.ts';
 
 export type NoticeSendMode = 'steer' | 'followUp';
 
@@ -43,14 +44,19 @@ export function createNoticeBuffer(opts: {
       if (content !== '' && paneId !== undefined) pendingPaneIds.add(paneId);
       if (opts.isBusy()) {
         pending.push({ content, paneId, ...(card ? { card } : {}) });
+        trace(traceRole, 'notice-buffered', { pane: paneId ?? null, queued: pending.length, contentLen: content.length });
         return;
       }
       try {
         await opts.send(content, 'followUp', card ?? undefined);
-      } catch {
+        trace(traceRole, 'notice-sent', { pane: paneId ?? null, contentLen: content.length });
+      } catch (err) {
         // pi drops prompts while the agent is mid-turn; holding the notice keeps it (and keeps its
         // pane GC-exempt) until a flush can deliver it, instead of losing the settlement here.
         requeue([{ content, paneId, ...(card ? { card } : {}) }]);
+        trace(traceRole, 'notice-requeued', {
+          pane: paneId ?? null, queued: pending.length, error: String((err as Error)?.message ?? err),
+        });
         return;
       }
       if (content !== '' && paneId !== undefined) pendingPaneIds.delete(paneId);
@@ -63,8 +69,12 @@ export function createNoticeBuffer(opts: {
       if (collapsed) {
         try {
           await opts.send(collapsed, mode, flushed.length === 1 ? flushed[0]!.card : undefined);
-        } catch {
+          trace(traceRole, 'notice-flushed', { mode, count: flushed.length, contentLen: collapsed.length });
+        } catch (err) {
           requeue(flushed);
+          trace(traceRole, 'notice-flush-failed', {
+            mode, count: flushed.length, error: String((err as Error)?.message ?? err),
+          });
           return;
         }
       }

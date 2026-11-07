@@ -14,6 +14,7 @@ import {
 } from './gc-core.ts';
 import type { SettlementCard } from './settlement-card.ts';
 import { checkoutSpaceId, type CheckoutSpace } from './worktree.ts';
+import { trace, traceRole } from './trace.ts';
 import { runtimePolicy } from './runtime-policy.ts';
 import { swallow } from './swallow.ts';
 import { foldSubsRegistry, registrySnapshot, sleep, SUBS_CUSTOM_TYPE, type SubEntry } from './subagent-core.ts';
@@ -88,6 +89,7 @@ export function createSubagentRegistry(host: SubagentRegistryHost): SubagentRegi
       // work, and unfinished work is what `resume` exists for. Only `close` may write `closed`.
       entry.status = 'settled';
       host.writeHistory(entry, { status: 'settled' }, 'zombie-sweep');
+      trace(traceRole, 'gc-release', { pane: entry.paneId, via: 'zombie-sweep', taskId: entry.taskId });
       changed = true;
     }
     if (changed) persist();
@@ -190,6 +192,7 @@ export function createGcController(h: GcHost): GcController {
       if (e.status !== 'running') return;
       e.status = 'settled';
       h.writeHistory(e, { status: 'settled' }, 'gc');
+      trace(traceRole, 'gc-release', { pane: e.paneId, via: 'gc', taskId: e.taskId });
     };
     /** The pair `close` and a one-shot settlement use as well. */
     const retire = (id: string): Promise<void> => retirePane(h.client, id);

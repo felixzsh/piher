@@ -483,7 +483,9 @@ test('startPoller: a follow_up refreshes the tracked request while the loop is r
   await poller.startPoller('p-refresh', '/tmp', 5_000, 'desc', 'req-2');
   firstPark.resolve();
   await loop;
-  assert.ok(sinceTs.includes(5_000), `the loop must judge against the newest request, saw ${sinceTs.join(',')}`);
+  // The newest request wins, and it wins with the boundary slack every poller start applies (a
+  // revived pane can answer in the very second the loop starts): 5_000 - 2_000.
+  assert.ok(sinceTs.includes(3_000), `the loop must judge against the newest request, saw ${sinceTs.join(',')}`);
   assert.deepEqual(f.claimKeys, ['p-refresh:req-2']);
   assert.deepEqual([...poller.pollers], [], 'the pane leaves the poller set when the loop ends');
 });
@@ -507,4 +509,37 @@ test('startPoller: a second call for an active pane does not start a second loop
   firstPark.resolve();
   await loop;
   assert.equal(f.writes.length, 1, 'exactly one settlement');
+});
+
+test('startPoller: the request boundary keeps a slack, so an answer in the same second is read', async () => {
+  const f = fixture(makeEntry('p-slack'));
+  const seen: number[] = [];
+  f.host.session.subSessionState = async (_paneId: string, _cwd: string, ts: number) => {
+    seen.push(ts);
+    return { text: 'finished', pendingTool: false, activity: true, turnEnded: true };
+  };
+  await start(f, 'req-1', 10_000);
+  assert.equal(seen[0], 8_000, '2s before the request: a revived pane can answer on the boundary itself');
+  assert.equal(f.entry!.status, 'consumed');
+});
+
+test('pollLoop: before declaring a timeout, a closing text found without the boundary settles instead', async () => {
+  const f = fixture(makeEntry('p-late'));
+  // What the loop sees after the request boundary: no activity, nothing settleable — the shape that
+  // used to run out the 300s and report `failed` for a worker that had in fact answered.
+  f.host.session.subSessionState = async (_paneId: string, _cwd: string, ts: number) =>
+    ts === 0
+      ? { text: 'REPORT: the pair is fixed', pendingTool: false, activity: true, turnEnded: true }
+      : { text: null, pendingTool: false, activity: false, turnEnded: false };
+  // The virtual clock only moves through the loop's own parks; the vacuum park floors at 0 once the
+  // budget is spent, so nudge it a millisecond to let the timeout be reached instead of parking at 0.
+  f.onPark((ms) => {
+    if (ms === 0) f.virtual.now += 1;
+    return false;
+  });
+  await start(f);
+  assert.equal(f.entry!.status, 'consumed');
+  assert.deepEqual(f.writes.map((w) => w.via), ['poll-settle'], 'a settlement, not a poll-timeout');
+  assert.match(f.notices[0]!, /REPORT: the pair is fixed/);
+  assert.match(f.notices[0]!, /finished and will do no further work/, 'the notice is the settlement one');
 });

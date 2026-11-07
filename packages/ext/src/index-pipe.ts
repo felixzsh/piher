@@ -3,6 +3,7 @@ import { formatSettlementNotice } from './vocab.ts';
 import type { SettlementCard } from './settlement-card.ts';
 import type { PipeRequest, PipeResponse } from './pipe-channel.ts';
 import type { SubagentPortBox } from './subagent-core.ts';
+import { trace, traceRole } from './trace.ts';
 
 export interface MachineRequest {
   id: string;
@@ -62,7 +63,12 @@ export async function handlePipeRequest(
       // a child echoes the id of the pipe request it answered (`id: req.id` in index.ts's settle
       // push) and the parent hands that same id to startPoller (`prompt-<taskId>` / `fu-<ts>`).
       // A mismatch surfaces as two "finished" notices for one settlement.
-      if (s.claimSettleNotice(`${req.paneId}:${req.id}`)) {
+      const claimed = s.claimSettleNotice(`${req.paneId}:${req.id}`);
+      trace(traceRole, 'reply', {
+        pane: req.paneId, request: req.id, textLen: (req.text ?? "").length, claimed,
+        sessionFile: req.sessionFile ?? null,
+      });
+      if (claimed) {
         const head = formatSettlementNotice(`${req.paneId}`, req.text);
         const body = req.sessionFile ? `${head}\nSession: ${req.sessionFile}` : head;
         await s.deliverNotice(body, req.paneId, s.port.current?.settlementCard(req.paneId, 'settled') ?? null);
