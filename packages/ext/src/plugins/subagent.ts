@@ -33,6 +33,7 @@ import {
 import {
   applyReportedSessionFile,
   isClosed,
+  isSpent,
   taskForPane,
   taskRef,
   type TaskEntry,
@@ -388,7 +389,7 @@ export default function subagentPlugin(ctx: Context): void {
     for (const entry of running) {
       if (!liveTerminalIds.has(entry.gen.paneId)) continue; // zombie sweep already settled those
       try {
-        await startPoller(entry.gen.paneId, entry.cwd, entry.createdAt, entry.description, `recover-${via}-${entry.gen.paneId}`);
+        await startPoller(entry.gen.paneId, entry.cwd, entry.gen.startedAt, entry.description, `recover-${via}-${entry.gen.paneId}`);
         recovered.push(`${entry.gen.paneId} (${entry.description})`);
       } catch {
       }
@@ -439,7 +440,7 @@ export default function subagentPlugin(ctx: Context): void {
     if (!isAlive(probe, Date.now())) return; // keep the original error only when the agent is truly dead
     // Move a live agent to the poller so its eventual result replaces the false error.
     if (!pollers.has(paneId)) {
-      startPoller(paneId, entry.cwd, entry.createdAt, entry.description, lastRequestIdByPane.get(paneId) ?? `probe-${paneId}`);
+      startPoller(paneId, entry.cwd, entry.gen.startedAt, entry.description, lastRequestIdByPane.get(paneId) ?? `probe-${paneId}`);
       writeRecord(entry);
     }
     return {
@@ -449,6 +450,11 @@ export default function subagentPlugin(ctx: Context): void {
 
   async function reviveEntry(entry: TaskEntry): Promise<TaskEntry> {
     const latest: TaskRow = readTaskRecord(entry.cwd, entry.taskId) ?? entry;
+    // S9: close is final for every session, and the disk is the authority. A closed (or spent)
+    // task never grows a new generation — otherwise a live pane would sit behind a record that
+    // still says closed, and the revive would carry the stale `closedAt` into the new record.
+    const verdict = spentText(latest);
+    if (verdict !== null) throw new ToolError(verdict);
     // S71: resume decides by existence, never by a flag — the same refusal whether `close`, a
     // one-shot settlement or a human removed the checkout.
     if (!existsSync(entry.cwd)) {
@@ -508,7 +514,8 @@ export default function subagentPlugin(ctx: Context): void {
       startedAt: Date.now(),
     });
     entry.status = 'running';
-    entry.createdAt = Date.now();
+    // S3: only the generation is replaced — `createdAt` is the task's durable fact, and the new
+    // generation's start rides `gen.startedAt` above.
     // A revived row is reclaimed at settlement too when its role still declares one-shot (S54).
     entry.lifecycle = lifecycle;
     // A task outlives its pane: the pane index moves to the new generation, and the dead id must
@@ -551,12 +558,14 @@ export default function subagentPlugin(ctx: Context): void {
    * `close` is the master's final word on a worker and a one-shot spends itself when its result is
    * consumed: neither may be revived. Resume exists for work that was left unfinished.
    */
-  function spentText(entry: TaskEntry): string | null {
-    if (entry.status === 'closed') {
-      return `Error: task ${entry.taskId} was closed by the master; close is final, so there is nothing to resume or send to. Start a new subagent for further work.`;
+  /** Refusal verdict from the durable facts alone (S12): a synthesized memory status never
+   *  authorizes it, so a closed record answers final whatever the caller resolved. */
+  function spentText(row: TaskRow): string | null {
+    if (isClosed(row)) {
+      return `Error: task ${row.taskId} was closed by the master; close is final, so there is nothing to resume or send to. Start a new subagent for further work.`;
     }
-    if (entry.status === 'consumed' && entry.lifecycle === 'one-shot') {
-      return `Error: task ${entry.taskId} was a one-shot and already delivered its verdict; there is nothing to resume. Spawn a new one-shot for new work.`;
+    if (isSpent(row)) {
+      return `Error: task ${row.taskId} was a one-shot and already delivered its verdict; there is nothing to resume. Spawn a new one-shot for new work.`;
     }
     return null;
   }
@@ -629,13 +638,11 @@ export default function subagentPlugin(ctx: Context): void {
     const taskId = resolution.taskId;
     const latest = readTaskRecord(cwd, taskId);
     if (!latest) return toolError(`Error: no history for task "${taskId}" in this repository's tasks (${dir}).`);
-    // Resume needs an unresolved task: a closed one is final, a spent one-shot has no session left.
+    // Resume needs an unresolved task: a closed one is final, a spent one-shot has no session
+    // left. The verdict derives from the record's durable facts, never from a synthesized status —
+    // a record closed before its report was consumed still says closed (S9).
     {
-      const verdict = spentText({
-        ...latest,
-        gen: { ...latest.gen },
-        status: latest.gen.consumedAt !== null ? 'consumed' : 'settled',
-      });
+      const verdict = spentText(latest);
       if (verdict !== null) return toolError(verdict);
     }
 
@@ -658,7 +665,6 @@ export default function subagentPlugin(ctx: Context): void {
           tabName: latest.gen.tabName || tabNameForTask(latest.description),
           consumedAt: null,
         },
-        createdAt: Date.now(),
         status: 'running',
       };
       // One row per task: the revived generation replaces whatever the restore seeded, and stale

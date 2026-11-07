@@ -570,21 +570,24 @@ test('slugs: spawn allocates and dedupes; list/send accept slug, slug@paneId, an
       assert.equal((env.frames[0] as { text?: string }).text, `ping ${ref}`);
     }
     // A stale combined ref (revived row changed its paneId) still resolves through the slug part.
-    const stale = await runSubagent(env.pi, { action: 'send', agentId: 'fix-auth-flow@pOld', message: 'still me' }, env.cwd);
+    const stale = await runSubagent(
+      env.pi, { action: 'send', agentId: 'fix-auth-flow@pOld', message: 'still me' }, env.cwd);
     assert.match(stale.content[0]!.text, /Message sent to subagent fix-auth-flow@p2/);
   }, { paneSeq: true });
 });
 
 /* ── P1: TaskRow + the two documents ───────────────────────────── */
 
-test('tasks: a reload restores two workers from the records, and both close by the refs list printed', async () => {
+test('tasks: a reload restores two workers from the records, and both close by ref', async () => {
   const sessionStamp = '2026-11-07T00-00-00-000Z_aaaaaaaa-0000-4000-8000-000000000000.jsonl';
   const sessionFor = (cwd: string): string => join(cwd, sessionStamp);
   await withPipeEnv(async (env) => {
     env.parkPollers();
     const sessionFile = sessionFor(env.cwd);
-    const first = await runSubagent(env.pi, { description: 'reload probe one', prompt: PROMPT }, env.cwd);
-    const second = await runSubagent(env.pi, { description: 'reload probe two', prompt: PROMPT }, env.cwd);
+    const spawn = (description: string) =>
+      runSubagent(env.pi, { description, prompt: PROMPT }, env.cwd);
+    const first = await spawn('reload probe one');
+    const second = await spawn('reload probe two');
     await waitFor(() => env.frames.length === 2);
     const ids = [first.details?.taskId, second.details?.taskId] as string[];
     const piBefore = env.pi;
@@ -617,7 +620,25 @@ test('tasks: a reload restores two workers from the records, and both close by t
 
     // No session entry was appended: the branch is not a document in this model.
     for (const [n, pi] of [piBefore, env.pi].entries()) {
-      assert.ok(!pi.entries.some(([type]) => type === 'piher.subs'), `mount #${n + 1} appended no piher.subs entry`);
+      const subs = pi.entries.some(([type]) => type === 'piher.subs');
+      assert.ok(!subs, `mount #${n + 1} appended no piher.subs entry`);
     }
   }, { paneSeq: true, sessionFile: sessionFor });
+});
+
+test('tasks: no transcript path keeps the view in memory, records still land (S25)', async () => {
+  // No `sessionFile` option: the host reports no transcript path, so there is no view document —
+  // only the in-memory view — while task records still land under the repository.
+  await withPipeEnv(async (env) => {
+    env.parkPollers();
+    const spawned = await runSubagent(
+      env.pi, { description: 'memory-view probe', prompt: PROMPT }, env.cwd);
+    await waitFor(() => env.frames.length === 1);
+    const taskId = spawned.details?.taskId as string;
+    const text = (await runSubagent(env.pi, { action: 'list' }, env.cwd)).content[0]!.text;
+    assert.match(text, /memory-view probe/, 'list still shows the worker from the memory view');
+    const row = readTaskRecord(env.cwd, taskId);
+    assert.equal(row?.taskId, taskId, 'the task record still lands under the repository');
+    assert.equal(row?.description, 'memory-view probe');
+  });
 });

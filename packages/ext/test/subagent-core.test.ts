@@ -589,6 +589,65 @@ test('subagent plugin: a task closed in another session does not come back as se
   }
 });
 
+test('subagent plugin: resume refuses a record closed before its report was consumed (S9)', async () => {
+  // Close on a settled persistent worker writes `closedAt` with `consumedAt` still null. The resume
+  // verdict derives from those durable facts, so a disk-only row — another session's closed task —
+  // can never revive, whatever status a memory copy would have synthesized for it.
+  const repo = mkdtempSync(join(tmpdir(), 'piher-resume-closed-'));
+  mkdirSync(join(repo, '.git'), { recursive: true });
+  const taskId = 'c10aff1e-0000-4000-8000-000000000001';
+  try {
+    seedTaskDocuments(null, [{
+      taskId, paneId: 'pGone', cwd: repo, description: 'closed before report',
+      status: 'settled', createdAt: 1, closedAt: 2, consumedAt: null,
+    }]);
+    const { root, pi } = await mountSubagent({ deps: { getCwd: () => repo } });
+    try {
+      const refused = await runSubagentRejects(pi, { action: 'resume', taskId }, repo);
+      assert.match(refused, /closed by the master/);
+      assert.match(refused, /close is final/);
+    } finally {
+      await root.fiber.dispose();
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('subagent plugin: send to a disk-closed task never revives a new generation (S9/S24)', async () => {
+  // Memory still holds the row as running when another session closes its record. The pane is gone,
+  // so `send` reaches `reviveEntry` — which re-reads the disk authority and refuses instead of
+  // putting a live pane behind a record that still says closed.
+  const repo = mkdtempSync(join(tmpdir(), 'piher-send-closed-'));
+  mkdirSync(join(repo, '.git'), { recursive: true });
+  const taskId = 'c10aff1e-0000-4000-8000-000000000002';
+  const seed = (closedAt: number | null): void => {
+    seedTaskDocuments(null, [{
+      taskId, paneId: 'pDead', cwd: repo, description: 'closed elsewhere',
+      status: 'running', createdAt: 1, closedAt, consumedAt: null,
+    }]);
+  };
+  try {
+    seed(null);
+    const { root, pi } = await mountSubagent({
+      client: { getTerminal: async () => null },
+      tasks: [taskRow({ paneId: 'pDead', taskId, cwd: repo, status: 'running' })],
+      deps: { getCwd: () => repo },
+    });
+    try {
+      seed(2);
+      const refused = await runSubagentRejects(pi, { action: 'send', agentId: 'pDead', message: 'x' }, repo);
+      assert.match(refused, /closed by the master/);
+      const record = readTaskRecord(repo, taskId);
+      assert.equal(record?.gen.paneId, 'pDead', 'no new generation was revived');
+    } finally {
+      await root.fiber.dispose();
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test('subagent plugin: close reclaims a running row whose pane is already gone', async () => {
   // A worker that stopped without a report leaves its row `running`. From a session that did not spawn
   // it there is no pane to probe alive, so refusing the close would keep that row forever.
