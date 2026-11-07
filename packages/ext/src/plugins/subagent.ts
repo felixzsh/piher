@@ -411,8 +411,6 @@ export default function subagentPlugin(ctx: Context): void {
   const { probeAlive } = session;
   const { spawnPaneInTaskTab, launchParts, approveFor, waitSubReady, findExistingPane } = spawn;
 
-  /** P0-2: re-arm pollers for live running panes after a master restart, or settle notices stop arriving
-   * and ledger rows stay 'running'. The `recover-*` requestId is never echoed by a worker, so this claim wins. */
   /** Re-arm settlement watches after a restart: only rows still awaiting a report whose pane core
    *  still lists. A delivered report needs no watch; a closed task is final; a gone pane is
    *  `resume` work, not a re-arm. The liveness lookup decides — never a stored status. */
@@ -938,8 +936,8 @@ export default function subagentPlugin(ctx: Context): void {
 
   /** Re-send the prompt this task was spawned with. An upstream failure (a provider outage, a dropped
    *  stream) says nothing about the task, and rewriting the brief costs the master real tokens: the
-   *  stored prompt makes the retry free. A spent row is revived first, because a one-shot that already
-   *  reported has no pane left to take the text. */
+   *  stored prompt makes the retry free. A closed task or spent one-shot starts a new task with it —
+   *  there is no live turn to send into. */
   async function executeSubagentRetry(params: ToolParams, toolCtx: unknown) {
     const { entry, foreign } = targetOf(params, toolCtx);
     const spawnNew = (brief: string) => executeSubagentSpawn({
@@ -1076,7 +1074,7 @@ export default function subagentPlugin(ctx: Context): void {
       checkoutLine = ` ${releasedCheckoutLine(entry.worktree, released.removed)};`;
     }
     await retirePane(client, entry.gen.paneId);
-    // The record survives the pane: `resume` answers from it, so the decision is not lost.
+    // The record survives the pane so the decision is durable: `list` and the refusals answer from it.
     writeCloseRecord(recordCwd, entry);
     const doneText = `Subagent ${taskRef(entry.gen)} closed — pane and tab gone;${checkoutLine} `
       + 'close is final — start a new subagent for further work.';

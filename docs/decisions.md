@@ -42,10 +42,10 @@ or at a file that no longer exists, fails the suite.
 | D103 | A one-shot closes its space but never its checkout: the working tree is what the master reviews before deciding to merge | `packages/ext/src/plugins/subagent.ts:1` |
 | D99 | There is no `terminal` tool: an interactive shell is `hc`'s business through the bundled skill, so the extension never re-implements a PTY CLI | `packages/ext/skills/piher-tools/SKILL.md:1` |
 | D104 | The config catalog is one plane map: roles are per file, env is per process, and every value reports its source | `packages/ext/src/config-catalog-core.ts:1` |
-| D114 | Durability is two documents written through one store: a record per task under `<repo>/.piher/tasks` plus the session's view, and no other path under `.piher/` is ever created | `packages/ext/src/task-store.ts:1` |
+| D114 | Delegation state is two documents written through one store: a record per task under `<repo>/.piher/tasks` plus the session's view; nothing else under `.piher/` is delegation state | `packages/ext/src/task-store.ts:1` |
 | D115 | Three predicates decide a row's fate — `isClosed`, `isSpent`, `isActionable` — and nothing else in the codebase may interpret a row | `packages/ext/src/task-row.ts:1` |
 | D116 | Liveness is observed, never stored: `list` probes panes and transcripts at call time, and a stale observation may mislabel a row but never steers, revives or closes one | `packages/ext/src/task-row.ts:1` |
-| D117 | Close is final for every session: a closed task refuses `send`, `resume` and `retry`, and further work starts a new subagent | `packages/ext/src/plugins/subagent.ts:1` |
+| D117 | Close is final for every session: a closed task refuses `send`, `resume` and `interrupt` — no turn left to steer or stop — while `retry` starts a new task with the stored brief | `packages/ext/src/plugins/subagent.ts:1` |
 | D118 | Ownership derives from the session view: an actionable record outside it belongs to another session, listed but acted on only by `interrupt`, `output` and `close` | `packages/ext/src/plugins/subagent.ts:1` |
 | S1 | The package is the delegation surface: role manifests and tool wiring live here, and a workflow policy belongs to the prompt that asks for it | `packages/ext/src/index.ts:1` |
 | S2 | Write locks are a soft veto by default and a hard one under `PIHER_WRITE_LOCK=1`; the warning names every holder | `packages/ext/src/lock-core.ts:1` |
