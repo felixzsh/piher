@@ -16,6 +16,7 @@ import {
 } from '../../src/task-store.ts';
 import { sessionStatePath } from '../../src/session-state.ts';
 import type { SubagentPortBox } from '../../src/subagent-core.ts';
+import type { TaskRow } from '../../src/task-row.ts';
 import { NodeGitAdapter, createSpawner, type GitExecFile } from '../../src/subagent-spawn.ts';
 import {
   TempHome, fakeCore, fakeWatch, fire, jsonl, mountSubagent, readTaskView, runSubagent, runSubagentRejects,
@@ -636,6 +637,30 @@ test('tasks: a reload restores two workers from the records, and both close by r
 
 const aStamp = '2026-11-07T00-00-00-000Z_aaaaaaaa-0000-4000-8000-000000000000.jsonl';
 
+// A foreign action must leave the row's identity and decision alone. The owning session's
+// poller still watches the pane and may honestly write delivery fields (gen.consumedAt,
+// gen.reportDelivered) into its own record at any moment — one writer per document — so
+// those two are excluded: a byte comparison would fail on the owner's write, not on ours.
+function stableRowFields(row: TaskRow) {
+  return {
+    taskId: row.taskId,
+    description: row.description,
+    kind: row.kind,
+    lifecycle: row.lifecycle,
+    cwd: row.cwd,
+    createdAt: row.createdAt,
+    closedAt: row.closedAt,
+    gen: {
+      paneId: row.gen.paneId,
+      slug: row.gen.slug,
+      tabId: row.gen.tabId,
+      sessionFile: row.gen.sessionFile,
+      launchCommand: row.gen.launchCommand,
+      startedAt: row.gen.startedAt,
+    },
+  };
+}
+
 test('ownership: foreign rows list marked, close final, retry starts new', async () => {
   // Two mounts share one repository directory with different session files. Foreignness derives
   // from the view alone: a record the view does not name belongs to another session (S10 keeps
@@ -708,12 +733,12 @@ test('ownership: foreign rows list marked, close final, retry starts new', async
         await runSubagentRejects(bMount.pi, { action: 'retry', agentId: w1!.paneId }, env.cwd),
         /belongs to another session/);
 
-      // Foreign output works and writes nothing: the record and B's view are untouched.
-      const before = readFileSync(taskRecordPath(repoTasksDir(env.cwd)!, w1!.taskId), 'utf8');
+      // Foreign output answers from live probes: the row's identity and decision are
+      // unchanged (delivery fields excluded — see stableRowFields), and B's view is untouched.
+      const before = stableRowFields(readTaskRecord(env.cwd, w1!.taskId)!);
       const out = await runSubagent(bMount.pi, { action: 'output', agentId: w1!.paneId }, env.cwd);
       assert.equal(out.details!.reportDelivered, false);
-      const recordPath = taskRecordPath(repoTasksDir(env.cwd)!, w1!.taskId);
-      assert.equal(readFileSync(recordPath, 'utf8'), before);
+      assert.deepEqual(stableRowFields(readTaskRecord(env.cwd, w1!.taskId)!), before);
       assert.equal(readTaskView(bSession), null, 'no view document grows from foreign rows');
 
       // Once the panes report gone, B stops listing them: no `no pane` line for foreign rows.
@@ -772,9 +797,8 @@ test('ownership: foreign rows list marked, close final, retry starts new', async
       assert.equal(aNewRow.description, 'shared worker one');
 
       // Retry on a foreign closed task starts a NEW task (S2): a new id in B's view alone,
-      // A's brief re-sent, A's record byte-identical.
-      const aRecordPath = taskRecordPath(repoTasksDir(env.cwd)!, w1!.taskId);
-      const aRecordBefore = readFileSync(aRecordPath, 'utf8');
+      // A's brief re-sent, A's row identity and decision unchanged (delivery excluded).
+      const aRecordBefore = stableRowFields(readTaskRecord(env.cwd, w1!.taskId)!);
       const retried = await runSubagent(
         bMount.pi, { action: 'retry', agentId: w1!.taskId }, env.cwd);
       assert.match(retried.content[0]!.text, /^started subagent/);
@@ -784,7 +808,8 @@ test('ownership: foreign rows list marked, close final, retry starts new', async
       assert.equal(readTaskRecord(env.cwd, newTaskId)?.description, 'shared worker one');
       await waitFor(() => bFrames.length === 1);
       assert.equal((bFrames[0] as { text?: string }).text, PROMPT, 'the stored brief is re-sent');
-      assert.equal(readFileSync(aRecordPath, 'utf8'), aRecordBefore, 'A’s record is untouched');
+      assert.deepEqual(
+        stableRowFields(readTaskRecord(env.cwd, w1!.taskId)!), aRecordBefore, 'A’s row is untouched');
     } finally {
       await bMount.root.fiber.dispose();
       for (const sock of bSockets) sock.destroy();
