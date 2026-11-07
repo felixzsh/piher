@@ -101,6 +101,21 @@ export function decideCheckoutSpaces(opts: {
 
 /** One line the master can act on. It names the decision, never a countdown: nothing closes by
  *  itself, and housekeeping never ends a window that still holds an idle worker. */
+/** Whether the channel heartbeat should ping this row at all. Only a worker with a turn in flight has a
+ *  channel to lose: a settled row's pane may be exiting, and `unknown` means pi has not reported a state
+ *  yet — the process is still booting and its pipe is seconds away. Announcing a loss in either case is
+ *  noise the master has to read and act on. */
+export function planChannelCheck(input: {
+  rowStatus: string;
+  /** What core reports for the pane; `undefined` when it does not list the terminal at all. */
+  terminalStatus: string | undefined;
+}): 'skip' | 'ping' {
+  if (input.rowStatus !== 'running') return 'skip';
+  if (input.terminalStatus === undefined) return 'skip';
+  if (input.terminalStatus === 'unknown') return 'skip';
+  return 'ping';
+}
+
 /** A worker whose pane is alive but whose channel is gone can never receive a follow-up: say it once,
  *  with the two ways out, so the master does not discover it on the next `send`. */
 export function formatDeadChannelNotice(opts: {

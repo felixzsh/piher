@@ -7,6 +7,7 @@ import { basename } from 'node:path';
 import type { CoreClientLike, CoreEnv, TerminalInfo } from './core-client.ts';
 import {
   decideCheckoutSpaces,
+  planChannelCheck,
   formatDeadChannelNotice,
   formatIdleCheckoutNotice,
   shouldClosePane,
@@ -265,20 +266,18 @@ export function createGcController(h: GcHost): GcController {
    *  when the message matters. Never settles, never closes, never touches the row. */
   async function sweepChannels(statuses: ReadonlyMap<string, string>): Promise<void> {
     for (const e of [...h.subs.values()]) {
-      // Only a worker with a turn in flight needs a channel. A settled row's pane may be exiting (a
-      // one-shot), and pinging it there announces a loss that costs nothing: `send` reports it exactly
-      // when it matters.
-      if (e.status !== 'running' || !e.paneId) continue;
-      // A pane that is gone has no channel by design: revive/close own that case.
+      if (!e.paneId) continue;
       const status = statuses.get(e.paneId);
-      if (status === undefined) continue;
+      if (planChannelCheck({ rowStatus: e.status, terminalStatus: status }) === 'skip') continue;
+      // Past the planner the terminal is listed and reported: the notice may name its state.
+      const reported = status ?? 'unknown';
       let ok = false;
       try {
         ok = (await pipeRequestTo(e.cwd, e.paneId, { type: 'ping', id: `hb-${Date.now()}` }, 1_500)).type === 'ok';
       } catch {
         ok = false;
       }
-      trace(traceRole, 'pipe-heartbeat', { pane: e.paneId, ok, status });
+      trace(traceRole, 'pipe-heartbeat', { pane: e.paneId, ok, status: reported });
       if (ok) {
         deadChannelNotified.delete(e.paneId);
         continue;
@@ -286,7 +285,7 @@ export function createGcController(h: GcHost): GcController {
       if (deadChannelNotified.has(e.paneId)) continue;
       deadChannelNotified.add(e.paneId);
       try {
-        await h.deliverNotice?.(formatDeadChannelNotice({ paneId: e.paneId, taskId: e.taskId, status }), e.paneId, null);
+        await h.deliverNotice?.(formatDeadChannelNotice({ paneId: e.paneId, taskId: e.taskId, status: reported }), e.paneId, null);
       } catch {
         /* the next pass re-announces: the latch is only set for a delivered notice */ 
         deadChannelNotified.delete(e.paneId);

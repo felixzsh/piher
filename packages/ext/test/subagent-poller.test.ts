@@ -243,6 +243,22 @@ test('pollLoop: a one-shot worker is reclaimed at settlement by the pair close u
   assert.deepEqual(persistent.retired, [], 'a persistent worker stays reachable for the next send');
 });
 
+test('pollLoop: the same closing text is announced once, even from two request ids', async () => {
+  // A recovery re-arm and a live request settle the same transcript under different ids, and the claim
+  // is per request: without a fingerprint the master reads one settlement twice (seen live, 71 ms apart).
+  const f = fixture(makeEntry('p-dup', { settleWindowStartedAt: 10_000 }));
+  await start(f, 'recover-session_start-p-dup');
+  assert.equal(f.notices.length, 1);
+
+  const second = fixture(makeEntry('p-dup', {
+    settleWindowStartedAt: 20_000,
+    noticeAnnounced: { fingerprint: f.entry!.noticeAnnounced!.fingerprint, at: 13_000 },
+  }));
+  await start(second, 'prompt-2');
+  assert.equal(second.notices.length, 0, 'the same words are not a second settlement');
+  assert.equal(second.entry!.status, 'consumed', 'the row still settles: the notice was the duplicate');
+});
+
 test('pollLoop: a lost settle claim suppresses the notice but not the ledger write', async () => {
   const f = fixture(makeEntry('p-dedup', { settleWindowStartedAt: 10_000 }));
   f.setClaim(false);

@@ -207,6 +207,10 @@ export interface SubEntry {
   /** The final report `subagent output` already returned (tail fingerprint + time): the settlement
    *  notice then points at that delivery instead of repeating the report. Durable across resume. */
   reportDelivered?: { fingerprint: string; at: number } | null;
+  /** The closing text already announced for this pane (fingerprint + time). Two pollers can settle the
+   *  same transcript — a recovery re-arm and a live request carry different ids — and the claim is per
+   *  request, so this is what stops the master from reading one settlement twice. */
+  noticeAnnounced?: { fingerprint: string; at: number } | null;
   /** S71: the checkout this spawn asked piher to create; its record is what authorises a removal. */
   worktree?: WorktreeRecord;
 }

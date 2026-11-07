@@ -84,6 +84,9 @@ export function isSettlementCandidate(input: {
   return !input.pendingTool && input.activity === true && input.terminalIdle === true;
 }
 
+/** How long one closing text counts as announced for a pane (see noticeAnnounced). */
+const NOTICE_DEDUPE_WINDOW_MS = 5 * 60_000;
+
 export function buildSettlementNoticeText(
   agentLabel: string,
   closing: string | null,
@@ -281,6 +284,17 @@ export function createPoller(h: PollerHost): Poller {
         }
         claimedKey = claimKey;
       }
+      // The same closing text, already announced for this pane, is one settlement: a recovery re-arm and
+      // a live request carry different ids, so the claim alone lets the master read it twice. The window
+      // keeps a genuinely new turn that happens to say the same words from being swallowed.
+      const fingerprint = closing === null ? null : reportFingerprint(closing);
+      const announced = entry.noticeAnnounced;
+      if (fingerprint !== null && announced && announced.fingerprint === fingerprint
+        && now() - announced.at < NOTICE_DEDUPE_WINDOW_MS) {
+        trace(traceRole, 'notice-dup', { pane: paneId, request: request.requestId, at: announced.at });
+        consume(closing, 'poll-settle', now());
+        return 'done';
+      }
       // `subagent output` may already have returned this exact report: point there, don't repeat it.
       const delivered = closing && entry.reportDelivered?.fingerprint === reportFingerprint(closing)
         ? entry.reportDelivered.at
@@ -296,6 +310,10 @@ export function createPoller(h: PollerHost): Poller {
       } catch (err) {
         trace(traceRole, 'inject-failed', { pane: paneId, request: request.requestId, error: String((err as Error)?.message ?? err) });
         return 'retry';
+      }
+      if (fingerprint !== null) {
+        entry.noticeAnnounced = { fingerprint, at: now() };
+        h.persistSubs();
       }
       consume(closing, 'poll-settle', now());
       trace(traceRole, 'consumed', { pane: paneId, via: 'poll-settle', request: request.requestId });

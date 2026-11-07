@@ -9,7 +9,7 @@ import { SUBS_REGISTRY_TAIL, type SubEntry } from '../../src/subagent-core.ts';
 import { checkoutSpaceId } from '../../src/worktree.ts';
 import type { TerminalInfo } from '../../src/core-client.ts';
 import {
-  decideCheckoutSpaces, formatIdleCheckoutNotice, shouldClosePane, shouldCloseTaskTab,
+  decideCheckoutSpaces, formatIdleCheckoutNotice, planChannelCheck, shouldClosePane, shouldCloseTaskTab,
   type CheckoutRowLike, type GcEntryLike,
 } from '../../src/gc-core.ts';
 
@@ -146,6 +146,17 @@ test('registry: startup settles zombie running rows whose terminal core no longe
   } finally {
     await root.fiber.dispose();
   }
+});
+
+test('planChannelCheck: only a worker with a turn in flight has a channel to lose', () => {
+  // Seen live: the heartbeat announced "its message channel is gone" for a worker that was still booting
+  // (`unknown`, no OSC report yet) — one second before that worker registered its own pipe.
+  assert.equal(planChannelCheck({ rowStatus: 'running', terminalStatus: 'working' }), 'ping');
+  assert.equal(planChannelCheck({ rowStatus: 'running', terminalStatus: 'idle' }), 'ping', 'an idle worker is still addressable');
+  assert.equal(planChannelCheck({ rowStatus: 'running', terminalStatus: 'unknown' }), 'skip', 'a booting pane has no channel yet');
+  assert.equal(planChannelCheck({ rowStatus: 'running', terminalStatus: undefined }), 'skip', 'a pane core does not list is revive/close work');
+  assert.equal(planChannelCheck({ rowStatus: 'settled', terminalStatus: 'idle' }), 'skip', 'a settled row needs no channel');
+  assert.equal(planChannelCheck({ rowStatus: 'consumed', terminalStatus: 'working' }), 'skip', 'nor a consumed one');
 });
 
 test('decideCheckoutSpaces: an empty window closes, a finished-but-open one only gets a reminder', () => {

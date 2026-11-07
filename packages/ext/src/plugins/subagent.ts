@@ -847,8 +847,10 @@ export default function subagentPlugin(ctx: Context): void {
       );
     }
     if (entry.status !== 'running') {
+      // The natural move for a finished worker is to reclaim it; a pointer that omits `close` sends the
+      // master looking for a turn that will never come back.
       return toolError(
-        `Error: subagent ${subRef(entry)} has no running turn (status: ${entry.status}) — interrupt stops the current turn only, and this worker already finished its last one. Send it a follow-up with action "send" if its pane is still listed, or revive it with action "resume" and taskId ${entry.taskId}.`,
+        `Error: subagent ${subRef(entry)} has no running turn (status: ${entry.status}) — interrupt stops the current turn only, and this worker already finished its last one. Close it with action "close" if its work is accepted, send it a follow-up with action "send" if its pane is still listed, or revive it with action "resume" and taskId ${entry.taskId}.`,
       );
     }
     return pipeAction(entry, {
