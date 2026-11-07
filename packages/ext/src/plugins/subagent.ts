@@ -388,13 +388,17 @@ export default function subagentPlugin(ctx: Context): void {
     }
   }
 
-  scoped.on('session_start', async (_event: unknown, eventCtx: unknown) => {
-    registry.rebuild(eventCtx);
+  scoped.on('session_start', async (event: unknown, eventCtx: unknown) => {
+    // The reason is core's own word for it (`startup`, `reload`, `new`, `resume`, `fork`): the one
+    // that costs the registry its rows is the one that makes a new extension instance, and the trace
+    // line must name it or the loss can only be guessed at afterwards.
+    const reason = (event as { reason?: string } | undefined)?.reason;
+    registry.rebuild(eventCtx, reason ?? 'session_start');
     await registry.sweepZombieRunning();
     await recoverRunningPollers('session_start');
   });
   scoped.on('session_tree', async (_event: unknown, eventCtx: unknown) => {
-    registry.rebuild(eventCtx);
+    registry.rebuild(eventCtx, 'session_tree');
     await registry.sweepZombieRunning();
     await recoverRunningPollers('session_tree');
   });

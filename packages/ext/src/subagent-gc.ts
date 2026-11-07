@@ -45,7 +45,7 @@ interface SubagentRegistryHost {
 interface SubagentRegistry {
   /** Append the registry snapshot to the session branch; duplicate snapshots are skipped. */
   persist(): void;
-  rebuild(eventCtx: unknown): void;
+  rebuild(eventCtx: unknown, via?: string): void;
   sweepZombieRunning(): Promise<void>;
 }
 
@@ -65,13 +65,25 @@ export function createSubagentRegistry(host: SubagentRegistryHost): SubagentRegi
     }
   }
 
-  function rebuild(eventCtx: unknown): void {
+  /** Replay the branch's last snapshot. `via` is the trigger core gave us (`session_start` reason or
+   *  `session_tree`), because the interesting case is the one where the registry is NOT carried over. */
+  function rebuild(eventCtx: unknown, via = 'branch'): void {
     try {
+      const before = host.subs.size;
       const entries = (eventCtx as { sessionManager?: { getBranch?: () => readonly unknown[] } })
         ?.sessionManager?.getBranch?.() ?? [];
       const registry = foldSubsRegistry(entries as Parameters<typeof foldSubsRegistry>[0]);
       for (const entry of registry.subs) host.subs.set(entry.paneId, entry);
       lastSnapshot = ''; // branch replay replaced live state; force the next persist
+      // `before` is what tells the two regimes apart: a positive count means the same instance kept
+      // its rows and the fold is additive, while `before=0` is a reload — a NEW instance whose whole
+      // memory is the bounded tail of the branch snapshot (S73), so anything older is simply gone.
+      trace(traceRole, 'registry-rebuild', {
+        via,
+        before,
+        restored: registry.subs.length,
+        rows: host.subs.size,
+      });
     } catch {
       /* registry recovery failure must not block the live session */
     }
