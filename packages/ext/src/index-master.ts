@@ -23,6 +23,8 @@ export interface MasterPluginMount {
   deliverNotice: (content: string, paneId?: string, card?: SettlementCard | null) => Promise<void>;
   noticePending: () => ReadonlySet<string>;
   getSessionId: () => string;
+  /** This session's transcript path; the subagent registry is stored beside it. */
+  getSessionFile: () => string | null;
   claimSettleNotice: (key: string) => boolean;
 }
 
@@ -78,6 +80,7 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
     deliverNotice: m.deliverNotice,
     noticePending: m.noticePending,
     getSessionId: m.getSessionId,
+    getSessionFile: m.getSessionFile,
     claimSettleNotice: m.claimSettleNotice,
     terminalState: jobDeps.state,
   });

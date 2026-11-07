@@ -63,6 +63,10 @@ export default async function (pi: ExtensionAPI) {
   const { client, env } = createCoreClient();
   /** RFC rfc-delegation-identity §2.1: resolved env → marker → branch fold; worker panes only. */
   let delegation: DelegationContext | null = parseDelegationContext(process.env.PIHER_DELEGATION);
+  /** The transcript path core reports, cached at session start: piher's per-session state root
+   *  (`piher/<id>/`) hangs off its directory, and re-deriving it by scanning the session dir fails
+   *  before the file exists — which is exactly when `session_start` fires. */
+  let ownSessionPath: string | null = null;
   const initialManifest =
     parseRuntimeManifest(process.env.PIHER_ROLE_MANIFEST) ??
     (mode.composeMaster ? composeMasterRuntime() : null);
@@ -84,6 +88,15 @@ export default async function (pi: ExtensionAPI) {
   let d96NoticeAt = 0;
 
   /** Session identity: sessionManager is authoritative (env may be unset in print/RPC mode). */
+  function reportedSessionFile(ctx: unknown): string | null {
+    try {
+      const sm = (ctx as { sessionManager?: { getSessionFile?: () => string | undefined } }).sessionManager;
+      return sm?.getSessionFile?.() ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   function resolveSessionId(ctx: unknown): string {
     try {
       const sm = (ctx as {
@@ -321,6 +334,7 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on('session_start', async (event, ctx) => {
     sessionId = resolveSessionId(ctx);
+    ownSessionPath = reportedSessionFile(ctx);
     latestCtx = ctx as { abort?: () => void } | null;
     // On resume pi restores widget state from the session; calling setWidget again
     // breaks the TUI '/' command-panel route (v1.3 M9).
@@ -372,6 +386,7 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on('session_tree', async (_event, ctx) => {
     sessionId = resolveSessionId(ctx);
+    ownSessionPath = reportedSessionFile(ctx) ?? ownSessionPath;
     // pi reverts the transcript loadout at the navigated branch point; the role
     // runtime follows the same point (same-origin, RFC §4.3).
     roles.syncFromBranch(ctx);
@@ -475,6 +490,10 @@ export default async function (pi: ExtensionAPI) {
       deliverNotice,
       noticePending: notices.noticePending,
       getSessionId: () => sessionId,
+      // The registry lives beside the transcript; the reported path is authoritative, and the scan by
+      // id is only the fallback for a host that reports an id instead of a file.
+      getSessionFile: () => ownSessionPath
+        ?? (sessionId ? resolveSessionFileValue(process.cwd(), agentSessionsDir(), sessionId) : null),
       claimSettleNotice,
     });
 

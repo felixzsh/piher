@@ -67,6 +67,8 @@ import {
 } from '../worktree.ts';
 import { createPoller } from '../subagent-poller.ts';
 import { createGcController, createSubagentRegistry, retirePane } from '../subagent-gc.ts';
+import { sessionStatePath } from '../session-state.ts';
+import { REGISTRY_FILE_NAME } from '../subagent-registry-file.ts';
 import { trace, traceRole } from '../trace.ts';
 import { createSessionIo, executeSubagentOutput, type SubagentOutputCursor } from '../subagent-session.ts';
 import type { WorkerWidgetRow } from '../tree-view.ts';
@@ -82,6 +84,8 @@ export interface SubagentDeps {
   sessionRoot: Context;
   port: SubagentPortBox;
   getSessionId: () => string;
+  /** This session's transcript path, for piher's per-session state root; null when it has none. */
+  getSessionFile?: () => string | null;
   claimSettleNotice: (key: string) => boolean;
   /** Settlement notice injector from index: buffer while busy, flush at turn_end. */
   deliverNotice?: (content: string, paneId?: string, card?: SettlementCard | null) => Promise<void>;
@@ -222,7 +226,13 @@ export default function subagentPlugin(ctx: Context): void {
     appendLedger(ledgerCwd ?? e.cwd, { ...toHistory(e, outcome), ...(patch ?? {}), ...(via ? { via } : {}) });
   }
 
-  const registry = createSubagentRegistry({ pi, client, subs, writeHistory });
+  const registry = createSubagentRegistry({
+    pi,
+    client,
+    subs,
+    writeHistory,
+    registryFile: () => sessionStatePath(d.getSessionFile?.() ?? null, REGISTRY_FILE_NAME),
+  });
   const { persist: persistSubs } = registry;
   const git = createGitIo();
   const checkout = d.checkoutIo ?? createCheckoutIo();
@@ -389,10 +399,12 @@ export default function subagentPlugin(ctx: Context): void {
   }
 
   scoped.on('session_start', async (event: unknown, eventCtx: unknown) => {
-    // The reason is core's own word for it (`startup`, `reload`, `new`, `resume`, `fork`): the one
-    // that costs the registry its rows is the one that makes a new extension instance, and the trace
-    // line must name it or the loss can only be guessed at afterwards.
+    // The reason is core's own word for it (`startup`, `reload`, `new`, `resume`, `fork`): a fork is
+    // the only one that lands on a session file with no state of its own, so it inherits the parent's
+    // registry document before the restore reads it.
     const reason = (event as { reason?: string } | undefined)?.reason;
+    const previous = (event as { previousSessionFile?: string } | undefined)?.previousSessionFile;
+    if (reason === 'fork' || reason === 'resume') registry.seed(previous ?? null);
     registry.rebuild(eventCtx, reason ?? 'session_start');
     await registry.sweepZombieRunning();
     await recoverRunningPollers('session_start');

@@ -45,10 +45,12 @@ function card(lines: readonly string[]): RenderComponent {
 }
 
 /**
- * How the registry entry renders in the transcript (S73 keeps it a record). `rows` shows the count and,
- * expanded, one row per worker: the master's fan-out at a glance, which is what someone monitoring a
- * session wants. `summary` is the quiet form — one line while workers run, nothing once they settle —
- * and `off` renders nothing at all. Switch it with `PIHER_SUBAGENT_CARDS=rows|summary|off`.
+ * How a registry entry renders in the transcript. The registry itself now lives in the session's own
+ * document (`subagent-registry-file.ts`), so this only paints the `piher.subs` entries an older build
+ * left behind — kept so replaying one of those sessions does not lose the fan-out card. `rows` shows the
+ * count and, expanded, one row per worker: the master's fan-out at a glance, which is what someone
+ * monitoring a session wants. `summary` is the quiet form — one line while workers run, nothing once
+ * they settle — and `off` renders nothing at all. Switch it with `PIHER_SUBAGENT_CARDS=rows|summary|off`.
  */
 export type SubagentCardMode = 'rows' | 'summary' | 'off';
 

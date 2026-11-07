@@ -7,9 +7,8 @@
 import type { DelegationContext } from './delegation-core.ts';
 import { delegationFromRecord } from './delegation-core.ts';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { bareSessionId } from './session-tail.ts';
-import { isValidSessionId } from './storage-layout.ts';
+import { dirname } from 'node:path';
+import { sessionStatePath } from './session-state.ts';
 
 export interface WorkerMarker {
   readonly v: 1;
@@ -21,12 +20,7 @@ export interface WorkerMarker {
 /** `<sessionDir>/piher/<sessionId>/worker.json` — the per-session state root piher owns. A bare id
  *  (`PI_SESSION_FILE=oneshot-sess-0001`, no transcript directory) has nowhere to sit, so no marker. */
 export function workerMarkerPath(sessionFile: string | null | undefined): string | null {
-  if (!sessionFile || typeof sessionFile !== 'string') return null;
-  const dir = dirname(sessionFile);
-  if (dir === '' || dir === '.') return null;
-  const id = bareSessionId(sessionFile);
-  if (!isValidSessionId(id)) return null;
-  return join(dir, 'piher', id, 'worker.json');
+  return sessionStatePath(sessionFile, 'worker.json');
 }
 
 export function readWorkerMarker(sessionFile: string | null | undefined): WorkerMarker | null {

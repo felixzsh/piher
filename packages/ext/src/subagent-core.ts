@@ -282,8 +282,9 @@ export function makeRegistry(subs: SubEntry[] = []): SubsRegistry {
   return { version: 2, subs };
 }
 
-/** Settled rows the persisted registry keeps beside the running ones (S73). The ledger holds every
- *  row, so a pruned entry still answers `list` and `resume`. */
+/** Rows the legacy branch entry kept beside the running ones (S73). Superseded by the per-session
+ *  registry file, which keeps every row: the constant now only bounds a snapshot written into a
+ *  session that predates the file (and the tests that pin that shape). */
 export const SUBS_REGISTRY_TAIL = 10;
 
 /** How recently a row left the running set: `consumedAt` moves forward as GC touches it, creation
@@ -292,18 +293,19 @@ function settledAt(sub: SubEntry): number {
   return Math.max(sub.consumedAt ?? 0, sub.createdAt);
 }
 
-/** What the session branch records: every running worker plus a bounded tail of the most recently
- *  settled ones, kept in registry order so a fold rebuilds the same sequence. */
+/** The durable registry: every row, kept in registry order so a reader rebuilds the same sequence.
+ *  `tail` bounds the non-running ones for the legacy branch entry; `null` keeps them all, which is
+ *  what the registry file does — a row the master can still address is a row a reload must not lose. */
 export function registrySnapshot(
   subs: Iterable<SubEntry>,
-  tail = SUBS_REGISTRY_TAIL,
+  tail: number | null = SUBS_REGISTRY_TAIL,
 ): SubsRegistry {
   const all = [...subs];
   const running = all.filter((sub) => sub.status === 'running');
   const settled = all.filter((sub) => sub.status !== 'running')
-    .sort((a, b) => settledAt(b) - settledAt(a))
-    .slice(0, Math.max(0, tail));
-  const kept = new Set([...running, ...settled]);
+    .sort((a, b) => settledAt(b) - settledAt(a));
+  const keptSettled = tail === null ? settled : settled.slice(0, Math.max(0, tail));
+  const kept = new Set([...running, ...keptSettled]);
   return makeRegistry(all.filter((sub) => kept.has(sub)));
 }
 

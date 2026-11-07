@@ -26,7 +26,7 @@ loads and both tools answer with that install command instead of running anythin
 | Tools | `subagent` (`spawn`, `send`, `output`, `list`, `interrupt`, `resume`, `role`, `close`, `help`), `bg_job` (`start`, `status`, `log`, `stop`, `list`) |
 | Commands | `/piher-tree`, `/piher-role`, `/piher-config`, `/piher-locks` |
 | Skill | `piher-tools` — when to delegate, what a prompt must contain, the answer-or-`BLOCKED:` report contract |
-| Session entries | `piher.subs`, `piher.delegation`, `piher.settlement`, `piher.role-manifest`, `piher.job-exit`, `piher.config-guide` |
+| Session entries | `piher.delegation`, `piher.settlement`, `piher.role-manifest`, `piher.job-exit`, `piher.config-guide` (`piher.subs` only on sessions written by an older build: the registry is now a per-session document) |
 | Terminal labels | `piher.session`, `piher.lock.<hash>` |
 
 ## Package contents

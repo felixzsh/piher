@@ -17,6 +17,8 @@ import {
 import type { SettlementCard } from './settlement-card.ts';
 import { checkoutSpaceId, type CheckoutSpace } from './worktree.ts';
 import { trace, traceRole } from './trace.ts';
+import { sessionStatePath } from './session-state.ts';
+import { REGISTRY_FILE_NAME, readRegistryFile, seedRegistryFile, writeRegistryFile } from './subagent-registry-file.ts';
 import { pipeRequestTo } from './pipe-channel.ts';
 import { runtimePolicy } from './runtime-policy.ts';
 import { swallow } from './swallow.ts';
@@ -40,12 +42,16 @@ interface SubagentRegistryHost {
   client: CoreClientLike;
   subs: Map<string, SubEntry>;
   writeHistory: (entry: SubEntry, patch?: { status?: SubEntry['status']; closedAt?: number }, via?: string) => void;
+  /** `<sessionDir>/piher/<sessionId>/registry.json`, or null when this session has nowhere to sit. */
+  registryFile: () => string | null;
 }
 
 interface SubagentRegistry {
-  /** Append the registry snapshot to the session branch; duplicate snapshots are skipped. */
+  /** Replace the registry document; an unchanged registry is not rewritten. */
   persist(): void;
   rebuild(eventCtx: unknown, via?: string): void;
+  /** A fork inherits the state it branched from; pi names the previous transcript. */
+  seed(previousSessionFile: string | null | undefined): void;
   sweepZombieRunning(): Promise<void>;
 }
 
@@ -54,22 +60,46 @@ export function createSubagentRegistry(host: SubagentRegistryHost): SubagentRegi
 
   function persist(): void {
     try {
-      const registry = registrySnapshot(host.subs.values());
+      const file = host.registryFile();
+      // `null` tail: the file keeps every row. Nothing addressable may be dropped on the way to disk —
+      // the whole point of leaving the session branch (S73 bounded that copy to ten settled rows).
+      const registry = file
+        ? registrySnapshot(host.subs.values(), null)
+        // A session with no transcript directory (a bare `PI_SESSION_FILE=oneshot-sess-0001` id) has
+        // nowhere to put a file, so the branch entry stays the durable copy and keeps its old bound:
+        // such a session is one process, and a reload of it is the process ending.
+        : registrySnapshot(host.subs.values());
       const snapshot = JSON.stringify(registry);
       if (snapshot === lastSnapshot) return;
+      if (file) writeRegistryFile(file, registry);
+      else host.pi.appendEntry?.(SUBS_CUSTOM_TYPE, registry);
       lastSnapshot = snapshot;
-      host.pi.appendEntry?.(SUBS_CUSTOM_TYPE, registry);
     } catch (err) {
       // Session logging must not break delegation; a silent failure here shows up as a ghost running row.
       swallow('subagent.persist-subs', err);
     }
   }
 
-  /** Replay the branch's last snapshot. `via` is the trigger core gave us (`session_start` reason or
-   *  `session_tree`), because the interesting case is the one where the registry is NOT carried over. */
+  /** Load the registry: the session's own document when there is one, else replay the branch what a
+   *  session written by an older build left there. The file is authoritative and skips the branch
+   *  scan entirely, which is also what keeps a reload cheap. */
   function rebuild(eventCtx: unknown, via = 'branch'): void {
     try {
       const before = host.subs.size;
+      const file = host.registryFile();
+      const fromFile = readRegistryFile(file);
+      if (fromFile) {
+        for (const entry of fromFile.subs) host.subs.set(entry.paneId, entry);
+        lastSnapshot = ''; // the file is the truth now; force the next persist to rewrite it
+        trace(traceRole, 'registry-rebuild', {
+          via,
+          source: 'file',
+          before,
+          restored: fromFile.subs.length,
+          rows: host.subs.size,
+        });
+        return;
+      }
       const entries = (eventCtx as { sessionManager?: { getBranch?: () => readonly unknown[] } })
         ?.sessionManager?.getBranch?.() ?? [];
       const registry = foldSubsRegistry(entries as Parameters<typeof foldSubsRegistry>[0]);
@@ -77,9 +107,10 @@ export function createSubagentRegistry(host: SubagentRegistryHost): SubagentRegi
       lastSnapshot = ''; // branch replay replaced live state; force the next persist
       // `before` is what tells the two regimes apart: a positive count means the same instance kept
       // its rows and the fold is additive, while `before=0` is a reload — a NEW instance whose whole
-      // memory is the bounded tail of the branch snapshot (S73), so anything older is simply gone.
+      // memory was the branch snapshot, the case that used to drop rows older than the tail (S73).
       trace(traceRole, 'registry-rebuild', {
         via,
+        source: 'branch',
         before,
         restored: registry.subs.length,
         rows: host.subs.size,
@@ -87,6 +118,13 @@ export function createSubagentRegistry(host: SubagentRegistryHost): SubagentRegi
     } catch {
       /* registry recovery failure must not block the live session */
     }
+  }
+
+  function seed(previousSessionFile: string | null | undefined): void {
+    const to = host.registryFile();
+    const from = sessionStatePath(previousSessionFile ?? null, REGISTRY_FILE_NAME);
+    if (!seedRegistryFile(to, from)) return;
+    trace(traceRole, 'registry-seed', { from: from ?? null, to: to ?? null });
   }
 
   async function sweepZombieRunning(): Promise<void> {
@@ -110,7 +148,7 @@ export function createSubagentRegistry(host: SubagentRegistryHost): SubagentRegi
     if (changed) persist();
   }
 
-  return { persist, rebuild, sweepZombieRunning };
+  return { persist, rebuild, seed, sweepZombieRunning };
 }
 
 /* ── GC ─────────────────────────────────────────────────────────── */

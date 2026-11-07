@@ -70,6 +70,8 @@ and the order of their lines is the story.
 | `probe` | `pane paneExists agentStatus` | the liveness/status core reports, the same answer `hc` gives |
 | `gc-view` | `panes running watch` | piher's own view each sweep: every running row with the status core reports for it (`absent` = core does not know that terminal) |
 | `recover` | `via running rearmed panes` | which running rows got a watcher back at session start |
+| `registry-rebuild` | `via source=file\|branch before restored rows` | what a session start/adopt left in the registry: `source=file` is the session's own document (the normal case), `branch` the legacy branch entries, and only `before=0` means the instance is new — the state where a bounded restore used to drop rows |
+| `registry-seed` | `from to` | a fork copied its parent's registry document, so it starts with the state it branched from |
 | `gc-release` | `pane via taskId` | housekeeping moved a row out of `running` (`gc` / `zombie-sweep`) |
 | `notice-buffered` | `pane queued contentLen` | the master was mid-turn, so the notice waits |
 | `notice-sent` / `notice-requeued` | `pane contentLen` / `… error` | delivered immediately, or kept for the next flush |
