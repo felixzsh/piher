@@ -100,3 +100,8 @@ repository the view does not name is another session's. `list` prints own rows t
 writes only that record. Correction round: the durable decisions became a read-through (`refreshFromRecord`
 at the shared spine and in `list`), so S24's "final on its next read" holds without a reload; `retry` of a
 closed or spent foreign row now reaches S2's new-task branch.
+
+P4 done: `b48e3a0` (range `97a599e..b48e3a0`), Risk: none (pure removal; acceptance asserted by the
+composition test), `npm test` 459/459 green (~7 s, run by the parent on that commit), Route: delegated.
+`tree-overlay.ts`, the `piher-tree` command, its projection and `SubagentPort.listRows` are gone; the
+resident widget keeps one line per running worker and its overflow hint names `subagent list`.
