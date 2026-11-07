@@ -11,6 +11,17 @@ const NULL_CLOSING_SENTENCE: Record<SettlementNullReason, string> = {
   silent: 'It left no closing message.',
 };
 
+/** A turn that ended without a report is a failure, not a settlement. Saying "finished" over an
+ *  upstream outage reads as success and lets the master move on with nothing: the notice must say the
+ *  task did not complete, why, and the one call that retries it for free. */
+export function formatFailureNotice(agentId: string, reason: string | null): string {
+  const why = reason && reason.trim() !== '' ? reason.trim() : 'the turn ended without a report';
+  return `Background subagent ${agentId} FAILED — no report was produced. Reason: ${why}. `
+    + 'The task did not complete and nothing it said is a result. '
+    + 'Retry it with subagent(action:"retry") — it re-sends the same prompt, so it costs no tokens — '
+    + 'or revive the session with action:"resume".';
+}
+
 /** Subagent settlement notice (aligned with DSH). `reportDeliveredAt`: the master already received
  *  this exact closing message through `subagent output`, so the notice points there instead. */
 export function formatSettlementNotice(

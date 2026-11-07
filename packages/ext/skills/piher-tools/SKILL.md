@@ -1,8 +1,8 @@
 ---
 name: piher-tools
 description: >-
-  Judgement for piher's two tools: when to delegate with subagent (spawn, send, output,
-  list, interrupt, close, resume, role, help), what a good prompt contains, how to read
+  Judgement for piher's two tools: when to delegate with subagent (spawn, send, retry,
+  output, list, interrupt, close, resume, role, help), what a good prompt contains, how to read
   the settlement notice that carries a worker's result, the answer-or-BLOCKED report
   contract, and when a background job (start, status, log, stop, list) beats bash. It also
   holds the `hc` recipes for the one thing no tool owns: driving a live interactive program.
@@ -84,6 +84,14 @@ buffered while you are busy, so a batch may hold several: it shows the first thr
 tail that names how many were withheld and points at the ledger.
 
 ## Following up
+
+`retry` takes `agentId` (or `taskId`) and no message: it re-sends the prompt the task was
+spawned with, which piher kept. That is the move after a failure that says nothing about the
+task — a provider outage, a dropped stream, a rate limit that ended the turn. Rewriting the
+brief costs tokens and adds nothing; a spent row is revived first, so one `retry` covers a
+one-shot that already reported. If the task was never spawned by this piher (a resumed
+session, another checkout's row) there is no stored prompt and the call says so: send the
+task explicitly instead.
 
 `send` takes `agentId` and `message`. To a working worker it lands at its next tool gap,
 inside the same turn — a correction, not a queue, because there is no inbox. To an idle or

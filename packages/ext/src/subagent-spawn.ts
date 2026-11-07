@@ -11,6 +11,7 @@ import { basename, resolve as pathResolve } from 'node:path';
 import { promisify } from 'node:util';
 import { childEnvironment, type CoreClientLike, type CoreEnv } from './core-client.ts';
 import { delegationEnv } from './delegation-core.ts';
+import { saveTaskPrompt } from './prompt-store.ts';
 import { bareSessionId } from './session-tail.ts';
 import { mainWorktreeRoot } from './storage-layout.ts';
 import { checkoutAckLine, checkoutSpaceId, ensureCheckout, planWorktree, releaseCheckout, type CheckoutIo, type CheckoutSpace, type WorktreeRecord } from './worktree.ts';
@@ -649,6 +650,9 @@ export function createSpawnAction(h: SpawnActionHost) {
       // A spawn's acknowledgement is the whole answer: what follows happens off the caller's turn.
       subs.set(paneId, entry);
       h.persistSubs();
+      // Keep the brief: an upstream failure is nobody's fault in the task, and `retry` re-sends this
+      // text instead of making the master spend tokens writing it again.
+      saveTaskPrompt(taskId, spec.prompt);
       const injectId = `prompt-${taskId}`;
       const boot = (async (): Promise<void> => {
         const ready = await waitSubReady(cwd, paneId);

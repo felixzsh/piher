@@ -7,7 +7,7 @@ import { Context } from '@deepseek-ai/cordis';
 import type { CoreClientLike, CoreStatus, TerminalInfo } from './core-client.ts';
 import { applyReportedSessionFile } from './history-store.ts';
 import { runtimePolicy, type RuntimePolicy } from './runtime-policy.ts';
-import { formatSettlementNotice, type SettlementNullReason } from './vocab.ts';
+import { formatFailureNotice, formatSettlementNotice, type SettlementNullReason } from './vocab.ts';
 import { settlementCard, type SettlementCard, type SettlementOutcome } from './settlement-card.ts';
 import { buildBlockedGateNotice, reportFingerprint, type SubEntry } from './subagent-core.ts';
 import { retirePane } from './subagent-gc.ts';
@@ -257,6 +257,9 @@ export function createPoller(h: PollerHost): Poller {
       closing: string | null,
       activity: boolean,
       request: { injectTs: number; description: string; requestId: string },
+      /** The turn ended with no report: the transcript's own reason (an error, a refused tool). A
+       *  settlement notice over it would read as success. */
+      failure: string | null = null,
     ): Promise<'done' | 'retry'> {
       // Null closing text is ambiguous — a mis-attributed transcript reads like a worker that died
       // silent — so the transcript is the only signal: no readable candidate at all (activity false)
@@ -282,13 +285,13 @@ export function createPoller(h: PollerHost): Poller {
       const delivered = closing && entry.reportDelivered?.fingerprint === reportFingerprint(closing)
         ? entry.reportDelivered.at
         : null;
-      const notice = buildSettlementNoticeText(
-        `${paneId} (${request.description})`, closing, nullReason, delivered,
-      );
+      const notice = failure !== null
+        ? formatFailureNotice(`${paneId} (${request.description})`, failure)
+        : buildSettlementNoticeText(`${paneId} (${request.description})`, closing, nullReason, delivered);
       try {
         // Tag the pane: a notice buffered while the master is busy must keep its row GC-exempt
         // until the flush actually delivers it.
-        await h.injectNotice(notice, paneId, cardFor(entry, paneId, request.description, 'settled'));
+        await h.injectNotice(notice, paneId, cardFor(entry, paneId, request.description, failure !== null ? 'failed' : 'settled'));
         trace(traceRole, 'inject-ok', { pane: paneId, request: request.requestId, closingLen: closing?.length ?? null });
       } catch (err) {
         trace(traceRole, 'inject-failed', { pane: paneId, request: request.requestId, error: String((err as Error)?.message ?? err) });
@@ -403,7 +406,10 @@ export function createPoller(h: PollerHost): Poller {
               continue;
             }
             entry.settleWindowStartedAt = null;
-            if (await handOver(entry, closing, s.activity, current) === 'retry') {
+            // No text but a stated reason means the turn died (a provider error, a refused tool): the
+            // reason is the diagnosis, never a report.
+            const failure = s.text === null ? (s.why ?? null) : null;
+            if (await handOver(entry, closing, s.activity, current, failure) === 'retry') {
               // Notification refused (e.g. the master is mid-turn): leave the row running and
               // re-detect the same closing text on the next wake.
               await park(recheckMs);
@@ -437,7 +443,8 @@ export function createPoller(h: PollerHost): Poller {
           });
           if (late && lateClosing != null && !late.pendingTool) {
             entry.settleWindowStartedAt = null;
-            if (await handOver(entry, lateClosing, late.activity, current) === 'retry') {
+            const lateFailure = late.text === null ? (late.why ?? null) : null;
+            if (await handOver(entry, lateClosing, late.activity, current, lateFailure) === 'retry') {
               await park(recheckMs);
               continue;
             }

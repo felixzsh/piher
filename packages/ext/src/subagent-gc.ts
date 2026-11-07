@@ -265,7 +265,10 @@ export function createGcController(h: GcHost): GcController {
    *  when the message matters. Never settles, never closes, never touches the row. */
   async function sweepChannels(statuses: ReadonlyMap<string, string>): Promise<void> {
     for (const e of [...h.subs.values()]) {
-      if (e.status === 'closed' || !e.paneId) continue;
+      // Only a worker with a turn in flight needs a channel. A settled row's pane may be exiting (a
+      // one-shot), and pinging it there announces a loss that costs nothing: `send` reports it exactly
+      // when it matters.
+      if (e.status !== 'running' || !e.paneId) continue;
       // A pane that is gone has no channel by design: revive/close own that case.
       const status = statuses.get(e.paneId);
       if (status === undefined) continue;

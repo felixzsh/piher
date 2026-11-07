@@ -8,8 +8,9 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  mountSubagent, runSubagent, runSubagentRejects, subEntry, subsSnapshot, terminalInfo,
+  TempHome, mountSubagent, runSubagent, runSubagentRejects, subEntry, subsSnapshot, terminalInfo,
 } from './test-utils.ts';
+import { forgetTaskPrompt, readTaskPrompt, saveTaskPrompt } from '../src/prompt-store.ts';
 import {
   MAIN_TAB_NAME, SUBS_CUSTOM_TYPE, SUBS_REGISTRY_TAIL, TAB_NAME_MAX, Semaphore, agoText, buildAliveNotice, buildBlockedGateNotice,
   allocateSubSlug, registrySnapshot, slugifyTask, subRef,
@@ -676,6 +677,36 @@ test('subagent plugin: send to a live pane with a dead pipe fails fast and says 
     assert.doesNotMatch(text, /pipe not ready within/, 'a dead pipe is not a slow boot');
   } finally {
     await root.fiber.dispose();
+  }
+});
+
+test('subagent plugin: retry re-sends the stored prompt instead of asking the master to write it again', async () => {
+  // An upstream failure says nothing about the task: rewriting the brief costs real tokens. The stored
+  // prompt is the retry, and a row without one must say so instead of sending nothing.
+  const home = new TempHome('prompt-retry');
+  try {
+    const taskId = 'task-retry-1';
+    saveTaskPrompt(taskId, 'the original brief');
+    assert.equal(readTaskPrompt(taskId), 'the original brief');
+    const { root, pi } = await mountSubagent({
+      client: { getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'idle' }) },
+      subs: [subEntry({ paneId: 't-retry', taskId, status: 'running', cwd: '/test/no-pipe' })],
+    });
+    try {
+      // No pipe server behind that cwd: the send path reports the dead channel, which proves the stored
+      // text was what it tried to deliver.
+      const dead = await runSubagentRejects(pi, { action: 'retry', agentId: 't-retry' });
+      assert.match(dead, /message channel is dead/);
+      assert.doesNotMatch(dead, /no stored prompt/);
+
+      forgetTaskPrompt(taskId);
+      const missing = await runSubagentRejects(pi, { action: 'retry', agentId: 't-retry' });
+      assert.match(missing, /no stored prompt/, 'a row without a brief names the reason instead of sending nothing');
+    } finally {
+      await root.fiber.dispose();
+    }
+  } finally {
+    home.dispose();
   }
 });
 

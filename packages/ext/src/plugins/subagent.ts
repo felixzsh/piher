@@ -47,6 +47,7 @@ import { listRoleNames, loadRoleConfig } from '../role-loader.ts';
 import type { RuntimePolicy } from '../runtime-policy.ts';
 import type { Lifecycle } from '../role-manifest.ts';
 import { toolError, ToolError } from '../tool-error.ts';
+import { readTaskPrompt } from '../prompt-store.ts';
 import { pipeNameFor, pipePathFor, pipeRequestTo, type PipeRequest, type PipeResponse } from '../pipe-channel.ts';
 import type { PaneStateSlot } from './bg-job.ts';
 import { bareSessionId, resolveSessionFileValue } from '../session-tail.ts';
@@ -97,13 +98,13 @@ export interface SubagentDeps {
 
 /** Sent with every request: what a call needs. Details live in SUBAGENT_MANUAL (`action: "help"`). */
 const SUBAGENT_DESCRIPTION = [
-  'Delegate a self-contained task to a subagent: a separate pi session in its own herdr terminal pane (its own context — it does NOT see this conversation; a human can talk to it in that pane).',
-  'Actions (default spawn): spawn | send | output | list | interrupt | resume | role | close | help.',
-  'spawn: `prompt` is the COMPLETE task, since only the prompt reaches it; `description` labels the pane. Several spawns in one message run in parallel (max 4).',
-  'spawn places the worker by `cwd` or by `worktree` (a name: piher creates the checkout and its branch).',
-  'spawn returns at once with the pane handle; the worker runs on and its result arrives later as a settlement notice at your next turn boundary — no need to sleep or poll.',
-  'send: follow-up to a running or settled worker, steered between tool calls. output: report once finished or the latest lines while it runs, for a stuck run or re-read; normally unneeded. resume: revive a task that was left unfinished, by taskId. role: switch a worker\'s role profile mid-session.',
-  'help: the full manual (cwd/tab placement, role profiles, the delegation ledger).',
+  'Delegate a self-contained task to a subagent: a separate pi session in its own herdr pane (its own context — it does NOT see this conversation; a human can talk to it there).',
+  'Actions (default spawn): spawn | send | retry | output | list | interrupt | resume | role | close | help.',
+  'spawn: `prompt` is the COMPLETE task, since only it reaches the worker; `description` labels the pane. Several spawns per message run in parallel (max 4).',
+  'spawn places the worker by `cwd` or by `worktree` (a name: piher creates the checkout and branch).',
+  'spawn returns at once; the result arrives as a settlement notice at your next turn boundary — never sleep or poll.',
+  'retry: re-sends the spawned prompt after a failure that was not the task\'s fault. send: follow-up to a running or settled worker, steered between tool calls. output: report once finished or the latest lines while it runs, for a stuck run or re-read; normally unneeded. resume: revive a task that was left unfinished, by taskId. role: switch a worker\'s role profile mid-session.',
+  'help: the full manual (placement, role profiles, the ledger).',
 ].join(' ');
 
 /** Returned by `action: "help"`: the reference text kept out of the per-request description. */
@@ -121,6 +122,8 @@ const SUBAGENT_MANUAL = [
   'send — `agentId` + `message`: steered into a working worker at its next tool gap; wakes an idle or settled one. `interrupt` aborts its current turn only — the pane and session stay, and no report arrives.',
   '',
   'close — `agentId`; reclaims a finished worker: pane and tab go, session and ledger row stay, so `resume` revives it. A running worker is refused — interrupt first. A one-shot role is reclaimed this way automatically; a `worktree` checkout is removed too (never forced; a dirty one is refused, the branch survives).',
+  '',
+  'retry — `agentId` or `taskId`, no message: re-sends the prompt piher stored at spawn. Use it after a failure that says nothing about the task (an outage, a dropped stream); a spent row is revived first, and a row with no stored prompt says so.',
   '',
   'resume — `taskId`; revives a collected worker from the ledger with `pi --session`. The ledger is append-only JSONL, one row per status change (taskId, description, status running|settled|consumed|closed, outcome, paneId, sessionFile, launchCommand, createdAt), one file per repository at `<repo>/.piher/history/history.jsonl` in the main checkout, shared by worktrees; outside a git repository nothing is recorded. A still-running task is not resumed — use send or output.',
 ].join('\n');
@@ -798,6 +801,29 @@ export default function subagentPlugin(ctx: Context): void {
     });
   }
 
+  /** Re-send the prompt this task was spawned with. An upstream failure (a provider outage, a dropped
+   *  stream) says nothing about the task, and rewriting the brief costs the master real tokens: the
+   *  stored prompt makes the retry free. A spent row is revived first, because a one-shot that already
+   *  reported has no pane left to take the text. */
+  async function executeSubagentRetry(params: ToolParams, toolCtx: unknown) {
+    const { entry } = targetOf(params, toolCtx);
+    const prompt = readTaskPrompt(entry.taskId);
+    if (prompt === null) {
+      return toolError(
+        `Error: no stored prompt for task ${entry.taskId} — piher keeps the brief of a spawn it made, and this task has none (a resumed session, or a row from another checkout). Send the task again with action "send".`,
+      );
+    }
+    if (spentText(entry) !== null) {
+      // Revive the same session in a new pane, then deliver the stored prompt into it.
+      await executeSubagentResume({ ...params, taskId: entry.taskId }, toolCtx);
+      const revived = newestPerTaskId([...subs.values()].filter((s) => s.taskId === entry.taskId && s.status === 'running'));
+      const target = revived.get(entry.taskId);
+      if (!target) return toolError(`Error: retry could not revive task ${entry.taskId}.`);
+      return executeSubagentSend({ ...params, agentId: target.paneId, message: prompt }, toolCtx);
+    }
+    return executeSubagentSend({ ...params, message: prompt }, toolCtx);
+  }
+
   async function executeSubagentInterrupt(params: ToolParams, toolCtx: unknown) {
     const { entry } = targetOf(params, toolCtx);
     // Interrupt stops the current turn and nothing else, so a worker with no turn in flight has
@@ -1016,6 +1042,7 @@ export default function subagentPlugin(ctx: Context): void {
     resume: (params, toolCtx) => executeSubagentResume(params, toolCtx),
     list: (_params, toolCtx) => executeSubagentList(toolCtx),
     send: (params, toolCtx) => executeSubagentSend(params, toolCtx),
+    retry: (params, toolCtx) => executeSubagentRetry(params, toolCtx),
     interrupt: (params, toolCtx) => executeSubagentInterrupt(params, toolCtx),
     output: (params, toolCtx) => executeSubagentOutput(params, toolCtx, outputActionDeps),
     role: (params, toolCtx) => executeSubagentRole(params, toolCtx),
@@ -1044,6 +1071,7 @@ export default function subagentPlugin(ctx: Context): void {
         Type.Literal('resume'),
         Type.Literal('list'),
         Type.Literal('send'),
+        Type.Literal('retry'),
         Type.Literal('interrupt'),
         Type.Literal('output'),
         Type.Literal('role'),

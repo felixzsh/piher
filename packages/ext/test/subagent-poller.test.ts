@@ -212,6 +212,22 @@ test('pollLoop: settlement consumes the row and delivers the notice', async () =
   assert.match(f.notices[0]!, /Background subagent p-settle \(desc\) finished/);
 });
 
+test('pollLoop: a turn that ended with no report is delivered as a failure, not a settlement', async () => {
+  // A provider outage ends the turn with a reason and no text. Calling that "finished" reads as success
+  // and lets the master move on with nothing — the notice must say the task did not complete, and the
+  // card must carry it as failed.
+  const f = fixture(makeEntry('p-fail', { settleWindowStartedAt: 10_000 }));
+  f.state({ text: null, why: 'upstream error: 429 rate limited', pendingTool: false, activity: true, turnEnded: true });
+  f.waitState('error');
+  await start(f);
+  const notice = f.notices[0]!;
+  assert.match(notice, /FAILED — no report was produced/);
+  assert.match(notice, /429 rate limited/, 'the reason is carried, not swallowed');
+  assert.match(notice, /action:"retry"/, 'the free way out is named');
+  assert.doesNotMatch(notice, /finished and will do no further work/, 'a failure is never phrased as a settlement');
+  assert.equal(f.cards[0]?.outcome, 'failed');
+});
+
 test('pollLoop: a one-shot worker is reclaimed at settlement by the pair close uses, a persistent one is left for send', async () => {
   const oneShot = fixture(makeEntry('p-shot', { lifecycle: 'one-shot' }));
   await start(oneShot);
