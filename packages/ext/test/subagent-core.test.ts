@@ -7,7 +7,9 @@ import { appendLedger, readLedger, type HistoryEntry } from '../src/history-stor
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mountSubagent, runSubagent, runSubagentRejects, subEntry, terminalInfo } from './test-utils.ts';
+import {
+  mountSubagent, runSubagent, runSubagentRejects, subEntry, subsSnapshot, terminalInfo,
+} from './test-utils.ts';
 import {
   MAIN_TAB_NAME, SUBS_CUSTOM_TYPE, SUBS_REGISTRY_TAIL, TAB_NAME_MAX, Semaphore, agoText, buildAliveNotice, buildBlockedGateNotice,
   allocateSubSlug, registrySnapshot, slugifyTask, subRef,
@@ -653,6 +655,29 @@ test('subagent plugin: close reclaims a running row whose pane is already gone',
     assert.deepEqual(retired, ['pZombie', 'pZombie'], 'the dead pane is still retired best-effort');
   } finally {
     await root.fiber.dispose();
+  }
+});
+
+test('subagent plugin: close reclaims a running row whose pane has no turn in flight', async () => {
+  // A settlement the poller missed leaves the row `running` while the agent is idle: refusing the
+  // close then strands the task forever, and `interrupt` cannot help because there is no turn to stop.
+  for (const status of ['idle', 'done', 'error'] as const) {
+    const retired: string[] = [];
+    const { root, pi } = await mountSubagent({
+      client: {
+        getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status }),
+        kill: async (id: string) => { retired.push(id); },
+        remove: async (id: string) => { retired.push(id); },
+      },
+      subs: [subEntry({ paneId: 'p-idle', taskId: 'task-idle', status: 'running', consumedAt: null })],
+    });
+    try {
+      const res = await runSubagent(pi, { action: 'close', agentId: 'p-idle' });
+      assert.match(res.content[0]!.text, /closed — pane and tab gone/, `status ${status} must be closable`);
+      assert.equal(subsSnapshot(pi)!.subs.find((s) => s.paneId === 'p-idle')?.status, 'closed');
+    } finally {
+      await root.fiber.dispose();
+    }
   }
 });
 

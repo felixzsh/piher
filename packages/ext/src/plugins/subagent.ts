@@ -752,6 +752,9 @@ export default function subagentPlugin(ctx: Context): void {
         // with no poller (never settles, skipped by GC): roll back the status on failure.
         const prevStatus = entry.status;
         entry.status = 'running';
+        // A follow_up re-arms the row: keeping the old consume time would make GC and the checkout
+        // sweep read it as finished while a turn is in flight.
+        entry.consumedAt = null;
         persistSubs();
         try {
           lastRequestIdByPane.set(entry.paneId, reqId);
@@ -802,12 +805,18 @@ export default function subagentPlugin(ctx: Context): void {
       // cannot report anything, though — its row is a zombie the ledger would keep forever (a worker
       // that stopped without a notice, seen from a session that was not the one that spawned it).
       let live = true;
+      let finished = false;
       try {
-        live = (await probeAlive(entry.paneId, entry.cwd)).paneExists;
+        const probe = await probeAlive(entry.paneId, entry.cwd);
+        live = probe.paneExists;
+        // A row can stay `running` after its turn ended (a settlement the poller missed). Refusing
+        // the close then strands the task forever: only a pane with a turn in flight is protected,
+        // and an unknown status is treated as in flight because core has not said otherwise.
+        finished = probe.agentStatus === 'idle' || probe.agentStatus === 'done' || probe.agentStatus === 'error';
       } catch {
         live = true; // a failed probe must not authorise the removal of a task
       }
-      if (live) {
+      if (live && !finished) {
         return toolError(
           `Error: subagent ${subRef(entry)} is still running — close only reclaims a worker that already finished, and a task must not disappear without a report. Use action "interrupt" to stop its current turn (the pane and its session stay), then close it once it settles.`,
         );

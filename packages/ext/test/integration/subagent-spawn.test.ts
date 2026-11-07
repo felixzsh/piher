@@ -277,6 +277,11 @@ test('send: a settled persistent worker is still reachable', async () => {
     // A persistent worker delivered its result, not its life: the master keeps talking to it.
     const sent = await runSubagent(env.pi, { action: 'send', agentId: paneId, message: 'y ahora otra cosa' }, env.cwd);
     assert.match(sent.content[0]!.text, /Message sent to subagent/);
+    // A follow_up re-arms the row: the old consume time must go, or GC and the checkout sweep read a
+    // worker with a turn in flight as finished.
+    const rearmed = subsSnapshot(env.pi)?.subs.find((s) => s.paneId === paneId);
+    assert.equal(rearmed?.status, 'running');
+    assert.equal(rearmed?.consumedAt, null, 'the new request clears the settlement time');
     // The combined `slug@paneId` form is what spawn prints, so it is what a master copies back.
     const slug = /started subagent ([a-z0-9-]+)@/.exec(spawned.content[0]!.text)![1];
     const combined = await runSubagent(env.pi, { action: 'send', agentId: `${slug}@${paneId}`, message: 'otra vez' }, env.cwd);
