@@ -10,7 +10,7 @@
  * details persist in session JSONL and getBranch() replay implements branch rollback.
  */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-import { pipeNameFor, pipeRequest, startPipeServer } from './pipe-channel.ts';
+import { pipeNameFor, pipePathFor, pipeRequest, startPipeServer } from './pipe-channel.ts';
 import { installRenderers } from './renderers.ts';
 import { SETTLEMENT_CUSTOM_TYPE, sendSettlementNotice } from './settlement-card.ts';
 import { createCoreClient } from './core-client.ts';
@@ -175,13 +175,33 @@ export default async function (pi: ExtensionAPI) {
 
   function startPipeServerFor(cwd: string): void {
     const paneId = env?.terminalId ?? '';
-    if (!paneId) return;
+    if (!paneId) {
+      // No address means no channel: every follow-up to this pane is undeliverable, which is worth
+      // saying out loud rather than discovering as a 90 s timeout on the other side.
+      trace(traceRole, 'pipe-listen', { ok: false, why: 'no-pane-id', cwd });
+      return;
+    }
+    const name = pipeNameFor(cwd, paneId);
+    const path = pipePathFor(name);
     if (pipeServerBox.current) {
       try { pipeServerBox.current.close(); } catch { /* Previous instance. */ }
       pipeServerBox.current = null;
+      trace(traceRole, 'pipe-rebind', { pane: paneId, path });
     }
+    /** A bind failure is silent by construction (net.Server reports it on 'error'), so it is the one
+     *  failure that used to leave a live worker unreachable with nothing in any log. */
+    const bindFailed = (err: Error): void => {
+      const code = (err as NodeJS.ErrnoException)?.code ?? null;
+      trace(traceRole, 'pipe-listen', { ok: false, pane: paneId, path, code, error: err.message });
+      void deliverNotice(
+        `piher: this pane cannot receive follow-up messages — its pipe ${path} failed to bind`
+        + `${code ? ` (${code})` : ''}. A master that sends to it will report the channel as dead.`,
+        paneId,
+        null,
+      );
+    };
     try {
-      pipeServerBox.current = startPipeServer(pipeNameFor(cwd, paneId), async (req) => handlePipeRequest(req, {
+      pipeServerBox.current = startPipeServer(name, async (req) => handlePipeRequest(req, {
         paneId,
         port: subagentPort,
         claimSettleNotice,
@@ -191,9 +211,11 @@ export default async function (pi: ExtensionAPI) {
         abort: () => { latestCtx?.abort?.(); },
         setPendingMachineRequest: (next) => { pendingMachineRequest = next; },
         applyRoleSwitch: roles.applyRoleSwitch,
-      }));
-    } catch {
-      /* Pipe name collision (rare): this session has no channel; callers report after ping timeout. */
+      }), bindFailed);
+      trace(traceRole, 'pipe-listen', { ok: true, pane: paneId, path, cwd });
+    } catch (err) {
+      // A synchronous throw (path too long, permission) is the same outcome as a failed bind.
+      bindFailed(err as Error);
     }
   }
 

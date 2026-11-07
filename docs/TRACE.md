@@ -61,6 +61,9 @@ and the order of their lines is the story.
 | Event | Fields | Answers |
 |---|---|---|
 | `resolve-session` | `pane cwd preferred reported candidates count` | which transcript this pane may be read from, and where each candidate came from |
+| `pipe-listen` | `ok path` / `ok=false why=no-pane-id` / `ok=false path code error` | this pane's message channel: bound, never attempted (no address), or failed to bind — the failure that used to be silent |
+| `pipe-rebind` | `pane path` | a second `session_start` replaced an existing server: the moment a channel can be lost |
+| `pipe-unreachable` | `pane path listening error` | a live pane did not take a request; `listening=false` means its extension host is not running and nothing was delivered |
 | `observe-fallback` | `pane source=getTerminal\|unavailable state status` / `… error` | the children snapshot lacked the pane, so core was asked directly — or could not be asked at all |
 | `probe` | `pane paneExists agentStatus` | the liveness/status core reports, the same answer `hc` gives |
 | `gc-view` | `panes running watch` | piher's own view each sweep: every running row with the status core reports for it (`absent` = core does not know that terminal) |
@@ -92,3 +95,5 @@ grep 'pane=t187' ~/.pi/agent/piher/trace.log
 | `gc-release` while the agent was still working | housekeeping ended a row it should have left alone |
 | `gc-view` shows `t187:done` while the row is `running` | piher's own view disagrees with core: the desync is on the reading side, not the event side |
 | `observe-fallback source=unavailable` repeated | core cannot be asked about that pane, so every state read is blind |
+| `pipe-listen ok=false` (worker side) | the worker has no message channel at all: every `send` to it is undeliverable |
+| `pipe-rebind` followed by no `pipe-listen ok` | the replacement bind failed: the channel existed and was lost |

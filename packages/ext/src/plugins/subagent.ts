@@ -47,7 +47,7 @@ import { listRoleNames, loadRoleConfig } from '../role-loader.ts';
 import type { RuntimePolicy } from '../runtime-policy.ts';
 import type { Lifecycle } from '../role-manifest.ts';
 import { toolError, ToolError } from '../tool-error.ts';
-import { pipeNameFor, pipeRequestTo, type PipeRequest, type PipeResponse } from '../pipe-channel.ts';
+import { pipeNameFor, pipePathFor, pipeRequestTo, type PipeRequest, type PipeResponse } from '../pipe-channel.ts';
 import type { PaneStateSlot } from './bg-job.ts';
 import { bareSessionId, resolveSessionFileValue } from '../session-tail.ts';
 import { mainWorktreeRoot } from '../storage-layout.ts';
@@ -579,19 +579,21 @@ export default function subagentPlugin(ctx: Context): void {
    * read that as `closed` and revive, which collapsed "not live" and "closed by the master" into one
    * state. They are different: a closed task is final, a vanished pane is unfinished work.
    */
-  async function ensureLive(entry: SubEntry): Promise<void> {
-    if (entry.status === 'closed') return; // final: the caller asked for `send` on purpose, refuse in spentText
+  /** Returns whether a pane was actually made: only a fresh pane is still booting. */
+  async function ensureLive(entry: SubEntry): Promise<boolean> {
+    if (entry.status === 'closed') return false; // final: `send` on it is refused by spentText
     let alive = false;
     try {
       alive = (await probeAlive(entry.paneId, entry.cwd)).paneExists;
     } catch {
       alive = true; // a probe that fails must not spawn a second pane over a live one
     }
-    if (alive) return;
+    if (alive) return false;
     const previousPaneId = entry.paneId;
     await reviveEntry(entry);
     rekeySub(subs, previousPaneId, entry);
     persistSubs();
+    return true;
   }
 
   async function executeSubagentResume(params: ToolParams, toolCtx: unknown) {
@@ -710,14 +712,22 @@ export default function subagentPlugin(ctx: Context): void {
         res = await pipeRequestTo(entry.cwd, entry.paneId, payload);
       } catch (err) {
         if (opts.ready === false) throw err;
-        // Only a pipe that did not answer earns the expensive path: the pane may be gone (revive it
-        // and rekey the row) or still starting (wait for readiness), then retry the same request.
-        await ensureLive(entry);
-        trace('recovered-liveness');
-        const ready = await waitSubReady(entry.cwd, entry.paneId);
-        trace('recovered-ready');
-        if (!ready.ok) throw new Error(ready.message);
-        res = await pipeRequestTo(entry.cwd, entry.paneId, payload);
+        // A pipe that did not answer may mean the pane is gone: revive it, and only a pane made right
+        // now is worth waiting for readiness. A pane that was already alive is not "starting": it has
+        // no listener, and spending the 90 s readiness budget on it turns a dead channel into a
+        // timeout that reads like a slow boot.
+        const revived = await ensureLive(entry);
+        trace(revived ? 'recovered-liveness' : 'alive-no-pipe');
+        if (revived) {
+          const ready = await waitSubReady(entry.cwd, entry.paneId);
+          trace('recovered-ready');
+          if (!ready.ok) throw new Error(ready.message);
+        }
+        try {
+          res = await pipeRequestTo(entry.cwd, entry.paneId, payload);
+        } catch (retryErr) {
+          throw new Error(await pipeUnreachableText(entry, retryErr));
+        }
       }
       trace('delivered');
       if (res.type !== 'ok') {
@@ -728,6 +738,25 @@ export default function subagentPlugin(ctx: Context): void {
       const what = opts.fail?.(entry.paneId) ?? `failed to reach subagent ${entry.paneId}`;
       return toolError(`Error: ${what}: ${(err as Error).message}`);
     }
+  }
+
+  /** Why a live pane did not take the request: a ping separates "nothing listens" (its extension
+   *  host is not running, so the message was lost) from "listens but did not answer" (busy or
+   *  rejecting). Both are honest; "retry is safe" is only true for the second. */
+  async function pipeUnreachableText(entry: SubEntry, err: unknown): Promise<string> {
+    const path = pipePathFor(pipeNameFor(entry.cwd, entry.paneId));
+    let listening = false;
+    try {
+      listening = (await pipeRequestTo(entry.cwd, entry.paneId, { type: 'ping', id: `ping-${Date.now()}` }, 2_000)).type === 'ok';
+    } catch {
+      listening = false;
+    }
+    trace(traceRole, 'pipe-unreachable', { pane: entry.paneId, path, listening, error: String((err as Error)?.message ?? err) });
+    const head = `subagent pane ${entry.paneId} is alive but its message channel is dead (${path})`;
+    const detail = String((err as Error)?.message ?? err);
+    return listening
+      ? `${head}: it answers a ping but did not take this request (${detail}). Nothing was confirmed delivered — check the pane before resending.`
+      : `${head}: nothing answers there, so the worker's extension host is not running and NOTHING was delivered (${detail}). action "resume" with taskId ${entry.taskId} restarts it in a new pane; action "close" retires the row.`;
   }
 
   /** Follow_up goes through the extension pipe with steering so supplemental instructions reach a

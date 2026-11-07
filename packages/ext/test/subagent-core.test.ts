@@ -658,6 +658,27 @@ test('subagent plugin: close reclaims a running row whose pane is already gone',
   }
 });
 
+test('subagent plugin: send to a live pane with a dead pipe fails fast and says nothing was delivered', async () => {
+  // The 90 s readiness wait is for a pane that was just made. A pane that was already alive has no
+  // listener, and waiting there turns a dead channel into a timeout that reads like a slow boot —
+  // while the message never arrived (a real session spent 92 s on it, twice).
+  const { root, pi } = await mountSubagent({
+    client: { getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'working' }) },
+    subs: [subEntry({ paneId: 't-dead-pipe', taskId: 'task-dead-pipe', status: 'running', cwd: '/test/no-pipe' })],
+  });
+  try {
+    const startedAt = Date.now();
+    const text = await runSubagentRejects(pi, { action: 'send', agentId: 't-dead-pipe', message: 'hola' });
+    assert.ok(Date.now() - startedAt < 20_000, `no readiness budget for a live pane (took ${Date.now() - startedAt}ms)`);
+    assert.match(text, /its message channel is dead/);
+    assert.match(text, /NOTHING was delivered/);
+    assert.match(text, /action "resume"/);
+    assert.doesNotMatch(text, /pipe not ready within/, 'a dead pipe is not a slow boot');
+  } finally {
+    await root.fiber.dispose();
+  }
+});
+
 test('subagent plugin: close reclaims a running row whose pane has no turn in flight', async () => {
   // A settlement the poller missed leaves the row `running` while the agent is idle: refusing the
   // close then strands the task forever, and `interrupt` cannot help because there is no turn to stop.

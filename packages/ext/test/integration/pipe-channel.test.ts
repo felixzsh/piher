@@ -115,6 +115,21 @@ test('startPipeServer: bad frame / handler throw answer with error frames', asyn
   }
 });
 
+test('startPipeServer: a bind failure is reported, not swallowed', async () => {
+  // net.Server announces a failed bind on 'error' only. With no listener that error was invisible, so
+  // a live worker could lose its whole channel and nothing anywhere said why (a master then waited the
+  // full readiness budget for a pipe that would never exist).
+  const errs: Error[] = [];
+  // A name with a separator puts the socket under a directory that does not exist: bind fails ENOENT.
+  const server = startPipeServer('piher-test/nodir-bind', async () => ({ type: 'ok', id: 'x' }), (e) => errs.push(e));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(errs.length, 1, 'one error, delivered to the caller');
+  const code = (errs[0] as NodeJS.ErrnoException).code;
+  assert.ok(code, `the failure carries its errno (got ${code})`);
+  assert.match(errs[0]!.message, /nodir-bind/, 'the message names the socket that could not be bound');
+  server.close();
+});
+
 test('pipeRequest: rejects on bad frame, silence, peer hangup and a missing peer', async (t) => {
   const CASES: PeerCase[] = [
     // Scripted raw peers: junk reply / silence / immediate hangup.
