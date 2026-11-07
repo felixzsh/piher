@@ -81,3 +81,12 @@ P1 done: `a9cdb9c` (range `64786f5..a9cdb9c` on `master`), Risk: item 1 (S9/S25 
 replace `history-store.ts`, `subagent-registry-file.ts` and the branch snapshot; one correction round after
 the review found `resume` reviving a closed-but-unconsumed record (S9), a `createdAt` overwritten by a
 revive (S3/S10), and S25 unproven at the plugin seam.
+
+P2 done: `04d8159` (range `8ffd6c0..04d8159`), Risk: item 2 (decision logic re-derived), `npm test` 461/461
+green (~8.5 s, run by the parent on that commit), Route: delegated. `TaskEntry.status` and `TaskStatus` are
+gone: every surface derives from `isClosed`/`isSpent`/`isActionable` plus a plugin-owned observation cache
+that feeds only the printed state text (S11/S26), and every action probes core itself. The GC keeps
+reclaiming panes, tabs and spaces from the watch snapshot, writes no document and ends no task; the zombie
+sweep and `releaseRow` are deleted. `list` prints the contract's four state texts and line shape.
+Correction round: `shouldClosePane` no longer blesses a close of an unlisted terminal, and the three
+closed-task answers now say close is final instead of promising `resume`.
