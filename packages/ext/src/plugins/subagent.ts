@@ -1,6 +1,6 @@
 /**
  * subagent — master-only plugin entry: tool registration, action dispatch, the resume / send / interrupt /
- * output / role / list actions, and port binding. Inbound deps arrive via `piher.subagent-deps`; outbound
+ * output / list actions, and port binding. Inbound deps arrive via `piher.subagent-deps`; outbound
  * pipe/settle queries bind atomically onto `port.current`.
  */
 import { Context } from '@deepseek-ai/cordis';
@@ -99,11 +99,11 @@ export interface SubagentDeps {
 /** Sent with every request: what a call needs. Details live in SUBAGENT_MANUAL (`action: "help"`). */
 const SUBAGENT_DESCRIPTION = [
   'Delegate a self-contained task to a subagent: a separate pi session in its own herdr pane (its own context — it does NOT see this conversation; a human can talk to it there).',
-  'Actions (default spawn): spawn | send | retry | output | list | interrupt | resume | role | close | help.',
+  'Actions (default spawn): spawn | send | retry | output | list | interrupt | resume | close | help.',
   'spawn: `prompt` is the COMPLETE task, since only it reaches the worker; `description` labels the pane. Several spawns per message run in parallel (max 4).',
   'spawn places the worker by `cwd` or by `worktree` (a name: piher creates the checkout and branch).',
   'spawn returns at once; the result arrives as a settlement notice at your next turn boundary — never sleep or poll.',
-  'retry: re-sends the spawned prompt after a failure that was not the task\'s fault. send: follow-up to a running or settled worker, steered between tool calls. output: report once finished or the latest lines while it runs, for a stuck run or re-read; normally unneeded. resume: revive a task that was left unfinished, by taskId. role: switch a worker\'s role profile mid-session.',
+  'retry: re-sends the spawned prompt after a failure that was not the task\'s fault. send: follow-up to a running or settled worker, steered between tool calls. output: report once finished or the latest lines while it runs, for a stuck run or re-read; normally unneeded. resume: revive a task that was left unfinished, by taskId.',
   'help: the full manual (placement, role profiles, the ledger).',
 ].join(' ');
 
@@ -113,7 +113,7 @@ const SUBAGENT_MANUAL = [
   '',
   'spawn — an independent worker on this workspace; its result is its final text, delivered as a settlement notice, so return at once and never wait in-turn. `prompt` is the whole task (the worker does not see this conversation): paths, acceptance criteria, the proving command, what to report. Do not delegate the current step. Placement: no pane by default — the app nests it under you, and only a worker with its own checkout opens a space. `tab` joins or creates a task tab. `cwd` is a directory or worktree you already have. `worktree` is a name, never a path: piher creates `~/.herdr/worktrees/<repo>/<slug>` on branch `<name>` from your HEAD and reuses it on that branch. `description` labels the pane. `cwd` and `worktree` are mutually exclusive.',
   '',
-  'role + allowed_tools — see the profile list below (name, description, tools, lifecycle); no filesystem hunting. A profile is searched in workspace `.piher/roles/`, then the user directory, then builtin; `allowed_tools` adds on top of it and role denies always win. Unknown role names stay display labels. `role` as an action switches a live worker (applies on its next request, survives resume) and reports the tool diff.',
+  'role + allowed_tools — see the profile list below (name, description, tools, lifecycle); no filesystem hunting. A profile is searched in workspace `.piher/roles/`, then the user directory, then builtin; `allowed_tools` adds on top of it and role denies always win. Unknown role names stay display labels; a worker\'s profile is fixed for its whole life.',
   '',
   'list — every worker that is still your business: running, or settled with a result you have not acted on. Closed workers are gone, and so is a one-shot once its verdict was consumed.',
   '',
@@ -932,20 +932,6 @@ export default function subagentPlugin(ctx: Context): void {
     };
   }
 
-  async function executeSubagentRole(params: ToolParams, toolCtx: unknown) {
-    const roleName = String(params?.role ?? '').trim();
-    if (!roleName) return toolError('Error: action "role" requires a target profile in `role` (same resolution as spawn)');
-    const { entry } = targetOf(params, toolCtx);
-    return pipeAction(entry, {
-      fail: (id) => `failed to switch subagent ${id} to role ${roleName}`,
-      build: () => ({ type: 'role', id: `role-${Date.now()}`, role: roleName }),
-      ok: (res) => ({
-        content: [{ type: 'text', text: `Subagent ${entry.paneId}: ${res.detail ?? `switched to ${roleName}`}` }],
-        details: { paneId: entry.paneId, role: roleName },
-      }),
-    });
-  }
-
   /** Live registry, newest row per task; closed rows stay visible so send can revive them. A task
    *  the bounded registry already pruned answers from the repository ledger, which keeps every row. */
   async function executeSubagentList(toolCtx: unknown) {
@@ -1059,7 +1045,6 @@ export default function subagentPlugin(ctx: Context): void {
     retry: (params, toolCtx) => executeSubagentRetry(params, toolCtx),
     interrupt: (params, toolCtx) => executeSubagentInterrupt(params, toolCtx),
     output: (params, toolCtx) => executeSubagentOutput(params, toolCtx, outputActionDeps),
-    role: (params, toolCtx) => executeSubagentRole(params, toolCtx),
     close: (params, toolCtx) => executeSubagentClose(params, toolCtx),
     help: async (_params, toolCtx) => {
       const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
@@ -1072,7 +1057,7 @@ export default function subagentPlugin(ctx: Context): void {
     label: 'Subagent',
     // B4: the model picks tools from the system prompt's snippet/guideline surface; delegation
     // decisions are made here, so state them rather than hoping for recall.
-    promptSnippet: 'subagent: delegate a self-contained task to a pi worker pane (spawn/send/output/interrupt/resume/list/role/close/help).',
+    promptSnippet: 'subagent: delegate a self-contained task to a pi worker pane (spawn/send/output/interrupt/resume/list/close/help).',
     promptGuidelines: [
       'Use subagent for self-contained work whose result is what matters: output that would flood this context, long builds/test runs, or independent parts of a bigger change that can run in parallel.',
       'The worker does not see this conversation: put paths, acceptance criteria, the test command and what to report back into the prompt.',
@@ -1088,7 +1073,6 @@ export default function subagentPlugin(ctx: Context): void {
         Type.Literal('retry'),
         Type.Literal('interrupt'),
         Type.Literal('output'),
-        Type.Literal('role'),
         Type.Literal('close'),
         Type.Literal('help'),
       ], { description: 'Default spawn' })),
@@ -1096,11 +1080,11 @@ export default function subagentPlugin(ctx: Context): void {
       prompt: Type.Optional(Type.String({ description: '[spawn] The complete self-contained task' })),
       cwd: Type.Optional(Type.String({ description: '[spawn] Existing directory or worktree to run in (absolute or workspace-relative)' })),
       worktree: Type.Optional(Type.String({ description: '[spawn] Name of a checkout piher creates for the worker (branch of the same name); mutually exclusive with cwd' })),
-      role: Type.Optional(Type.String({ description: '[spawn|role] Role profile name; action help lists the profiles available here (description, tools, lifecycle). Unknown names are display labels only' })),
+      role: Type.Optional(Type.String({ description: '[spawn] Role profile name; action help lists the profiles available here (description, tools, lifecycle). Unknown names are display labels only' })),
       tab: Type.Optional(Type.String({ description: '[spawn] Task tab to join or create (default: grouped by worktree)' })),
       allowed_tools: Type.Optional(Type.Array(Type.String(), { description: '[spawn] Extra tools on top of the role baseline' })),
       taskId: Type.Optional(Type.String({ description: '[resume] Task id from the delegation ledger' })),
-      agentId: Type.Optional(Type.String({ description: '[send|interrupt|output|role|close] Slug, pane id, or slug@paneId as printed by spawn/list' })),
+      agentId: Type.Optional(Type.String({ description: '[send|interrupt|output|close] Slug, pane id, or slug@paneId as printed by spawn/list' })),
       message: Type.Optional(Type.String({ description: '[send] Follow-up message' })),
       max_chars: Type.Optional(Type.Integer({ description: '[output] Output cap (default 6000, 100-16000)' })),
       full: Type.Optional(Type.Boolean({ description: '[output] Return the whole pane buffer instead of the latest lines (default false)' })),

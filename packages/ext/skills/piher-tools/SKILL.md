@@ -2,7 +2,7 @@
 name: piher-tools
 description: >-
   Judgement for piher's two tools: when to delegate with subagent (spawn, send, retry,
-  output, list, interrupt, close, resume, role, help), what a good prompt contains, how to read
+  output, list, interrupt, close, resume, help), what a good prompt contains, how to read
   the settlement notice that carries a worker's result, the answer-or-BLOCKED report
   contract, and when a background job (start, status, log, stop, list) beats bash. It also
   holds the `hc` recipes for the one thing no tool owns: driving a live interactive program.
@@ -104,8 +104,8 @@ extensions) around the same words, so the full text is behind `full: true`. You 
 `output` at all: a settlement notice already carries the worker's own message, and a notice
 never arrives empty for a worker that answered. `list` shows
 every worker of this session with its state and handle; `agentId` is the slug, the pane id,
-or `slug@paneId` printed by `spawn` and `list`. `role` switches a live worker's profile
-mid-session and reports the tool diff.
+or `slug@paneId` printed by `spawn` and `list`. A worker's profile is fixed at spawn: there is
+no action that changes it mid-session.
 
 ## interrupt, close, resume
 

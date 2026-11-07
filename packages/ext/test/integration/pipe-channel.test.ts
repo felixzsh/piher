@@ -95,9 +95,9 @@ test('pipeRequest: round-trip dispatch of ping/prompt, error frames returned as-
   }), async (name) => {
     assert.deepEqual(await pipeRequest(name, { type: 'ping', id: 'p1' }), { type: 'ok', id: 'p1', detail: 'pong' });
     assert.equal((await pipeRequest(name, { type: 'prompt', id: 'p2', text: 'hi' })).type, 'ok');
-    const denied = await pipeRequest(name, { type: 'role', id: 'p3', role: 'reviewer' }, 2000);
+    const denied = await pipeRequest(name, { type: 'interrupt', id: 'p3' }, 2000);
     assert.deepEqual(denied, { type: 'error', id: 'p3', message: 'Test error' });
-    assert.deepEqual(seen, ['ping', 'prompt', 'role']);
+    assert.deepEqual(seen, ['ping', 'prompt', 'interrupt']);
   });
 });
 

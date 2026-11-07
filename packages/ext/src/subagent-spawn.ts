@@ -532,7 +532,7 @@ export function createSpawnAction(h: SpawnActionHost) {
           ...(role.guidelines?.length ? { guidelines: role.guidelines } : {}),
           ...(role.instructions ? { instructions: role.instructions } : {}),
         }),
-        // Role base: /piher-role and the pipe switch resolve .piher/roles/ against the MASTER's checkout.
+        // Role base: /piher-role resolves .piher/roles/ against the MASTER's checkout.
         PIHER_ROLE_BASE: masterCwd,
       };
       // S9/S54: the lifetime is the role's, and the worker learns it from its own delegation record.

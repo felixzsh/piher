@@ -29,7 +29,6 @@ function pipeSession(over: Partial<PipeHandlerSession> = {}): PipeHandlerSession
     sendUserMessageAs: async () => {},
     abort: () => {},
     setPendingMachineRequest: () => {},
-    applyRoleSwitch: async () => ({ ok: true, message: 'stub' }),
     ...over,
   };
 }
@@ -114,24 +113,14 @@ test('handlePipeRequest: the reply claim key is the id the parent pushed (B8)', 
   assert.deepEqual(claims, [`p2:${sentId}`]);
 });
 
-test('handlePipeRequest: role switch ok/error is relayed verbatim', async () => {
-  // P0 (RFC §4.4): the master switches a worker's role over the pipe; a mixed-version peer
-  // answering `unknown type role` must reach the model as that same error.
-  const calls: Array<{ role: string; by: string }> = [];
-  const ROLE_MSG = 'role worker-default → reviewer (+bash)';
-  const okSession = pipeSession({
-    paneId: 'w1',
-    applyRoleSwitch: async (role, by) => { calls.push({ role, by }); return { ok: true, message: ROLE_MSG }; },
-  });
-  const ok = await handlePipeRequest({ type: 'role', id: 'r1', role: 'reviewer' }, okSession);
-  assert.deepEqual(ok, { type: 'ok', id: 'r1', detail: ROLE_MSG });
-  assert.deepEqual(calls, [{ role: 'reviewer', by: 'w1' }], 'switchedBy = the pane that asked');
-
-  const errSession = pipeSession({
-    applyRoleSwitch: async () => ({ ok: false, message: 'Error: role "nope" unavailable: ROLE_NOT_FOUND' }),
-  });
-  const err = await handlePipeRequest({ type: 'role', id: 'r2', role: 'nope' }, errSession);
-  assert.deepEqual(err, { type: 'error', id: 'r2', message: 'Error: role "nope" unavailable: ROLE_NOT_FOUND' });
+test('handlePipeRequest: an unknown request type is refused by name', async () => {
+  // PipeRequest is closed, but parsePipeLine forwards whatever JSON arrives: a peer asking for a type
+  // this version does not implement (`role` was removed with the live role switch) must hear it.
+  const req = { type: 'role', id: 'r1', role: 'reviewer' } as unknown as Parameters<typeof handlePipeRequest>[0];
+  assert.deepEqual(
+    await handlePipeRequest(req, pipeSession()),
+    { type: 'error', id: 'r1', message: 'unknown type role' },
+  );
 });
 
 /* ── index-notices: D92 settlement-notice buffer ────────────────── */

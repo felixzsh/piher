@@ -465,7 +465,7 @@ async function mountRoleRuntime(opts: { isSubagent: boolean; ws: string }) {
   const runtime = createRoleRuntime({
     pi: pi as never,
     roleBase: opts.ws,
-    // Armed, so /piher-role and the pipe switch have something to switch away from.
+    // Armed, so /piher-role has something to switch away from.
     initialManifest: {
       role: 'worker', version: '1.0.0', tools: ['read'], permissions: { '*': 'allow' },
       unknownTools: 'allow',
@@ -511,7 +511,7 @@ test('role runtime: piher-roles is the derived menu, byte-identical until a swit
   // A role written mid-session appears on the next recompute — a switch, with no skill file edited.
   await writeFile(join(wsDir, 'auditor.json'), JSON.stringify({ role: 'auditor', version: '1.0.0', description: 'audits a branch', manifest: { tools: ['read'] } }));
   assert.equal((await sections())['piher-roles'], first, 'nothing recomputes without a switch');
-  const switched = await runtime.applyRoleSwitch('reviewer', 'human');
+  const switched = await runtime.applyRoleSwitch('reviewer');
   assert.equal(switched.ok, true, switched.message);
   const after = (await sections())['piher-roles'];
   assert.match(after, /^- auditor — audits a branch$/m, 'the new workspace role is now advertised');

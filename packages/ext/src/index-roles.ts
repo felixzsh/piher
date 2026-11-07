@@ -44,8 +44,8 @@ export interface RoleRuntime {
   readonly state: RoleState;
   /** Replay the branch-point role record and re-anchor side effects (D77 visible layer). */
   syncFromBranch(ctx: unknown): void;
-  /** Mid-session switch: /piher-role (human) and the pipe `role` request (master). */
-  applyRoleSwitch(roleName: string, switchedBy: string): Promise<{ ok: boolean; message: string }>;
+  /** Mid-session switch from `/piher-role`: the human typing in the pane is the final authority (Q2/S22). */
+  applyRoleSwitch(roleName: string): Promise<{ ok: boolean; message: string }>;
 }
 
 export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
@@ -121,10 +121,7 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
     }
   }
 
-  async function applyRoleSwitch(
-    roleName: string,
-    switchedBy: string,
-  ): Promise<{ ok: boolean; message: string }> {
+  async function applyRoleSwitch(roleName: string): Promise<{ ok: boolean; message: string }> {
     const current = roleState.manifest;
     if (!current) {
       return { ok: false, message: 'Error: role system not armed (no manifest; bare pi sessions cannot switch roles)' };
@@ -151,7 +148,7 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
     roleState.manifest = next;
     catalog = null; // A switch is the recompute point for the role menu (S20).
     roleState.origin = 'switch';
-    roleState.switchedBy = switchedBy;
+    roleState.switchedBy = 'human';
     roleState.switchedAt = Date.now();
     try {
       pi.appendEntry(ROLE_MANIFEST_CUSTOM_TYPE, {
@@ -163,7 +160,7 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
         unknownTools: next.unknownTools ?? 'deny',
         ...(next.guidelines?.length ? { guidelines: next.guidelines } : {}),
         origin: 'switch' as const,
-        switchedBy,
+        switchedBy: 'human',
         ts: Date.now(),
       });
     } catch {
@@ -231,7 +228,7 @@ export function createRoleRuntime(d: RoleRuntimeDeps): RoleRuntime {
         notify(`Error: role "${name}" unavailable: ${(err as Error).message}`, 'error');
         return;
       }
-      const res = await applyRoleSwitch(name, 'human');
+      const res = await applyRoleSwitch(name);
       notify(res.message, res.ok ? 'info' : 'error');
     },
   });

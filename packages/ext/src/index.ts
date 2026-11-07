@@ -232,7 +232,6 @@ export default async function (pi: ExtensionAPI) {
         sendUserMessageAs,
         abort: () => { latestCtx?.abort?.(); },
         setPendingMachineRequest: (next) => { pendingMachineRequest = next; },
-        applyRoleSwitch: roles.applyRoleSwitch,
       }), bindFailed);
       pipeServerBox.current = server;
       server.once('listening', () => {

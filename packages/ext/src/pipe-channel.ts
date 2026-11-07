@@ -57,13 +57,6 @@ export type PipeRequest =
     }
   | { type: 'interrupt'; id: string }
   | {
-      /** P0 (RFC §4.4): master switches a worker's role; the worker applies the manifest swap and
-       * replies ok/error. Mixed-version peers answer `unknown type role`, which the master surfaces. */
-      type: 'role';
-      id: string;
-      role: string;
-    }
-  | {
       /** D50: fast-path settlement reply from child to requester, with summary and session path for progressive disclosure. */
       type: 'reply';
       id: string;
