@@ -226,6 +226,35 @@ export default function subagentPlugin(ctx: Context): void {
     writeTaskRecord(entry.cwd, entry);
   }
 
+  /** Write the close decision onto the freshest record: the rename is atomic against a torn
+   *  file, not against a lost field, so a concurrent report delivery from the owning session
+   *  is merged in, never dropped by flushing a snapshot read earlier in the call. */
+  function writeCloseRecord(cwd: string, entry: TaskEntry): void {
+    const at = Date.now();
+    entry.closedAt = at;
+    const fresh = readTaskRecord(cwd, entry.taskId);
+    if (!fresh) {
+      writeTaskRecord(cwd, entry);
+      return;
+    }
+    fresh.closedAt = at;
+    writeTaskRecord(cwd, fresh);
+    // Keep memory truthful: the record may carry a delivery this session had not seen.
+    if (fresh.gen.consumedAt !== null) entry.gen.consumedAt = fresh.gen.consumedAt;
+    if (fresh.gen.reportDelivered !== null) entry.gen.reportDelivered = fresh.gen.reportDelivered;
+  }
+
+  /** The disk is the authority (S24): adopt durable decisions another session may have written
+   *  since this row was read. Facts only move toward final — closedAt, consumedAt and the
+   *  delivered fingerprint are set, never cleared — so a refresh can never revive a task. */
+  function refreshFromRecord(entry: TaskEntry): void {
+    const row = readTaskRecord(entry.cwd, entry.taskId);
+    if (!row) return;
+    if (row.closedAt !== null) entry.closedAt = row.closedAt;
+    if (row.gen.consumedAt !== null) entry.gen.consumedAt = row.gen.consumedAt;
+    if (row.gen.reportDelivered !== null) entry.gen.reportDelivered = row.gen.reportDelivered;
+  }
+
   /** A spawn appends its id to the view; every other operation touches one record. */
   function appendView(taskId: string): void {
     if (!viewIds.includes(taskId)) viewIds.push(taskId);
@@ -648,6 +677,9 @@ export default function subagentPlugin(ctx: Context): void {
     const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
     const resolved = resolveSubEntry(idParam(params, 'agentId', 'taskId'), cwd);
     if ('error' in resolved) toolError(resolved.error);
+    // Freshness at the single shared spine: no decision below may read a stale memory copy.
+    // Transient rows are already fresh — they were read from the record in this same call.
+    if (!resolved.foreign) refreshFromRecord(resolved.entry);
     return { entry: resolved.entry, cwd, foreign: resolved.foreign };
   }
 
@@ -923,37 +955,32 @@ export default function subagentPlugin(ctx: Context): void {
    *  reported has no pane left to take the text. */
   async function executeSubagentRetry(params: ToolParams, toolCtx: unknown) {
     const { entry, foreign } = targetOf(params, toolCtx);
-    // A retry re-sends the spawning session's brief or starts its next worker: neither is this
-    // session's to do for another session's task.
-    if (foreign) return toolError(foreignRefusal(entry.taskId, 'retry'));
-    const prompt = readTaskPrompt(entry.taskId);
-    if (prompt === null) {
-      return toolError(
-        `Error: no stored prompt for task ${entry.taskId} — piher keeps the brief of a spawn it made, and this task has none (a resumed session, or a row from another checkout). Send the task again with action "send".`,
-      );
-    }
-    // Every kind of worker retries: a closed row is final and a spent one-shot has no session left to
-    // revive, so those two get a new worker with the same brief, role and checkout. The rest keep
-    // their own pane or session.
-    if (isClosed(entry) || isSpent(entry)) {
-      return executeSubagentSpawn({
-        prompt,
-        description: entry.description,
-        cwd: entry.cwd,
-        ...(entry.kind !== 'task' ? { role: entry.kind } : {}),
-        ...(entry.worktree ? { worktree: entry.worktree.branch } : {}),
-      }, toolCtx);
-    }
-    if (spentText(entry) !== null) {
-      // A collected task whose pane is gone: revive the same session, then deliver the stored prompt.
-      await executeSubagentResume({ ...params, taskId: entry.taskId }, toolCtx);
-      const target = tasks.get(entry.taskId);
-      if (!target || isClosed(target) || isSpent(target)) {
-        return toolError(`Error: retry could not revive task ${entry.taskId}.`);
+    const spawnNew = (brief: string) => executeSubagentSpawn({
+      prompt: brief,
+      description: entry.description,
+      cwd: entry.cwd,
+      ...(entry.kind !== 'task' ? { role: entry.kind } : {}),
+      ...(entry.worktree ? { worktree: entry.worktree.branch } : {}),
+    }, toolCtx);
+    const needBrief = (): string => {
+      const brief = readTaskPrompt(entry.taskId);
+      if (brief === null) {
+        throw new ToolError(
+          `Error: no stored prompt for task ${entry.taskId} — piher keeps the brief `
+          + 'of a spawn it made, and this task has none (a resumed session, or a row from '
+          + 'another checkout). Send the task again with action "send".',
+        );
       }
-      return executeSubagentSend({ ...params, agentId: target.gen.paneId, message: prompt }, toolCtx);
-    }
-    return executeSubagentSend({ ...params, message: prompt }, toolCtx);
+      return brief;
+    };
+    // S2, no session qualifier: a closed task or a spent one-shot starts a NEW task. The new task
+    // is this session's own — new taskId, own view and record — so a foreign closed row retries
+    // the same way, and the old row is untouched.
+    if (spentText(entry) !== null) return spawnNew(needBrief());
+    // An actionable foreign row refuses: this session may not steer another session's live
+    // conversation (S7).
+    if (foreign) return toolError(foreignRefusal(entry.taskId, 'retry'));
+    return executeSubagentSend({ ...params, message: needBrief() }, toolCtx);
   }
 
   async function executeSubagentInterrupt(params: ToolParams, toolCtx: unknown) {
@@ -962,6 +989,9 @@ export default function subagentPlugin(ctx: Context): void {
     // probe decides — a worker with no turn in flight has nothing to stop, and naming `close`
     // points at the natural next step instead of a wait. A probe that fails never refuses: the
     // pipe attempt itself is the honest test.
+    // No ownership refusal here: `close` refuses a worker with a turn in flight and points at
+    // `interrupt`, so refusing `interrupt` across sessions would make another session's stuck
+    // worker impossible to end. Interrupting writes no document and adopts nothing.
     if (isClosed(entry)) {
       return toolError(
         `Error: subagent ${taskRef(entry.gen)} is closed — its pane and tab are gone, so there is `
@@ -1011,10 +1041,7 @@ export default function subagentPlugin(ctx: Context): void {
       // elsewhere, or a sweep). Record the decision here too, so the record says who ended it
       // instead of trailing off at `consumed`.
       const latest = readTaskRecord(entry.cwd, entry.taskId);
-      if (!latest || !isClosed(latest)) {
-        entry.closedAt = Date.now();
-        writeRecord(entry);
-      }
+      if (!latest || !isClosed(latest)) writeCloseRecord(entry.cwd, entry);
       const finality = `Error: task ${entry.taskId} was closed by the master; close is final, `
         + 'so there is nothing to resume or send to. Start a new subagent for further work.';
       return {
@@ -1062,9 +1089,8 @@ export default function subagentPlugin(ctx: Context): void {
       checkoutLine = ` ${releasedCheckoutLine(entry.worktree, released.removed)};`;
     }
     await retirePane(client, entry.gen.paneId);
-    entry.closedAt = Date.now();
     // The record survives the pane: `resume` answers from it, so the decision is not lost.
-    writeTaskRecord(recordCwd, entry);
+    writeCloseRecord(recordCwd, entry);
     const doneText = `Subagent ${taskRef(entry.gen)} closed — pane and tab gone;${checkoutLine} `
       + 'close is final — start a new subagent for further work.';
     return {
@@ -1077,7 +1103,11 @@ export default function subagentPlugin(ctx: Context): void {
    *  A closed or spent row is never printed, and a foreign record whose pane is gone is not
    *  printed at all. Every row shown is probed — the probe feeds the state text (S26). */
   async function executeSubagentList(toolCtx?: unknown) {
-    const rows = [...tasks.values()].filter(isActionable);
+    const rows = [...tasks.values()];
+    // Every own row is re-read before it is shown: another session may have closed it since the
+    // restore, and `list` must drop it on sight, not on the next reload (S24).
+    for (const row of rows) refreshFromRecord(row);
+    const visible = rows.filter(isActionable);
     const cwd = (toolCtx as { cwd?: string } | undefined)?.cwd ?? process.cwd();
     const foreign = listTaskRecords(cwd)
       .filter((row) => isActionable(row) && !viewIds.includes(row.taskId) && !tasks.has(row.taskId))
@@ -1091,11 +1121,11 @@ export default function subagentPlugin(ctx: Context): void {
       } catch { /* best effort: the cache below covers a failed probe */ }
     };
     await Promise.all([
-      ...rows.map((row) => probeRow(row, true)),
+      ...visible.map((row) => probeRow(row, true)),
       ...foreign.map((row) => probeRow(row, false)),
     ]);
     const lines: string[] = [];
-    for (const row of rows) {
+    for (const row of visible) {
       const cached = probes.get(row.taskId) ?? observations.get(row.taskId) ?? null;
       const head = `${taskRef(row.gen)} [${describeTaskState(row, cached)}]`;
       lines.push(`${head} (${row.kind} · ${row.lifecycle}) ${row.description}`);
@@ -1136,7 +1166,11 @@ export default function subagentPlugin(ctx: Context): void {
 
   const outputActionDeps = {
     client,
-    resolveEntry: (rawId: string, cwd?: string) => resolveSubEntry(rawId, cwd),
+    resolveEntry: (rawId: string, cwd?: string) => {
+      const resolved = resolveSubEntry(rawId, cwd);
+      if (!('error' in resolved) && !resolved.foreign) refreshFromRecord(resolved.entry);
+      return resolved;
+    },
     outputCursors,
     nextRevision: (paneId: string): number => {
       const next = (outputRevisions.get(paneId) ?? 0) + 1;

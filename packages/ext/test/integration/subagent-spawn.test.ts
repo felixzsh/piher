@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { CoreClientLike } from '../../src/core-client.ts';
 import { pipeNameFor, startPipeServer, type PipeRequest } from '../../src/pipe-channel.ts';
-import { readTaskRecord, repoTasksDir } from '../../src/task-store.ts';
+import { readTaskRecord, repoTasksDir, taskRecordPath } from '../../src/task-store.ts';
 import type { SubagentPortBox } from '../../src/subagent-core.ts';
 import { NodeGitAdapter, createSpawner, type GitExecFile } from '../../src/subagent-spawn.ts';
 import {
@@ -135,17 +135,17 @@ async function withPipeEnv(
     server.unref();
   };
   ensureServer('p2');
-  if (opts.paneSeq) { ensureServer('p3'); ensureServer('p4'); }
+  if (opts.paneSeq) { for (const id of ['p3', 'p4', 'p5', 'p6']) ensureServer(id); }
   await Promise.all(servers.map((s) => new Promise<void>((resolve) => s.once('listening', resolve))));
   const clientOpts: Partial<CoreClientLike> = {
     getTerminal: async (id: string) => env.paneGone ? null : terminalInfo({
       id,
-      labels: ['p2', 'p3', 'p4'].includes(id) ? { 'piher.session': sessionFile } : {},
+      labels: ['p2', 'p3', 'p4', 'p5', 'p6'].includes(id) ? { 'piher.session': sessionFile } : {},
     }),
     // The poller parks on the children watch: while parked, `changed` never resolves and the
     // snapshot reports the worker as working, so the row stays running with no polling.
     watchChildren: () => fakeWatch({
-      terminals: () => ['p2', 'p3', 'p4'].map((id) => terminalInfo({
+      terminals: () => ['p2', 'p3', 'p4', 'p5', 'p6'].map((id) => terminalInfo({
         id,
         status: parked ? 'working' : 'idle',
         labels: { 'piher.session': sessionFile },
@@ -615,10 +615,11 @@ test('tasks: a reload restores two workers from the records, and both close by r
     assert.deepEqual(readTaskView(sessionFile), ids);
     for (const [i, taskId] of ids.entries()) {
       const row = readTaskRecord(env.cwd, taskId);
-      assert.equal(row?.taskId, taskId);
-      assert.equal(row?.description, i === 0 ? 'reload probe one' : 'reload probe two');
-      assert.equal(row?.gen.paneId, refs[i]!.split('@')[1]);
-      assert.ok(row?.closedAt !== null, 'close wrote the decision into the record');
+      assert.ok(row, `record exists for ${taskId}`);
+      assert.equal(row.taskId, taskId);
+      assert.equal(row.description, i === 0 ? 'reload probe one' : 'reload probe two');
+      assert.equal(row.gen.paneId, refs[i]!.split('@')[1]);
+      assert.ok(row.closedAt !== null, 'close wrote the decision into the record');
     }
 
     // No session entry was appended: the branch is not a document in this model.
@@ -631,20 +632,42 @@ test('tasks: a reload restores two workers from the records, and both close by r
 
 const aStamp = '2026-11-07T00-00-00-000Z_aaaaaaaa-0000-4000-8000-000000000000.jsonl';
 
-test('ownership: B lists A’s live worker foreign, drops and closes it', async () => {
+test('ownership: foreign rows list marked, close final, retry starts new', async () => {
   // Two mounts share one repository directory with different session files. Foreignness derives
   // from the view alone: a record the view does not name belongs to another session (S10 keeps
   // the durable facts fixed, so no owner field exists to read).
   const bStamp = '2026-11-07T00-00-00-000Z_bbbbbbbb-0000-4000-8000-000000000000.jsonl';
+  const words = ['one', 'two', 'three', 'four'];
   await withPipeEnv(async (env) => {
     env.parkPollers();
-    const spawned = await runSubagent(
-      env.pi, { description: 'shared worker', prompt: PROMPT }, env.cwd);
-    await waitFor(() => env.frames.length === 1);
-    const taskId = spawned.details?.taskId as string;
-    const slug = /started subagent ([a-z0-9-]+)@/.exec(spawned.content[0]!.text)![1];
-    const ref = `${slug}@p2`;
+    const workers: Array<{ taskId: string; slug: string; paneId: string }> = [];
+    for (const [i, word] of words.entries()) {
+      const spawned = await runSubagent(
+        env.pi, { description: `shared worker ${word}`, prompt: PROMPT }, env.cwd);
+      const text = spawned.content[0]!.text;
+      workers.push({
+        taskId: spawned.details?.taskId as string,
+        slug: /started subagent ([a-z0-9-]+)@/.exec(text)![1]!,
+        paneId: `p${2 + i}`,
+      });
+    }
+    await waitFor(() => env.frames.length === 4);
+    const [w1, w2, w3, w4] = workers;
+    if (!w1 || !w2 || !w3 || !w4) throw new Error('four workers were not spawned');
 
+    // B also spawns (a retry below needs it): its own pane ids and pipe, parked pollers.
+    const bFrames: PipeRequest[] = [];
+    const bSockets = new Set<Socket>();
+    const qServer = startPipeServer(pipeNameFor(env.cwd, 'q2'), async (req) => {
+      if (req.type === 'prompt' || req.type === 'follow_up') bFrames.push(req);
+      return { type: 'ok', id: req.id };
+    });
+    qServer.on('connection', (sock) => {
+      bSockets.add(sock);
+      sock.on('close', () => bSockets.delete(sock));
+    });
+    await new Promise<void>((resolve) => qServer.once('listening', resolve));
+    let bPaneSeq = 0;
     let bMode: 'working' | 'gone' | 'idle' = 'working';
     const bSession = join(env.cwd, bStamp);
     const bKilled: string[] = [];
@@ -653,56 +676,117 @@ test('ownership: B lists A’s live worker foreign, drops and closes it', async 
         getTerminal: async (id: string) => bMode === 'gone'
           ? null
           : terminalInfo({ id, state: 'live', status: bMode }),
+        listTerminals: async () => [],
+        watchChildren: () => fakeWatch({
+          terminals: () => [], park: () => new Promise<never>(() => {}),
+        }),
+        run: async (o) => terminalInfo({ id: `q${2 + bPaneSeq++}`, cwd: o.cwd, labels: o.labels }),
         kill: async (id: string) => { bKilled.push(`kill:${id}`); },
         remove: async (id: string) => { bKilled.push(`remove:${id}`); },
       },
       deps: { getSessionFile: () => bSession },
     });
     try {
-      // B lists A's live worker with the foreign prefix, in the contract's line format.
+      // B lists A's live workers with the foreign prefix, in the contract's line format.
       const listed = (await runSubagent(bMount.pi, { action: 'list' }, env.cwd)).content[0]!.text;
-      const foreignLine = `\\[otra sesión\\] ${slug}@p2 \\[running\\] ` +
-        `\\(task · persistent\\) shared worker`;
-      assert.match(listed, new RegExp(foreignLine));
+      const lines = listed.split('\n');
+      assert.equal(lines.length, 4, `B lists all four foreign workers: ${listed}`);
+      for (const [i, w] of workers.entries()) {
+        const foreignLine = `^\\[otra sesión\\] ${w.slug}@${w.paneId} \\[running\\]`;
+        assert.match(lines[i]!, new RegExp(foreignLine), `worker ${i} is marked foreign`);
+      }
 
-      // Once the pane reports gone, B stops listing it: no `no pane` line for foreign rows.
+      // Send and retry on a live foreign row refuse with ownership, not finality: steering
+      // would write a generation this session does not own.
+      const bSend = { action: 'send', agentId: w1!.paneId, message: 'x' };
+      assert.match(await runSubagentRejects(bMount.pi, bSend, env.cwd), /belongs to another session/);
+      assert.match(
+        await runSubagentRejects(bMount.pi, { action: 'retry', agentId: w1!.paneId }, env.cwd),
+        /belongs to another session/);
+
+      // Foreign output works and writes nothing: the record and B's view are untouched.
+      const before = readFileSync(taskRecordPath(repoTasksDir(env.cwd)!, w1!.taskId), 'utf8');
+      const out = await runSubagent(bMount.pi, { action: 'output', agentId: w1!.paneId }, env.cwd);
+      assert.equal(out.details!.reportDelivered, false);
+      const recordPath = taskRecordPath(repoTasksDir(env.cwd)!, w1!.taskId);
+      assert.equal(readFileSync(recordPath, 'utf8'), before);
+      assert.equal(readTaskView(bSession), null, 'no view document grows from foreign rows');
+
+      // Once the panes report gone, B stops listing them: no `no pane` line for foreign rows.
       bMode = 'gone';
       const gone = (await runSubagent(bMount.pi, { action: 'list' }, env.cwd)).content[0]!.text;
       assert.equal(gone, 'No subagents started (from this session view).');
 
-      // B's close writes the decision into A's record and reclaims the pane — no adoption step.
-      // The agent is idle, so no turn blocks the close.
+      // B's close drives one worker per id form the list line offers. The agents are idle,
+      // so no turn blocks any close; nothing is adopted anywhere.
       bMode = 'idle';
-      const closed = await runSubagent(bMount.pi, { action: 'close', agentId: ref }, env.cwd);
-      assert.match(closed.content[0]!.text, /closed — pane and tab gone/);
-      assert.deepEqual(bKilled, ['kill:p2', 'remove:p2'], 'the foreign pane is retired');
-      const record = readTaskRecord(env.cwd, taskId);
-      assert.ok(record?.closedAt !== null, 'the decision lands in A’s record');
-      assert.equal(readTaskView(bSession), null, 'no view document grows from foreign rows');
+      const closes = [
+        w1!.slug,
+        `${w2!.slug}@${w2!.paneId}`,
+        w3!.paneId,
+        w4!.taskId.slice(0, 8),
+      ];
+      for (const ref of closes) {
+        const closed = await runSubagent(bMount.pi, { action: 'close', agentId: ref }, env.cwd);
+        assert.match(closed.content[0]!.text, /closed — pane and tab gone/, `close by ${ref}`);
+      }
+      assert.deepEqual(bKilled, [
+        'kill:p2', 'remove:p2', 'kill:p3', 'remove:p3',
+        'kill:p4', 'remove:p4', 'kill:p5', 'remove:p5',
+      ], 'every foreign pane is retired');
+      for (const w of workers) {
+        const row = readTaskRecord(env.cwd, w.taskId);
+        assert.ok(row, `${w.paneId} record exists`);
+        assert.ok(row.closedAt !== null, `${w.paneId} decision lands`);
+      }
+      assert.equal(readTaskView(bSession), null, 'closes adopt nothing into the view');
 
-      // A's row is still open in A's memory, but its pane is gone with the old session: every
-      // action now derives the finality from the record instead.
-      env.paneGone = true;
-      env.deadPipes = 100;
+      // A's rows are still open in A's memory, but the refresh adopts the record's decision:
+      // send and resume refuse with finality, and the next list drops them — all with no reload.
       assert.match(
         await runSubagentRejects(env.pi, { action: 'send', agentId: 'p2', message: 'x' }, env.cwd),
         /closed by the master/);
       assert.match(
-        await runSubagentRejects(env.pi, { action: 'resume', taskId }, env.cwd),
+        await runSubagentRejects(env.pi, { action: 'resume', taskId: w1!.taskId }, env.cwd),
         /closed by the master/);
-      assert.match(
-        await runSubagentRejects(env.pi, { action: 'retry', agentId: 'p2' }, env.cwd),
-        /closed by the master/);
-
-      // A's next read drops it: the record's decision wins over memory.
-      await fire(env.pi, 'session_start', { reason: 'reload' }, {});
       assert.equal(
         (await runSubagent(env.pi, { action: 'list' }, env.cwd)).content[0]!.text,
         'No subagents started (from this session view).');
+
+      // A's retry on its B-closed row starts a new own task (S2): new id, same brief, and the
+      // old record stays final on its original pane.
+      const aRetried = await runSubagent(env.pi, { action: 'retry', agentId: 'p2' }, env.cwd);
+      assert.match(aRetried.content[0]!.text, /^started subagent/);
+      const aNewId = aRetried.details?.taskId as string;
+      assert.ok(aNewId && aNewId !== w1!.taskId, 'a new task, not a resurrection');
+      const aOldRow = readTaskRecord(env.cwd, w1!.taskId);
+      assert.ok(aOldRow, 'the old record still exists');
+      assert.ok(aOldRow.closedAt !== null, 'the old row stays final');
+      assert.equal(aOldRow.gen.paneId, 'p2', 'no new generation on the closed task');
+      const aNewRow = readTaskRecord(env.cwd, aNewId);
+      assert.ok(aNewRow, 'the new record exists');
+      assert.equal(aNewRow.description, 'shared worker one');
+
+      // Retry on a foreign closed task starts a NEW task (S2): a new id in B's view alone,
+      // A's brief re-sent, A's record byte-identical.
+      const aRecordPath = taskRecordPath(repoTasksDir(env.cwd)!, w1!.taskId);
+      const aRecordBefore = readFileSync(aRecordPath, 'utf8');
+      const retried = await runSubagent(
+        bMount.pi, { action: 'retry', agentId: w1!.taskId }, env.cwd);
+      assert.match(retried.content[0]!.text, /^started subagent/);
+      const newTaskId = retried.details?.taskId as string;
+      assert.ok(newTaskId !== w1!.taskId, 'a new task, not a resurrection');
+      assert.deepEqual(readTaskView(bSession), [newTaskId], 'B’s view gains only the new id');
+      assert.equal(readTaskRecord(env.cwd, newTaskId)?.description, 'shared worker one');
+      await waitFor(() => bFrames.length === 1);
+      assert.equal((bFrames[0] as { text?: string }).text, PROMPT, 'the stored brief is re-sent');
+      assert.equal(readFileSync(aRecordPath, 'utf8'), aRecordBefore, 'A’s record is untouched');
     } finally {
       await bMount.root.fiber.dispose();
+      for (const sock of bSockets) sock.destroy();
+      await new Promise<void>((resolve) => qServer.close(() => resolve()));
     }
-  }, { sessionFile: (cwd) => join(cwd, aStamp) });
+  }, { paneSeq: true, sessionFile: (cwd) => join(cwd, aStamp) });
 });
 
 test('tasks: no transcript path keeps the view in memory, records still land (S25)', async () => {

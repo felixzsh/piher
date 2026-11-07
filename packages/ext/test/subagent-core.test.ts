@@ -457,7 +457,9 @@ test('subagent plugin: eleven settlements prune nothing, the oldest still closes
       }
       const closed = await runSubagent(pi, { action: 'close', agentId: 'p0' }, repo);
       assert.match(closed.content[0]!.text, /closed — pane and tab gone/);
-      assert.ok(readTaskRecord(repo, 'settle-0')?.closedAt !== null, 'the oldest row closes');
+      const oldest = readTaskRecord(repo, 'settle-0');
+      assert.ok(oldest, 'the oldest record exists');
+      assert.ok(oldest.closedAt !== null, 'the oldest row closes');
     } finally {
       await root.fiber.dispose();
     }
@@ -807,6 +809,8 @@ test('subagent plugin: close reclaims a running row whose pane has no turn in fl
   const repo = mkdtempSync(join(tmpdir(), 'piher-close-repo-'));
   mkdirSync(join(repo, '.git'), { recursive: true });
   for (const status of ['idle', 'done', 'error'] as const) {
+    // One task per iteration: a close persists, so a shared id would read back already closed.
+    const taskId = `task-idle-${status}`;
     const retired: string[] = [];
     const { root, pi } = await mountSubagent({
       client: {
@@ -814,12 +818,13 @@ test('subagent plugin: close reclaims a running row whose pane has no turn in fl
         kill: async (id: string) => { retired.push(id); },
         remove: async (id: string) => { retired.push(id); },
       },
-      tasks: [taskRow({ paneId: 'p-idle', taskId: 'task-idle', cwd: repo })],
+      tasks: [taskRow({ paneId: 'p-idle', taskId, cwd: repo })],
     });
     try {
       const res = await runSubagent(pi, { action: 'close', agentId: 'p-idle' }, repo);
       assert.match(res.content[0]!.text, /closed — pane and tab gone/, `status ${status} must be closable`);
-      assert.ok(readTaskRecord(repo, 'task-idle')?.closedAt !== null, 'the record carries the decision');
+      const record = readTaskRecord(repo, taskId);
+      assert.ok(record && record.closedAt !== null, 'the record carries the decision');
     } finally {
       await root.fiber.dispose();
     }
