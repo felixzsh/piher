@@ -359,12 +359,18 @@ test('subagent plugin: one tool, lifecycle hooks, port binding and unbinding', a
   assert.ok((pi.listeners.get('session_start') ?? []).length >= 1);
   assert.ok((pi.listeners.get('turn_start') ?? []).length >= 1, 'GC turn_start hook');
   assert.ok(port.current, 'port bound at mount');
-  for (const key of ['applyReplySession', 'listRunningSubs'] as const) {
+  const members = [
+    'applyReplySession', 'listRunningSubs', 'consumeReply', 'settlementCard',
+  ] as const;
+  for (const key of members) {
+
     assert.equal(typeof port.current[key], 'function', `port member ${key}`);
   }
+  const shape = port.current as unknown as Record<string, unknown>;
+  assert.ok(!('listRows' in shape), 'the tree projection left the port');
   port.current.applyReplySession('unknown', null);
 
-  // A cwd with no repository and no ledger: `list` answers from the registry alone there.
+  // A cwd with no repository and no tasks: `list` answers from memory alone there.
   assert.match((await runSubagent(pi, { action: 'list' }, mkdtempSync(join(tmpdir(), 'piher-no-ledger-')))).content[0]!.text, /No subagents started/);
   await assert.rejects(runSubagent(pi, { action: 'explode' }), /unknown action "explode"/);
 
@@ -377,7 +383,8 @@ test('subagent plugin: ledger tombstone makes the tool inert', async () => {
   const { root, pi, port } = await mountSubagent({ ledger });
   assert.equal(ledger.disposeKey(new URL('../src/plugins/subagent.ts', import.meta.url).href), 1);
   assert.match((await runSubagent(pi, { action: 'list' })).content[0]!.text, /disposed/);
-  assert.equal(typeof port.current?.listRows, 'function');
+  const shapeOrNull = port.current as unknown as Record<string, unknown> | null;
+  assert.equal(typeof shapeOrNull?.['listRows'], 'undefined');
   await root.fiber.dispose();
 });
 

@@ -1,30 +1,19 @@
 /**
- * Unified TUI status surface (RFC rfc-unified-widget.md, D113): the resident widget shows one line
- * per running subagent, and the full delegation tree with its settled nodes lives behind
- * /piher-tree. Pure builders only.
+ * The resident widget: one line per running subagent. Pure builders only.
  */
 
-/** One running worker row as the widget and the tree consume it. */
+/** One running worker row as the widget consumes it. */
 export interface WorkerWidgetRow {
   paneId: string;
   slug?: string;
   /** Role name the worker was launched with; `task` when it was spawned without one. */
   role?: string;
-  /** Registry state. The widget is handed running workers only. */
+  /** Observed state text. The widget is handed workers still awaiting a report only. */
   state?: string;
   /** Spawn time, for the elapsed field on a widget row. */
   startedAt?: number;
   /** Pane label for `list` and the settle notice. A widget row never shows it. */
   description?: string;
-}
-
-/** A settled (delivered) worker row for the tree view only — never in the resident widget. */
-export interface SettledWidgetRow {
-  paneId: string;
-  slug?: string;
-  description: string;
-  /** Absent when the row survived a resume without its timestamp. */
-  settledAt?: number | null;
 }
 
 /** `<60s → Ns`; `<60m → Nm`; `<48h → Nh` (floor); otherwise `Nd`. */
@@ -65,39 +54,5 @@ export function widgetLines(workers: readonly WorkerWidgetRow[], now = Date.now(
   const overflow = rows.length > WIDGET_MAX_LINES;
   const shown = rows.slice(0, overflow ? WIDGET_MAX_LINES - 1 : WIDGET_MAX_LINES);
   const hidden = rows.length - shown.length;
-  return [...shown, ...(hidden > 0 ? [`…+${hidden} more subagents · /piher-tree`] : [])];
-}
-
-/** Full delegation tree for /piher-tree: every running worker plus the settled nodes that are still
- *  revivable, hung off the master node. */
-export function formatDelegationTree(opts: {
-  workers: readonly WorkerWidgetRow[];
-  settled?: readonly SettledWidgetRow[];
-  now?: number;
-}): string[] {
-  const now = opts.now ?? Date.now();
-  const settled = opts.settled ?? [];
-  const children = opts.workers.length + settled.length;
-  const lines: string[] = [
-    `Delegation tree · ${opts.workers.length} running · ${settled.length} settled`,
-    '',
-    '● master (this pane)',
-  ];
-  if (children > 0) lines.push('│');
-
-  let index = 0;
-  for (const w of opts.workers) {
-    const last = ++index === children;
-    const meta = [w.paneId, w.state ?? 'running', ...(w.role && w.role !== 'task' ? [w.role] : [])].join(' · ');
-    lines.push(`${last ? '└' : '├'}─ ↳ ${w.slug ?? w.paneId} (${meta})`);
-    if (!last) lines.push('│');
-  }
-  for (const s of settled) {
-    const last = ++index === children;
-    const age = s.settledAt ? ` · settled ${formatAge(Math.max(now - s.settledAt, 0))} ago` : ' · settled';
-    lines.push(`${last ? '└' : '├'}─ ✓ ${s.slug ?? s.paneId} (${s.paneId}${age})  result delivered`);
-    if (!last) lines.push('│');
-  }
-  lines.push('', 'subagent list → workers');
-  return lines;
+  return [...shown, ...(hidden > 0 ? [`…+${hidden} more subagents · subagent list`] : [])];
 }

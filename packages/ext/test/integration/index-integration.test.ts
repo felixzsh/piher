@@ -69,13 +69,13 @@ test('index mount surface: worker and bare pi mount no core plugin', async (t) =
   }));
 });
 
-test('index core master: mounts subagent + bg_job + the four piher commands', withCleanup(async (cleanup) => {
+test('index core master: mounts subagent, bg_job, three commands', withCleanup(async (cleanup) => {
   const pi = await mountIndex(cleanup, 'master');
   try {
     for (const tool of ['subagent', 'bg_job']) assert.ok(pi.tools.has(tool), `core master mounts ${tool}`);
     assert.deepEqual([...pi.commands.keys()].sort(),
-      ['piher-config', 'piher-locks', 'piher-role', 'piher-tree'],
-      'the master mounts exactly the four piher commands');
+      ['piher-config', 'piher-locks', 'piher-role'],
+      'the master mounts exactly the three piher commands: no delegation tree');
   } finally {
     await fire(pi, 'session_shutdown');
   }
@@ -484,9 +484,9 @@ test('master and delegation-less workers never grow a piher-delegation section',
   }
 }));
 
-/* ── resident widget + /piher-tree: the delegation surface the master alone owns ── */
+/* ── resident widget: the delegation surface the master alone owns ── */
 
-test('widget + /piher-tree: both follow the restored tasks, and only the master renders either', withCleanup(async (cleanup) => {
+test('widget: follows restored tasks, master renders it alone', withCleanup(async (cleanup) => {
   const cwd = cleanup.tempDir('piher-tree-ws').path;
   mkdirSync(join(cwd, '.git'), { recursive: true });
   const sessionFile = join(cleanup.tempDir('piher-tree-sess').path, '2026-01-01T00-00-00-000Z_dddddddd-0000-4000-8000-000000000000.jsonl');
@@ -523,43 +523,16 @@ test('widget + /piher-tree: both follow the restored tasks, and only the master 
       'the widget carries the running worker only, with its role, state and elapsed time',
     );
 
-    // /piher-tree without ui.custom (RPC mode) degrades to one notify call carrying the same tree.
-    const tree = master.commands.get('piher-tree');
-    assert.ok(tree?.handler, '/piher-tree registers on the master');
-    const notified: string[] = [];
-    await (tree!.handler as (args: unknown, ctx: unknown) => Promise<void>)([], { ui: { notify: (t: string) => { notified.push(t); } } });
-    const text = notified.join('\n');
-    assert.match(text, /Delegation tree · 1 running · 1 settled/);
-    assert.match(text, /● master \(this pane\)/);
-    assert.match(text, /↳ harden-pipe \(w2 · running · worker\)/);
-    assert.match(text, /✓ run-e2e \(w3 · settled \d+m ago\)/);
+    // No delegation tree command: the widget is the only delegation surface now.
+    assert.ok(!master.commands.has('piher-tree'), 'no piher-tree command is registered');
 
-    // With ui.custom it opens as an overlay inside pi; a settlement repaints it without a reopen.
-    type Factory = (tui: unknown, theme: unknown, keys: unknown, done: (v: unknown) => void) => { render(w: number): string[]; handleInput(d: string): void };
-    const opened: { factory?: Factory } = {};
-    const { promise: closed, resolve: close } = Promise.withResolvers<unknown>();
-    let repaints = 0;
-    const opening = (tree!.handler as (args: unknown, ctx: unknown) => Promise<void>)('', {
-      ui: { custom: (f: Factory) => { opened.factory = f; return closed; } },
-    });
-    assert.ok(opened.factory, '/piher-tree opens a ui.custom component');
-    const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
-    const view = opened.factory({ requestRender: () => { repaints += 1; } }, theme, undefined, close);
-    assert.ok(view.render(100).some((line) => line.includes('harden-pipe')), 'the overlay renders the running worker');
-
-    // A settlement (pipe reply → consumed row) reaches the open overlay at the next settle.
+    // A settlement (pipe reply → consumed row) takes the widget down at the next settle.
     const reply = await pipeRequestTo(cwd, 't1', { type: 'reply', id: 'reply-tree', paneId: 'w2', text: 'done', sessionFile: null });
     assert.equal(reply.type, 'ok');
     await fire(master, 'agent_settled', {}, ctx);
-    assert.ok(repaints > 0, 'the settlement asks the open overlay to repaint');
-    const after = view.render(100);
-    assert.ok(after.some((line) => line.includes('Delegation tree · 0 running · 2 settled')), `repaint shows both settlements: ${JSON.stringify(after)}`);
-    assert.ok(after.some((line) => line.includes('✓ harden-pipe')), 'the consumed row moves to the settled nodes');
     // Nothing runs any more, so the strip is removed rather than left as an empty widget (pi keeps an
     // empty array on screen as a stray blank line; undefined is how a widget is taken down).
     assert.equal(widgets.at(-1)?.lines, undefined, 'an idle master carries no agent widget');
-    view.handleInput('\x1b');
-    await opening;
   } finally {
     await fire(master, 'session_shutdown');
   }
@@ -580,7 +553,7 @@ test('widget: a bare or worker pane never sets one (no delegation surface to sho
   }
 });
 
-test('widget cap + overlay scroll: more workers than the budget still renders one honest widget', withCleanup(async (cleanup) => {
+test('widget cap: overflow still renders one honest widget', withCleanup(async (cleanup) => {
   const cwd = cleanup.tempDir('piher-cap-ws').path;
   mkdirSync(join(cwd, '.git'), { recursive: true });
   const sessionFile = join(cleanup.tempDir('piher-cap-sess').path, '2026-01-01T00-00-00-000Z_eeeeeeee-0000-4000-8000-000000000000.jsonl');
@@ -602,29 +575,10 @@ test('widget cap + overlay scroll: more workers than the budget still renders on
     // pi slices a string-array widget to ten lines and appends its own `... (widget truncated)`,
     // so piher must hand over at most ten — tail included — or the fold hint is what gets cut.
     assert.equal(lines.length, WIDGET_MAX_LINES, 'the widget never exceeds pi’s line budget');
-    assert.equal(lines.at(-1), `…+3 more subagents · /piher-tree`, 'and the tail names the exact remainder');
+    assert.equal(lines.at(-1), '…+3 more subagents · subagent list', 'the tail names it');
 
-    // The tree still holds every worker, which is where the folded rows remain reachable.
-    const tree = master.commands.get('piher-tree')!;
-    type Factory = (tui: unknown, theme: unknown, keys: unknown, done: (v: unknown) => void) => { render(w: number): string[]; handleInput(d: string): void };
-    const opened: { factory?: Factory } = {};
-    const { promise: closed, resolve: close } = Promise.withResolvers<unknown>();
-    let repaints = 0;
-    const opening = (tree.handler as (args: unknown, ctx: unknown) => Promise<void>)('', {
-      ui: { custom: (f: Factory) => { opened.factory = f; return closed; } },
-    });
-    const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
-    const view = opened.factory!({ requestRender: () => { repaints += 1; } }, theme, undefined, close);
-    const first = view.render(100);
-    // The overlay is fed by the whole registry, so the rows the widget folded are all still reachable
-    // here (the viewport clips, the count in the header does not).
-    assert.ok(first.some((line) => line.includes(`Delegation tree · ${WIDGET_MAX_LINES + 2} running · 0 settled`)), JSON.stringify(first));
-    assert.ok(first.some((line) => line.includes('↑↓ scroll · esc close')), 'the overlay keeps its key hint');
-    const before = repaints;
-    view.handleInput('j');
-    assert.ok(repaints > before, 'a scroll key repaints the overlay');
-    view.handleInput('\x1b');
-    await opening;
+    // The folded rows stay reachable through the action the tail names.
+    assert.ok(!master.commands.has('piher-tree'), 'no tree command takes over the overflow');
   } finally {
     await fire(master, 'session_shutdown');
   }

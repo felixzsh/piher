@@ -1,11 +1,12 @@
 /** Board hygiene: gc-core decision tables (task tabs, terminals) and the plugin-level GC pass. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  fakeWatch, fire, mountSubagent, runSubagent, taskRow, terminalInfo, type TaskSeed,
+  fakeWatch, fire, listTaskRecords, mountSubagent, runSubagent, seedTaskDocuments, taskRow,
+  terminalInfo, type TaskSeed,
 } from '../test-utils.ts';
 import type { TaskEntry } from '../../src/task-row.ts';
 import { checkoutSpaceId } from '../../src/worktree.ts';
@@ -58,20 +59,22 @@ test('shouldClosePane: only a one-shot pane is reclaimed; a persistent worker is
 /* ── plugin-level GC ────────────────────────────────────────────── */
 
 const pane = (id: string): TerminalInfo => terminalInfo({ id, status: 'idle', labels: { 'herdr.tab': 'tMAIN' } });
-const consumed = (paneId: string, cwd: string, over: TaskSeed = {}) => taskRow({
+const seedData = (paneId: string, cwd: string, over: TaskSeed = {}): TaskSeed => ({
   paneId, taskId: `task-${paneId}`, tabId: 'tMAIN', tabName: 'main', cwd, description: 'pane-gc regression',
   consumedAt: Date.now() - 120_000, createdAt: Date.now() - 150_000,
   lifecycle: 'one-shot', ...over,
 });
+const consumed = (paneId: string, cwd: string, over: TaskSeed = {}): TaskEntry =>
+  taskRow(seedData(paneId, cwd, over));
 
 /** Seeds `tasks`, runs one GC pass with `liveTerminals` in the children watch (and core's list),
  * then reports the retired terminal ids and the live board. */
 async function gcPass(
   liveTerminals: string[],
   tasks: TaskEntry[],
-): Promise<{ closed: string[]; subs: Array<{ paneId: string; settledAt: number | null }> }> {
+): Promise<{ closed: string[] }> {
   const closed: string[] = [];
-  const { root, pi, port } = await mountSubagent({
+  const { root, pi } = await mountSubagent({
     client: {
       placementLabels: async () => ({ 'herdr.tab': 'tMAIN' }),
       listTerminals: async () => liveTerminals.map(pane),
@@ -82,26 +85,32 @@ async function gcPass(
   });
   try {
     await fire(pi, 'turn_start');
-    return { closed, subs: port.current!.listRows() };
+    return { closed };
   } finally {
     await root.fiber.dispose();
   }
 }
 
 test('GC pass: panes are reclaimed, tasks are not closed', async () => {  const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-'));
-  const seeded = [consumed('pAlive', cwd), consumed('pGone', cwd)];
-  const { closed, subs } = await gcPass(['pAlive'], seeded);
+  const seeds = [seedData('pAlive', cwd), seedData('pGone', cwd)];
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  seedTaskDocuments(null, seeds);
+  const before = listTaskRecords(cwd);
+  const { closed } = await gcPass(['pAlive'], seeds.map(taskRow));
   assert.deepEqual(closed, ['pAlive'], 'the pane is retired');
-  // Housekeeping frees panes; only `close` ends a task. Both rows stay listed with their facts.
-  assert.deepEqual(subs.map((s) => s.paneId).sort(), ['pAlive', 'pGone']);
-  for (const sub of subs) assert.ok(sub.settledAt !== null, 'delivery time is kept');
+  // Housekeeping frees panes but writes no rows: only `close` ends a task.
+  assert.deepEqual(listTaskRecords(cwd), before);
 });
 
 test('GC pass: the master terminal is never collected, whatever the registry claims', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-self-'));
-  const { closed, subs } = await gcPass(['t0'], [consumed('t0', cwd)]); // t0 is the master itself
+  const seeds = [seedData('t0', cwd)];
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  seedTaskDocuments(null, seeds);
+  const before = listTaskRecords(cwd);
+  const { closed } = await gcPass(['t0'], seeds.map(taskRow)); // t0 is the master itself
   assert.deepEqual(closed, [], 'kill must never target the master');
-  assert.ok(subs.some((s) => s.paneId === 't0'), 'the row is left alone');
+  assert.deepEqual(listTaskRecords(cwd), before, 'the row is left alone');
 });
 
 test('tasks: a worker whose pane is gone is listed as actionable, not dropped', async () => {
@@ -171,11 +180,11 @@ test('decideCheckoutSpaces: an empty window closes, a finished-but-open one only
 
 /** A checkout sweep pass: one row per worker, all in the same checkout. */
 async function checkoutPass(tasks: TaskEntry[], passes = 1): Promise<{
-  closed: string[]; notices: string[]; subs: Array<{ paneId: string; status: string }>;
+  closed: string[]; notices: string[];
 }> {
   const closed: string[] = [];
   const notices: string[] = [];
-  const { root, pi, port } = await mountSubagent({
+  const { root, pi } = await mountSubagent({
     client: {
       placementLabels: async () => ({ 'herdr.tab': 'tMAIN' }),
       listTerminals: async () => [],
@@ -190,7 +199,7 @@ async function checkoutPass(tasks: TaskEntry[], passes = 1): Promise<{
   });
   try {
     for (let i = 0; i < passes; i += 1) await fire(pi, 'turn_start');
-    return { closed, notices, subs: port.current!.listRows() };
+    return { closed, notices };
   } finally {
     await root.fiber.dispose();
   }

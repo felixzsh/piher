@@ -347,18 +347,6 @@ export default function subagentPlugin(ctx: Context): void {
           description: s.description,
         }));
     },
-    listRows() {
-      return [...tasks.values()]
-        .filter((s) => !isClosed(s))
-        .map((s) => ({
-          paneId: s.gen.paneId,
-          slug: s.gen.slug,
-          description: s.description,
-          kind: s.kind,
-          status: describeTaskState(s, observations.get(s.taskId)),
-          settledAt: s.gen.consumedAt ?? null,
-        }));
-    },
     settlementCard(paneId, outcome) {
       const entry = taskForPane(tasks, panes, paneId);
       return settlementCard({

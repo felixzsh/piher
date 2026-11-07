@@ -544,7 +544,8 @@ test('resume: a record pointing at the master session is refused; another pane i
     await fire(pi, 'session_start', { reason: 'reload' }, {});
 
     assert.match(await runSubagentRejects(pi, { action: 'resume', taskId: '8183022d' }, cwd), /master's own session/);
-    assert.ok(!port.current!.listRows().some((s) => s.paneId === 'p0'), 'the master pane never enters the board');
+    const panes = port.current!.listRunningSubs();
+    assert.ok(!panes.some((s) => s.paneId === 'p0'), 'the master pane never enters the board');
 
     const ok = await runSubagent(pi, { action: 'resume', taskId: '937f4abf' }, cwd);
     assert.match(ok.content[0]!.text, /reused existing pane/);

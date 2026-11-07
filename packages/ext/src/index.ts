@@ -27,7 +27,6 @@ import { parseRuntimeManifest } from './tool-gate.ts';
 import { planIndexMode } from './index-runtime.ts';
 import { emptySubagentPortBox, sleepWhileSubsRunningNote } from './subagent-core.ts';
 import { writeWorkerMarker, readWorkerMarker } from './worker-marker.ts';
-import { openTreeOverlay, type TreeOverlayHandle } from './tree-overlay.ts';
 import {
   DELEGATION_CUSTOM_TYPE,
   buildDelegationSection,
@@ -35,7 +34,7 @@ import {
   parseDelegationContext,
   type DelegationContext,
 } from './delegation-core.ts';
-import { formatDelegationTree, widgetLines } from './tree-view.ts';
+import { widgetLines } from './tree-view.ts';
 import { createNoticeBuffer } from './index-notices.ts';
 import { handlePipeRequest, type MachineRequest } from './index-pipe.ts';
 import { installWriteLocks } from './index-locks.ts';
@@ -110,9 +109,6 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
-  /* ── /piher-tree overlay: rendered inside pi; open views repaint on worker updates. ── */
-  let treeView: TreeOverlayHandle | null = null;
-
   /** The resident widget carries one line per running subagent, and is removed when none runs. */
   function renderWorkerWidget(ctx: unknown): void {
     if (!mode.composeMaster) return;
@@ -127,21 +123,9 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
-  /** Both views read the subagent registry, so a turn boundary or a settlement repaints them. */
+  /** The widget is a view of the tasks, so a turn boundary or a settlement repaints it. */
   function repaintAgentViews(ctx: unknown): void {
-    treeView?.refresh();
     renderWorkerWidget(ctx);
-  }
-
-  function renderTreeLines(): string[] {
-    const rows = subagentPort.current?.listRows() ?? [];
-    return formatDelegationTree({
-      workers: subagentPort.current?.listRunningSubs() ?? [],
-      settled: rows
-        .filter((r) => r.settledAt != null)
-        .map((r) => ({ paneId: r.paneId, slug: r.slug, description: r.description, settledAt: r.settledAt })),
-      now: Date.now(),
-    });
   }
 
   /** Tool names by call id: the end event may omit the name the tools ledger records. */
@@ -474,7 +458,6 @@ export default async function (pi: ExtensionAPI) {
       await closePipeServer(server);
     }
     if (env?.terminalId) releasePipe(env.terminalId, pipeGeneration);
-    treeView = null;
   });
 
   /* ── master vs worker mount (dynamic: workers never load the cordis tree, C3) ── */
@@ -497,21 +480,5 @@ export default async function (pi: ExtensionAPI) {
       claimSettleNotice,
     });
 
-    /* ── /piher-tree (D113): every running subagent plus the settled nodes it can still be revived from. ── */
-    pi.registerCommand('piher-tree', {
-      description: 'Show the delegation tree: every running subagent and the settled nodes you can resume',
-      handler: async (_args: unknown, ctx: unknown) => {
-        const ui = (ctx as { ui?: { notify?: (text: string, level?: string) => void; custom?: (factory: unknown, options?: unknown) => Promise<unknown> } }).ui;
-        const custom = typeof ui?.custom === 'function' ? ui.custom.bind(ui) : undefined;
-        const opened = openTreeOverlay(custom, renderTreeLines, (handle) => { treeView = handle; });
-        if (opened) {
-          await opened;
-          treeView = null;
-          return;
-        }
-        // RPC mode / no custom components: one-shot text view.
-        ui?.notify?.(renderTreeLines().join('\n'), 'info');
-      },
-    });
   }
 }

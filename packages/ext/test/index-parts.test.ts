@@ -70,7 +70,6 @@ test('handlePipeRequest: reply binds port, claims once, delivers notice', async 
     consumeReply(paneId, outcome) { consumed.push([paneId, outcome]); },
     settlementCard(paneId, outcome) { return { name: paneId, role: null, outcome, elapsedMs: null }; },
     listRunningSubs() { return []; },
-    listRows() { return []; },
   };
   const latch = new Set<string>();
   const session = pipeSession({

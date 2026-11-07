@@ -247,7 +247,6 @@ test('spawn action: an acknowledgement now, the prompt later, the report as a no
       assert.match(notice, /sim rejected/);
       // Scoped by slug: earlier subtests parked their workers on the same harness pane id.
       assert.ok(!(env.port.current?.listRunningSubs() ?? []).some((s) => s.slug === slug), 'no ghost running row for the failed start');
-      assert.ok(!(env.port.current?.listRows() ?? []).some((s) => s.slug === slug), 'the final board no longer lists the failed task');
       assert.equal(readTaskRecord(env.cwd, failedTaskId), null, 'a spawn that never started leaves no record');
     });
   });
@@ -304,8 +303,8 @@ test('send: a settled persistent worker is still reachable', async () => {
     assert.match(sent.content[0]!.text, /Message sent to subagent/);
     // A follow_up re-arms the row: the old consume time must go, or GC and the checkout sweep read a
     // worker with a turn in flight as finished.
-    const rearmed = env.port.current!.listRows().find((s) => s.paneId === paneId);
-    assert.equal(rearmed?.status, 'running');
+    const rearmed = env.port.current!.listRunningSubs().find((s) => s.paneId === paneId);
+    assert.ok(rearmed, 'the re-armed row still awaits its report');
     const taskId = spawned.details?.taskId as string;
     assert.equal(readTaskRecord(env.cwd, taskId)?.gen.consumedAt, null, 'the new request clears the settlement time');
     // The combined `slug@paneId` form is what spawn prints, so it is what a master copies back.
