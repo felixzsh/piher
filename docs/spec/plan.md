@@ -90,3 +90,13 @@ reclaiming panes, tabs and spaces from the watch snapshot, writes no document an
 sweep and `releaseRow` are deleted. `list` prints the contract's four state texts and line shape.
 Correction round: `shouldClosePane` no longer blesses a close of an unlisted terminal, and the three
 closed-task answers now say close is final instead of promising `resume`.
+
+P3 done: `97a599e` (range `84985f3..97a599e`), Risk: item 3 (S24 cross-session read), `npm test` 462/462
+green (~7 s, run by the parent on that commit), Route: delegated. Plan correction: P3's one-line outcome says
+"records carry their session", and that is not implementable — S10 fixes the durable facts and has no owner
+field, so ownership is derived instead: a task in this session's view is its own, an actionable record of the
+repository the view does not name is another session's. `list` prints own rows then live foreign rows as
+`[otra sesión] …`, a dead foreign row silently; every printed ref resolves for the actions; a foreign close
+writes only that record. Correction round: the durable decisions became a read-through (`refreshFromRecord`
+at the shared spine and in `list`), so S24's "final on its next read" holds without a reload; `retry` of a
+closed or spent foreign row now reaches S2's new-task branch.
