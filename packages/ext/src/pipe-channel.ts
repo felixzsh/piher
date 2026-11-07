@@ -167,6 +167,60 @@ export async function pipeRequestTo(
 
 type PipeMessageHandler = (req: PipeRequest) => Promise<PipeResponse>;
 
+/** One pipe server per pane, across module copies. A pane can load piher twice (an installed package
+ *  plus the `-e` the spawner passes), and two servers on one socket path steal it from each other: the
+ *  loser's requests reach whichever instance bound last — and after a reload that is the instance whose
+ *  ctx is stale, so every follow-up comes back as "ctx is stale after session replacement or reload".
+ *  The registry lives on globalThis because two copies of this module share no module state. */
+const PIPE_OWNER_KEY = Symbol.for('piher.pipeServerOwner');
+const PIPE_GENERATION_KEY = Symbol.for('piher.pipeServerGeneration');
+
+interface PipeOwner {
+  readonly generation: number;
+  /** Shuts the previous owner's server down; awaited before the new one binds. */
+  readonly close: () => Promise<void>;
+}
+
+function ownerRegistry(): Map<string, PipeOwner> {
+  const store = globalThis as unknown as Record<symbol, unknown>;
+  const existing = store[PIPE_OWNER_KEY];
+  // globalThis outlives a reload, so the value may belong to an older build with another shape (the
+  // first version kept a Set of pane ids). Interpreting it would throw on the first rebind after an
+  // upgrade, so an unknown shape is discarded rather than trusted.
+  if (existing instanceof Map) return existing as Map<string, PipeOwner>;
+  const fresh = new Map<string, PipeOwner>();
+  store[PIPE_OWNER_KEY] = fresh;
+  return fresh;
+}
+
+/** Become the pane's channel owner, closing whoever held it first. Last writer wins on purpose: after
+ *  a reload the newest instance is the one with a live ctx, and the previous one must stop answering.
+ *  Closing before binding also keeps the socket entry alive (libuv unlinks on close). */
+export async function takeOverPipe(paneId: string, close: () => Promise<void>): Promise<number> {
+  const store = globalThis as unknown as Record<symbol, number | undefined>;
+  store[PIPE_GENERATION_KEY] = (store[PIPE_GENERATION_KEY] ?? 0) + 1;
+  const generation = store[PIPE_GENERATION_KEY];
+  const previous = ownerRegistry().get(paneId);
+  if (previous) {
+    try {
+      await previous.close();
+    } catch {
+      /* the previous owner is already gone: the bind below is the only thing left to do */
+    }
+  }
+  ownerRegistry().set(paneId, { generation, close });
+  return generation;
+}
+
+/** Still the owner? A watchdog must stop healing a channel someone else took over. */
+export function ownsPipe(paneId: string, generation: number): boolean {
+  return ownerRegistry().get(paneId)?.generation === generation;
+}
+
+export function releasePipe(paneId: string, generation: number): void {
+  if (ownsPipe(paneId, generation)) ownerRegistry().delete(paneId);
+}
+
 /** Close a pipe server and wait for the close to complete, so its entry is gone before the next bind.
  *  Binding first and closing second is the trap: libuv unlinks the path on close, and it would remove
  *  the entry the new server just created — a listener nobody can connect to. */

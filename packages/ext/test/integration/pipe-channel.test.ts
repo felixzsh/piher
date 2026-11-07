@@ -6,7 +6,8 @@ import { once } from 'node:events';
 import * as net from 'node:net';
 import * as fs from 'node:fs';
 import {
-  closePipeServer, pipeNameCandidates, pipeNameFor, pipePathFor, pipeRequest, pipeRequestTo, startPipeServer,
+  closePipeServer, ownsPipe, pipeNameCandidates, pipeNameFor, pipePathFor, pipeRequest, pipeRequestTo,
+  releasePipe, startPipeServer, takeOverPipe,
 } from '../../src/pipe-channel.ts';
 import { jsonl } from '../test-utils.ts';
 
@@ -140,6 +141,79 @@ test('pipe-channel: a rebind must close the old server to completion first', asy
   await closePipeServer(second);
   assert.ok(!fs.existsSync(path), 'libuv removed the newer entry — the reason the close is awaited first');
   await closePipeServer(third);
+});
+
+test('pipe ownership: the newest instance takes the pane over and the old server stops', async () => {
+  // Exactly one server per pane. A second copy of the extension in the same pane (an installed package
+  // plus the spawner's `-e`) or a reload must leave one server serving the path — and it must be the
+  // newest one, because the previous instance's ctx is stale and answers every follow-up with an error.
+  const name = 'piher-test-takeover';
+  const path = pipePathFor(name);
+  const pane = 't_takeover_pane';
+  const h: Handler = async () => ({ type: 'ok', id: 'x' });
+
+  let first: net.Server | null = null;
+  const gen1 = await takeOverPipe(pane, async () => {
+    if (first) await closePipeServer(first);
+    first = null;
+  });
+  first = startPipeServer(name, h);
+  await once(first, 'listening');
+  assert.ok(ownsPipe(pane, gen1));
+  assert.ok(fs.existsSync(path), 'the owner serves a reachable path');
+
+  let second: net.Server | null = null;
+  const gen2 = await takeOverPipe(pane, async () => {
+    if (second) await closePipeServer(second);
+    second = null;
+  });
+  assert.ok(gen2 > gen1, 'generations are monotonic, so "newest" is decidable');
+  assert.equal(ownsPipe(pane, gen1), false, 'the previous owner steps aside');
+  assert.ok(ownsPipe(pane, gen2));
+  assert.equal(first, null, 'the previous server was closed: only one can serve the path');
+
+  second = startPipeServer(name, h);
+  await once(second, 'listening');
+  const ping = await pipeRequest(name, { type: 'ping', id: 'p1' }, 2000);
+  assert.equal(ping.type, 'ok', 'the new owner answers on the same path');
+  assert.ok(fs.existsSync(path), 'the takeover left the entry in place');
+
+  releasePipe(pane, gen2);
+  assert.equal(ownsPipe(pane, gen2), false, 'shutdown releases the pane for the next instance');
+  await closePipeServer(second);
+});
+
+test('pipe ownership: a registry left by an older build is discarded, not interpreted', async () => {
+  // globalThis survives a reload, so the first rebind after an upgrade can find the previous build's
+  // value there. The first version kept a Set of pane ids; reading it as a Map would throw exactly when
+  // the channel matters most.
+  const key = Symbol.for('piher.pipeServerOwner');
+  const store = globalThis as unknown as Record<symbol, unknown>;
+  store[key] = new Set(['t_legacy']);
+  const pane = 't_legacy_pane';
+  let closed = 0;
+  const generation = await takeOverPipe(pane, async () => { closed += 1; });
+  assert.ok(ownsPipe(pane, generation), 'the registry is rebuilt and usable');
+  assert.equal(closed, 0, 'a foreign registry names no owner to close');
+  releasePipe(pane, generation);
+  assert.equal(ownsPipe(pane, generation), false);
+});
+
+test('pipe ownership: two module copies share the claim (duplicate load in one pane)', async () => {
+  // The two copies of this module share no module state, so the registry lives on globalThis. Without
+  // that, both copies bind the same socket and steal it from each other — the failure this prevents.
+  const copySpecifier = '../../src/pipe-channel.ts?copy=2';
+  const copy2 = await import(copySpecifier) as typeof import('../../src/pipe-channel.ts');
+  const pane = 't_dup_pane';
+  let closed = 0;
+  const genA = await takeOverPipe(pane, async () => { closed += 1; });
+  assert.ok(copy2.ownsPipe(pane, genA), 'the second copy sees the first copy\'s claim');
+  const genB = await copy2.takeOverPipe(pane, async () => { closed += 1; });
+  assert.equal(closed, 1, 'taking over closes the previous holder exactly once');
+  assert.equal(ownsPipe(pane, genA), false, 'the first copy is no longer the owner');
+  assert.ok(copy2.ownsPipe(pane, genB));
+  copy2.releasePipe(pane, genB);
+  assert.equal(copy2.ownsPipe(pane, genB), false);
 });
 
 test('startPipeServer: a bind failure is reported, not swallowed', async () => {

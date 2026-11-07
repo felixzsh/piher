@@ -10,7 +10,9 @@
  * details persist in session JSONL and getBranch() replay implements branch rollback.
  */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-import { closePipeServer, pipeNameFor, pipePathFor, pipeRequest, startPipeServer } from './pipe-channel.ts';
+import {
+  closePipeServer, ownsPipe, pipeNameFor, pipePathFor, pipeRequest, releasePipe, startPipeServer, takeOverPipe,
+} from './pipe-channel.ts';
 import { installRenderers } from './renderers.ts';
 import { SETTLEMENT_CUSTOM_TYPE, sendSettlementNotice } from './settlement-card.ts';
 import { createCoreClient } from './core-client.ts';
@@ -173,6 +175,8 @@ export default async function (pi: ExtensionAPI) {
   /* ── pipe channel: this pane's NDJSON server + the settle fast-path push (D48/D49/D50) ── */
   const pipeServerBox: { current: ReturnType<typeof startPipeServer> | null } = { current: null };
   let pipeWatchdog: ReturnType<typeof setInterval> | null = null;
+  /** This instance's ownership generation for the pane's channel (see takeOverPipe). */
+  let pipeGeneration = 0;
   let pendingMachineRequest: MachineRequest | null = null;
   /** Dedup latch for settle notices: one per paneId+request id per round. */
   const settleNoticeLatch = new Set<string>();
@@ -192,14 +196,20 @@ export default async function (pi: ExtensionAPI) {
     }
     const name = pipeNameFor(cwd, paneId);
     const path = pipePathFor(name);
-    if (pipeServerBox.current) {
-      // Wait for the old server to be fully closed: libuv removes the entry on close, so binding first
-      // and closing second would delete the new entry and leave an unreachable listener.
-      const previous = pipeServerBox.current;
+    // Exactly one server per pane, whoever else is in this process. Taking ownership closes the
+    // previous holder first — our own server on a rebind, or a second copy of this extension loaded in
+    // the same pane (an installed package plus the spawner's `-e`). Binding before that close would let
+    // libuv delete the new entry; leaving the previous holder alive would let a stale ctx answer.
+    const hadServer = pipeServerBox.current !== null;
+    const generation = await takeOverPipe(paneId, async () => {
+      const mine = pipeServerBox.current;
       pipeServerBox.current = null;
-      trace(traceRole, 'pipe-rebind', { pane: paneId, path });
-      await closePipeServer(previous);
-    }
+      if (pipeWatchdog) clearInterval(pipeWatchdog);
+      pipeWatchdog = null;
+      if (mine) await closePipeServer(mine);
+    });
+    pipeGeneration = generation;
+    if (hadServer) trace(traceRole, 'pipe-rebind', { pane: paneId, path });
     /** A bind failure is silent by construction (net.Server reports it on 'error'), so it is the one
      *  failure that used to leave a live worker unreachable with nothing in any log. */
     const bindFailed = (err: Error): void => {
@@ -227,7 +237,7 @@ export default async function (pi: ExtensionAPI) {
       pipeServerBox.current = server;
       server.once('listening', () => {
         trace(traceRole, 'pipe-listen', { ok: true, pane: paneId, path, cwd });
-        watchPipePath(cwd, path, paneId);
+        watchPipePath(cwd, path, paneId, generation);
       });
     } catch (err) {
       // A synchronous throw (path too long, permission) is the same outcome as a failed bind.
@@ -239,9 +249,11 @@ export default async function (pi: ExtensionAPI) {
    *  stale pre-bind unlink from another instance, a tmp cleaner) leaves the socket open while every
    *  new connect() gets ENOENT — a worker that keeps working and cannot be reached. Nothing in the
    *  process notices, so this re-checks and rebinds. */
-  function watchPipePath(cwd: string, path: string, paneId: string): void {
+  function watchPipePath(cwd: string, path: string, paneId: string, generation: number): void {
     if (pipeWatchdog) clearInterval(pipeWatchdog);
     pipeWatchdog = setInterval(() => {
+      // A channel someone else took over is not ours to heal, and healing it would start a tug of war.
+      if (!ownsPipe(paneId, generation)) return;
       if (existsSync(path)) return;
       trace(traceRole, 'pipe-vanish', { pane: paneId, path });
       void startPipeServerFor(cwd);
@@ -447,6 +459,7 @@ export default async function (pi: ExtensionAPI) {
       pipeServerBox.current = null;
       await closePipeServer(server);
     }
+    if (env?.terminalId) releasePipe(env.terminalId, pipeGeneration);
     treeView = null;
   });
 
