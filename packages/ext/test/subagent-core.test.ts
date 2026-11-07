@@ -710,6 +710,57 @@ test('subagent plugin: retry re-sends the stored prompt instead of asking the ma
   }
 });
 
+test('subagent plugin: retry on a spent one-shot spawns the same brief instead of refusing like resume', async () => {
+  // A one-shot reviewer that already reported has no pane and no resumable session, which is exactly
+  // what `resume` refuses. The retry must still happen: same brief, same role, same checkout.
+  const home = new TempHome('prompt-oneshot');
+  try {
+    const taskId = 'task-shot-1';
+    saveTaskPrompt(taskId, 'the review brief');
+    const { root, pi } = await mountSubagent({
+      client: { available: false },
+      subs: [subEntry({
+        paneId: 't-shot', taskId, status: 'consumed', lifecycle: 'one-shot', kind: 'reviewer',
+        description: 'review X', cwd: '/test/checkout',
+      })],
+    });
+    try {
+      const text = await runSubagentRejects(pi, { action: 'retry', agentId: 't-shot' });
+      assert.doesNotMatch(text, /already delivered its verdict/, 'resume refuses a spent one-shot; retry must not');
+      assert.doesNotMatch(text, /no stored prompt/, 'the stored brief was found');
+      assert.match(text, /herdr-core/, 'it went to spawn, which is the only way to retry a spent one-shot');
+    } finally {
+      await root.fiber.dispose();
+    }
+  } finally {
+    home.dispose();
+  }
+});
+
+test('subagent plugin: retry works from a closed row too, by starting a new worker', async () => {
+  // A row can be closed by the master or by housekeeping. `send` and `resume` refuse it, but a retry
+  // is a request for the work, not a resurrection: it starts a fresh worker with the same brief.
+  const home = new TempHome('prompt-closed');
+  try {
+    const taskId = 'task-closed-1';
+    saveTaskPrompt(taskId, 'a brief');
+    const { root, pi } = await mountSubagent({
+      client: { available: false },
+      subs: [subEntry({ paneId: 't-closed', taskId, status: 'closed', kind: 'reviewer', description: 'review Y' })],
+    });
+    try {
+      const text = await runSubagentRejects(pi, { action: 'retry', agentId: 't-closed' });
+      assert.doesNotMatch(text, /close is final/);
+      assert.doesNotMatch(text, /no stored prompt/);
+      assert.match(text, /herdr-core/, 'it went to spawn with the stored brief');
+    } finally {
+      await root.fiber.dispose();
+    }
+  } finally {
+    home.dispose();
+  }
+});
+
 test('subagent plugin: close reclaims a running row whose pane has no turn in flight', async () => {
   // A settlement the poller missed leaves the row `running` while the agent is idle: refusing the
   // close then strands the task forever, and `interrupt` cannot help because there is no turn to stop.

@@ -813,8 +813,20 @@ export default function subagentPlugin(ctx: Context): void {
         `Error: no stored prompt for task ${entry.taskId} — piher keeps the brief of a spawn it made, and this task has none (a resumed session, or a row from another checkout). Send the task again with action "send".`,
       );
     }
+    // Every kind of worker retries: a closed row is final and a spent one-shot has no session left to
+    // revive, so those two get a new worker with the same brief, role and checkout. The rest keep
+    // their own pane or session.
+    if (entry.status === 'closed' || (entry.status === 'consumed' && entry.lifecycle === 'one-shot')) {
+      return executeSubagentSpawn({
+        prompt,
+        description: entry.description,
+        cwd: entry.cwd,
+        ...(entry.kind !== 'task' ? { role: entry.kind } : {}),
+        ...(entry.worktree ? { worktree: entry.worktree.branch } : {}),
+      }, toolCtx);
+    }
     if (spentText(entry) !== null) {
-      // Revive the same session in a new pane, then deliver the stored prompt into it.
+      // A collected task whose pane is gone: revive the same session, then deliver the stored prompt.
       await executeSubagentResume({ ...params, taskId: entry.taskId }, toolCtx);
       const revived = newestPerTaskId([...subs.values()].filter((s) => s.taskId === entry.taskId && s.status === 'running'));
       const target = revived.get(entry.taskId);

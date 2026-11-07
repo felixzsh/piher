@@ -88,10 +88,11 @@ tail that names how many were withheld and points at the ledger.
 `retry` takes `agentId` (or `taskId`) and no message: it re-sends the prompt the task was
 spawned with, which piher kept. That is the move after a failure that says nothing about the
 task — a provider outage, a dropped stream, a rate limit that ended the turn. Rewriting the
-brief costs tokens and adds nothing; a spent row is revived first, so one `retry` covers a
-one-shot that already reported. If the task was never spawned by this piher (a resumed
-session, another checkout's row) there is no stored prompt and the call says so: send the
-task explicitly instead.
+brief costs tokens and adds nothing, and one call covers every kind of worker: a live one
+takes the text as a follow-up, a collected task is revived on its own session, and a spent
+one-shot or a closed row starts a fresh worker with the same brief, role and checkout. If the
+task was never spawned by this piher (a resumed session, another checkout's row) there is no
+stored prompt and the call says so: send the task explicitly instead.
 
 `send` takes `agentId` and `message`. To a working worker it lands at its next tool gap,
 inside the same turn — a correction, not a queue, because there is no inbox. To an idle or
