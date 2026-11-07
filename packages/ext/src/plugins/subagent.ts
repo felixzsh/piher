@@ -540,6 +540,18 @@ export default function subagentPlugin(ctx: Context): void {
 
     if (cwd) {
       const hist = readLedger(cwd);
+      // A row can be missing from `subs` while the master still sees it: `list` merges the repository
+      // ledger, and a reload restores only the branch's bounded tail of settled rows (S73). The ref
+      // `list` printed must address the ledger too, or `close`/`send` answer "unknown subagent id"
+      // for a worker the same session just offered.
+      const rows = newestPerTaskId(hist.map((h) => entryFromHistory(h, {})));
+      const known = [...rows.values()];
+      const ledgerHit = known.find((e) => e.slug === slugPart)
+        ?? known.find((e) => e.paneId === (panePart ?? slugPart));
+      if (ledgerHit) {
+        subs.set(ledgerHit.paneId, ledgerHit);
+        return { entry: ledgerHit };
+      }
       const histRes = resolveTaskIdPrefix(rawId, Array.from(new Set(hist.map((e) => e.taskId))));
       if (histRes.kind === 'resolved') {
         const latest = latestGeneration(hist, histRes.taskId);

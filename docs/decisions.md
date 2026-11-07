@@ -61,4 +61,4 @@ or at a file that no longer exists, fails the suite.
 | S70 | The three texts that describe `subagent` (tool description, manual, skill) cannot diverge: a test extracts the actions and parameters and fails on a gap | `packages/ext/test/skill-coverage.test.ts:1` |
 | S71 | A persisted checkout record is trusted only when its path and branch are readable; an occupied path fails naming both | `packages/ext/src/worktree.ts:1` |
 | S72 | The checkout's ledger row is what `resume` and `close` read, so a restart finds the worktree without listing or pattern-matching | `packages/ext/src/subagent-spawn.ts:1` |
-| S73 | The persisted registry keeps running workers and a bounded tail of settled ones; the ledger holds every row, which is why `list` and `resume` still answer for a pruned one | `packages/ext/src/subagent-core.ts:1` |
+| S73 | The persisted registry keeps running workers and a bounded tail of settled ones; the ledger holds every row, so every id `list` printed (`slug`, `paneId`, `slug@paneId`, task prefix) still resolves after a reload pruned it | `packages/ext/src/subagent-core.ts:1` |

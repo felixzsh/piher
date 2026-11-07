@@ -547,6 +547,50 @@ test('subagent plugin: list answers for a task the registry already pruned, from
   }
 });
 
+test('subagent plugin: a row only the ledger holds answers the ref `list` printed', async () => {
+  // A reload restores the branch's bounded tail of settled rows (S73), so a worker the master still
+  // sees in `list` can be gone from the registry. The ref list printed must still be addressable.
+  const repo = mkdtempSync(join(tmpdir(), 'piher-ledger-ref-'));
+  mkdirSync(join(repo, '.git'), { recursive: true });
+  try {
+    const pruned: HistoryEntry = {
+      taskId: '407ca2e0-0000-4000-8000-000000000001',
+      kind: 'task',
+      paneId: 't195',
+      slug: 't2-8a-2-shared-escalatio',
+      tabId: '',
+      workspaceId: '',
+      cwd: repo,
+      description: 'T2 8A.2 shared escalation log',
+      sessionFile: null,
+      launchCommand: [],
+      status: 'consumed',
+      createdAt: 5,
+      consumedAt: 6,
+    };
+    assert.deepEqual(appendLedger(repo, pruned), { ok: true });
+    const { root, pi } = await mountSubagent({
+      subs: [subEntry({ taskId: 'live-1', paneId: 'w1:p4', cwd: repo, description: 'live worker' })],
+    });
+    try {
+      const listed = (await runSubagent(pi, { action: 'list' }, repo)).content[0]!.text;
+      assert.match(listed, /t2-8a-2-shared-escalatio@t195 \[idle\]/, 'list offers the ledger row');
+      // The combined ref spawn prints is what a master copies back, and it used to answer "unknown".
+      const closed = await runSubagent(pi, { action: 'close', agentId: 't2-8a-2-shared-escalatio@t195' }, repo);
+      assert.match(closed.content[0]!.text, /Subagent t2-8a-2-shared-escalatio@t195 closed/);
+      assert.equal(readLedger(repo).filter((r) => r.taskId === pruned.taskId && r.status === 'closed').length, 1,
+        'the decision lands in the ledger');
+      // The bare pane id is the other form the master reached for.
+      const again = await runSubagent(pi, { action: 'close', agentId: 't195' }, repo);
+      assert.match(again.content[0]!.text, /already closed/, 'the adopted row now answers by pane id too');
+    } finally {
+      await root.fiber.dispose();
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test('subagent plugin: tool_result hook only rewrites our errors, and stays silent for a dead pane', async () => {
   const { root, pi } = await mountSubagent({
     subs: [subEntry({ paneId: 'w1:p2', cwd: '/tmp', description: 'dead worker', createdAt: 1 })],
