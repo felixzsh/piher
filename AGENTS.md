@@ -52,7 +52,7 @@ commands.
 
 ## Tests: `npm test`, and nothing else to decide
 
-`npm test` is `tsc --noEmit` plus the whole suite: **458 tests in ~15 s**. That covers every case — a
+`npm test` is `tsc --noEmit` plus the whole suite: **460 tests in ~15 s**. That covers every case — a
 one-line edit, a string, a whole feature — so there is no tier, no subset and no cheap-loop calculus to
 rehearse: run it before every commit and push, and let the result speak.
 

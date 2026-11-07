@@ -167,6 +167,19 @@ export async function pipeRequestTo(
 
 type PipeMessageHandler = (req: PipeRequest) => Promise<PipeResponse>;
 
+/** Close a pipe server and wait for the close to complete, so its entry is gone before the next bind.
+ *  Binding first and closing second is the trap: libuv unlinks the path on close, and it would remove
+ *  the entry the new server just created — a listener nobody can connect to. */
+export function closePipeServer(server: net.Server): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      server.close(() => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
 /** Server: one line in → handler → one line out → close. Returns the server (caller closes it). */
 export function startPipeServer(
   pipeName: string,
@@ -222,14 +235,10 @@ export function startPipeServer(
     // whole extension host down on a transient listen failure; pass onError to observe it (F04).
     server.on('error', () => { /* swallowed by design; pass onError to observe */ });
   }
-  if (process.platform !== 'win32') {
-    server.on('close', () => {
-      try {
-        fs.unlinkSync(socketPath);
-      } catch {
-      }
-    });
-  }
+  // No 'close' handler removes the entry: libuv already unlinks a unix socket when its server closes
+  // (verified: listen + close leaves no file). That is also why a rebind MUST close the old server to
+  // completion first — closing it after the new one bound deletes the NEW entry, leaving a live
+  // listener that no connect() can reach. See closePipeServer.
   server.listen(socketPath);
   return server;
 }

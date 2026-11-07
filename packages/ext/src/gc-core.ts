@@ -101,6 +101,18 @@ export function decideCheckoutSpaces(opts: {
 
 /** One line the master can act on. It names the decision, never a countdown: nothing closes by
  *  itself, and housekeeping never ends a window that still holds an idle worker. */
+/** A worker whose pane is alive but whose channel is gone can never receive a follow-up: say it once,
+ *  with the two ways out, so the master does not discover it on the next `send`. */
+export function formatDeadChannelNotice(opts: {
+  paneId: string;
+  taskId: string;
+  status: string;
+}): string {
+  return `Note: subagent ${opts.paneId} is alive (${opts.status}) but its message channel is gone — a ` +
+    'follow-up sent to it would not arrive. Nothing was lost: the row is untouched. Restart it with ' +
+    `subagent action:"resume" taskId ${opts.taskId}, or retire it with action:"close".`;
+}
+
 export function formatIdleCheckoutNotice(opts: {
   name: string;
   minutes: number;

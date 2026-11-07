@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { DisposeLedger } from '../src/ledger.ts';
 import { createPlatformPaths } from '../src/platform-paths.ts';
@@ -109,6 +110,14 @@ test('createPlatformPaths: overrides win; sessionsDir defaults under agentDataDi
   const p = createPlatformPaths({ agentDataDir: '/x/agent' });
   assert.equal(p.agentDataDir, '/x/agent'); assert.equal(p.sessionsDir, join('/x/agent', 'sessions'));
   assert.equal(createPlatformPaths({ agentDataDir: '/x/agent', sessionsDir: '/custom/sessions' }).sessionsDir, '/custom/sessions');
+});
+
+test("createPlatformPaths: sessions live under pi's own agent dir, not XDG", { skip: !['linux', 'darwin'].includes(process.platform) }, () => {
+  // pi writes sessions to ~/.pi/agent/sessions (storage-layout already assumes it) and does not follow
+  // XDG_DATA_HOME. Deriving the default from XDG pointed at ~/.local/share/agent/sessions, which never
+  // exists, so every resolution by session id silently found nothing — the worker could not read its own
+  // transcript, so the instant settle reply was never sent and every report waited for the poller.
+  assert.equal(createPlatformPaths().sessionsDir, join(homedir(), '.pi', 'agent', 'sessions'));
 });
 
 /* ── OPTION_SPECS registry + RuntimePolicy ──────────────────────────────── */

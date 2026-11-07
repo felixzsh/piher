@@ -10,13 +10,14 @@
  * details persist in session JSONL and getBranch() replay implements branch rollback.
  */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-import { pipeNameFor, pipePathFor, pipeRequest, startPipeServer } from './pipe-channel.ts';
+import { closePipeServer, pipeNameFor, pipePathFor, pipeRequest, startPipeServer } from './pipe-channel.ts';
 import { installRenderers } from './renderers.ts';
 import { SETTLEMENT_CUSTOM_TYPE, sendSettlementNotice } from './settlement-card.ts';
 import { createCoreClient } from './core-client.ts';
 import { bareSessionId, deriveSubSessionState, readSessionFile, resolveSessionFileValue } from './session-tail.ts';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { platformPaths } from './platform-paths.ts';
 import { WRITE_LOCK_ENV } from './lock-core.ts';
 import { ABORT_STOP_REASON, planSettleWake, shouldPushSettleReply } from './settle-wake-core.ts';
@@ -40,6 +41,9 @@ import { installConfigCommand } from './config-command.ts';
 import { composeMasterRuntime, createRoleRuntime } from './index-roles.ts';
 import { trace, traceRole } from './trace.ts';
 
+/** How often a worker re-checks that its own socket path still exists (see watchPipePath). */
+const PIPE_WATCHDOG_MS = 10_000;
+
 function agentSessionsDir(): string {
   return process.env.PI_CODING_AGENT_DIR ? join(process.env.PI_CODING_AGENT_DIR, 'sessions') : platformPaths.sessionsDir;
 }
@@ -50,6 +54,10 @@ export default async function (pi: ExtensionAPI) {
   const roleBase = process.env.PIHER_ROLE_BASE || process.cwd();
 
   let sessionId: string = process.env.PI_SESSION_FILE ?? process.env.PI_SESSION_ID ?? '';
+  /** The transcript path pi itself reports for this session, cached at session_start. The settle push
+   *  must read it, and re-deriving it from the bare id failed in a live worker (`hasFile=false`), which
+   *  silently disabled the instant reply and left every settlement to the master's poller. */
+  let ownSessionFile: string | null = null;
   const { client, env } = createCoreClient();
   /** RFC rfc-delegation-identity §2.1: resolved env → marker → branch fold; worker panes only. */
   let delegation: DelegationContext | null = parseDelegationContext(process.env.PIHER_DELEGATION);
@@ -164,6 +172,7 @@ export default async function (pi: ExtensionAPI) {
 
   /* ── pipe channel: this pane's NDJSON server + the settle fast-path push (D48/D49/D50) ── */
   const pipeServerBox: { current: ReturnType<typeof startPipeServer> | null } = { current: null };
+  let pipeWatchdog: ReturnType<typeof setInterval> | null = null;
   let pendingMachineRequest: MachineRequest | null = null;
   /** Dedup latch for settle notices: one per paneId+request id per round. */
   const settleNoticeLatch = new Set<string>();
@@ -173,7 +182,7 @@ export default async function (pi: ExtensionAPI) {
     return true;
   }
 
-  function startPipeServerFor(cwd: string): void {
+  async function startPipeServerFor(cwd: string): Promise<void> {
     const paneId = env?.terminalId ?? '';
     if (!paneId) {
       // No address means no channel: every follow-up to this pane is undeliverable, which is worth
@@ -184,9 +193,12 @@ export default async function (pi: ExtensionAPI) {
     const name = pipeNameFor(cwd, paneId);
     const path = pipePathFor(name);
     if (pipeServerBox.current) {
-      try { pipeServerBox.current.close(); } catch { /* Previous instance. */ }
+      // Wait for the old server to be fully closed: libuv removes the entry on close, so binding first
+      // and closing second would delete the new entry and leave an unreachable listener.
+      const previous = pipeServerBox.current;
       pipeServerBox.current = null;
       trace(traceRole, 'pipe-rebind', { pane: paneId, path });
+      await closePipeServer(previous);
     }
     /** A bind failure is silent by construction (net.Server reports it on 'error'), so it is the one
      *  failure that used to leave a live worker unreachable with nothing in any log. */
@@ -201,7 +213,7 @@ export default async function (pi: ExtensionAPI) {
       );
     };
     try {
-      pipeServerBox.current = startPipeServer(name, async (req) => handlePipeRequest(req, {
+      const server = startPipeServer(name, async (req) => handlePipeRequest(req, {
         paneId,
         port: subagentPort,
         claimSettleNotice,
@@ -212,11 +224,29 @@ export default async function (pi: ExtensionAPI) {
         setPendingMachineRequest: (next) => { pendingMachineRequest = next; },
         applyRoleSwitch: roles.applyRoleSwitch,
       }), bindFailed);
-      trace(traceRole, 'pipe-listen', { ok: true, pane: paneId, path, cwd });
+      pipeServerBox.current = server;
+      server.once('listening', () => {
+        trace(traceRole, 'pipe-listen', { ok: true, pane: paneId, path, cwd });
+        watchPipePath(cwd, path, paneId);
+      });
     } catch (err) {
       // A synchronous throw (path too long, permission) is the same outcome as a failed bind.
       bindFailed(err as Error);
     }
+  }
+
+  /** The path is a filesystem entry that a live listener does not own: anything that unlinks it (a
+   *  stale pre-bind unlink from another instance, a tmp cleaner) leaves the socket open while every
+   *  new connect() gets ENOENT — a worker that keeps working and cannot be reached. Nothing in the
+   *  process notices, so this re-checks and rebinds. */
+  function watchPipePath(cwd: string, path: string, paneId: string): void {
+    if (pipeWatchdog) clearInterval(pipeWatchdog);
+    pipeWatchdog = setInterval(() => {
+      if (existsSync(path)) return;
+      trace(traceRole, 'pipe-vanish', { pane: paneId, path });
+      void startPipeServerFor(cwd);
+    }, PIPE_WATCHDOG_MS);
+    pipeWatchdog.unref?.();
   }
 
   /** Returns whether a settlement reply actually went out: a worker whose report never reached the
@@ -236,7 +266,8 @@ export default async function (pi: ExtensionAPI) {
     }
     pendingMachineRequest = null;
     try {
-      const ownFile = sessionId ? resolveSessionFileValue(process.cwd(), agentSessionsDir(), sessionId) : null;
+      const ownFile = ownSessionFile
+        ?? (sessionId ? resolveSessionFileValue(process.cwd(), agentSessionsDir(), sessionId) : null);
       let text: string | null = null;
       if (ownFile) {
         const entries = readSessionFile(ownFile);
@@ -290,6 +321,7 @@ export default async function (pi: ExtensionAPI) {
       const sm = typeof ctx === 'object' && ctx !== null && 'sessionManager' in ctx ? ctx.sessionManager : undefined;
       const sessionFile = (typeof sm?.getSessionFile === 'function' ? sm.getSessionFile() : undefined)
         ?? process.env.PI_SESSION_FILE ?? null;
+      if (sessionFile) ownSessionFile = resolveSessionFileValue(process.cwd(), agentSessionsDir(), sessionFile);
       // RFC rfc-delegation-identity §2.1: env (spawn) > marker > branch fold (/resume).
       if (!delegation) delegation = readWorkerMarker(sessionFile)?.delegation ?? null;
       const branchEntries = (ctx as { sessionManager?: { getBranch?: () => readonly unknown[] } })
@@ -309,7 +341,7 @@ export default async function (pi: ExtensionAPI) {
       writeWorkerMarker(sessionFile, roles.state.manifest?.role, delegation ?? undefined);
     }
 
-    startPipeServerFor((ctx as { cwd?: string }).cwd ?? process.cwd());
+    await startPipeServerFor((ctx as { cwd?: string }).cwd ?? process.cwd());
   });
 
   /* RFC rfc-delegation-identity §2.2: worker identity + delivery contract ride the prompt
@@ -407,9 +439,13 @@ export default async function (pi: ExtensionAPI) {
   installConfigCommand({ pi });
 
   pi.on('session_shutdown', async () => {
+    // Stop the watchdog first: a rebind during shutdown would outlive the session it serves.
+    if (pipeWatchdog) clearInterval(pipeWatchdog);
+    pipeWatchdog = null;
     if (pipeServerBox.current) {
-      try { pipeServerBox.current.close(); } catch { /* Already closed. */ }
+      const server = pipeServerBox.current;
       pipeServerBox.current = null;
+      await closePipeServer(server);
     }
     treeView = null;
   });

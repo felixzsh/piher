@@ -7,6 +7,7 @@ import { basename } from 'node:path';
 import type { CoreClientLike, CoreEnv, TerminalInfo } from './core-client.ts';
 import {
   decideCheckoutSpaces,
+  formatDeadChannelNotice,
   formatIdleCheckoutNotice,
   shouldClosePane,
   shouldCloseTaskTab,
@@ -15,6 +16,7 @@ import {
 import type { SettlementCard } from './settlement-card.ts';
 import { checkoutSpaceId, type CheckoutSpace } from './worktree.ts';
 import { trace, traceRole } from './trace.ts';
+import { pipeRequestTo } from './pipe-channel.ts';
 import { runtimePolicy } from './runtime-policy.ts';
 import { swallow } from './swallow.ts';
 import { foldSubsRegistry, registrySnapshot, sleep, SUBS_CUSTOM_TYPE, type SubEntry } from './subagent-core.ts';
@@ -125,6 +127,8 @@ export function createGcController(h: GcHost): GcController {
   let gcRunning = false;
   /** Path → the settlement a checkout reminder was already delivered for. */
   const remindedCheckouts = new Map<string, number>();
+  /** Panes whose dead channel was already announced: one notice per loss, cleared when it answers. */
+  const deadChannelNotified = new Set<string>();
 
   /** A checkout's space is nobody else's to sweep: close it when empty, and remind the master once
    *  about the window a finished-but-open worker left behind. Never ends a task, never ends a pane. */
@@ -252,7 +256,39 @@ export function createGcController(h: GcHost): GcController {
       await sleep(300);
     }
     await sweepCheckoutSpaces(ttlMs);
+    await sweepChannels(statuses);
     h.persistSubs();
+  }
+
+  /** A worker's message channel is what makes a follow-up possible at all. Ping it and say so once
+   *  when it is gone: the alternative is the master finding out on the next `send`, which is exactly
+   *  when the message matters. Never settles, never closes, never touches the row. */
+  async function sweepChannels(statuses: ReadonlyMap<string, string>): Promise<void> {
+    for (const e of [...h.subs.values()]) {
+      if (e.status === 'closed' || !e.paneId) continue;
+      // A pane that is gone has no channel by design: revive/close own that case.
+      const status = statuses.get(e.paneId);
+      if (status === undefined) continue;
+      let ok = false;
+      try {
+        ok = (await pipeRequestTo(e.cwd, e.paneId, { type: 'ping', id: `hb-${Date.now()}` }, 1_500)).type === 'ok';
+      } catch {
+        ok = false;
+      }
+      trace(traceRole, 'pipe-heartbeat', { pane: e.paneId, ok, status });
+      if (ok) {
+        deadChannelNotified.delete(e.paneId);
+        continue;
+      }
+      if (deadChannelNotified.has(e.paneId)) continue;
+      deadChannelNotified.add(e.paneId);
+      try {
+        await h.deliverNotice?.(formatDeadChannelNotice({ paneId: e.paneId, taskId: e.taskId, status }), e.paneId, null);
+      } catch {
+        /* the next pass re-announces: the latch is only set for a delivered notice */ 
+        deadChannelNotified.delete(e.paneId);
+      }
+    }
   }
 
   async function runGcSafely(): Promise<void> {

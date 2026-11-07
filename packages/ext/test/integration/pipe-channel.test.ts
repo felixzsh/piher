@@ -6,7 +6,7 @@ import { once } from 'node:events';
 import * as net from 'node:net';
 import * as fs from 'node:fs';
 import {
-  pipeNameCandidates, pipeNameFor, pipePathFor, pipeRequest, pipeRequestTo, startPipeServer,
+  closePipeServer, pipeNameCandidates, pipeNameFor, pipePathFor, pipeRequest, pipeRequestTo, startPipeServer,
 } from '../../src/pipe-channel.ts';
 import { jsonl } from '../test-utils.ts';
 
@@ -113,6 +113,33 @@ test('startPipeServer: bad frame / handler throw answer with error frames', asyn
       assert.match(String(reply.message), c.message);
     }));
   }
+});
+
+test('pipe-channel: a rebind must close the old server to completion first', async () => {
+  // The messaging channel of a worker is its only way in, and libuv unlinks a unix socket when its
+  // server closes. Bind-then-close therefore deletes the entry the NEW server just created: the
+  // listener stays open, every connect() gets ENOENT, and a live worker is unreachable with nothing in
+  // any log. This pins the ordering that prevents it.
+  const name = 'piher-test-rebind-order';
+  const path = pipePathFor(name);
+  const h: Handler = async () => ({ type: 'ok', id: 'x' });
+
+  const first = startPipeServer(name, h);
+  await once(first, 'listening');
+  assert.ok(fs.existsSync(path), 'the first server owns the entry');
+  await closePipeServer(first);
+  assert.ok(!fs.existsSync(path), 'closing it removes the entry');
+
+  const second = startPipeServer(name, h);
+  await once(second, 'listening');
+  assert.ok(fs.existsSync(path), 'the rebind left a reachable entry');
+
+  // The trap itself, kept as a witness: a newer server bound before the older one closes loses its path.
+  const third = startPipeServer(name, h);
+  await once(third, 'listening');
+  await closePipeServer(second);
+  assert.ok(!fs.existsSync(path), 'libuv removed the newer entry — the reason the close is awaited first');
+  await closePipeServer(third);
 });
 
 test('startPipeServer: a bind failure is reported, not swallowed', async () => {
