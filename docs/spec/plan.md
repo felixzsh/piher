@@ -105,3 +105,20 @@ P4 done: `b48e3a0` (range `97a599e..b48e3a0`), Risk: none (pure removal; accepta
 composition test), `npm test` 459/459 green (~7 s, run by the parent on that commit), Route: delegated.
 `tree-overlay.ts`, the `piher-tree` command, its projection and `SubagentPort.listRows` are gone; the
 resident widget keeps one line per running worker and its overflow hint names `subagent list`.
+
+P5 done: `8f68609` (range `b48e3a0..8f68609`, after `d1f215a`), Risk: item 4 (the three shipped texts),
+`npm test` 456/456 green (~7 s, run by the parent on that commit; five consecutive green runs by the
+worker), Route: delegated. `trace.ts`, its two specs and every call site are gone without losing a retry,
+a claim, a park or a notice; `PIHER_TRACE` and `PIHER_SUBAGENT_CARDS` left the code and the docs; the
+description, the `help` manual and the shipped skill now say one model (task/taskId, two documents,
+observed liveness, `running`/`idle`/`no report`/`no pane`, close final, retry starts a new task,
+`[otra sesión]`, send revives a gone pane); README pair, INSTALL and `decisions.md` match it (D113 removed,
+D114-D118 added). The phase's headline test asserts that spawning and closing a task creates exactly the
+two documents and nothing else under `.piher/`, with no `status` key. Correction rounds: byte-comparisons
+that raced the owner's own poller became field comparisons, and D114/D117 were narrowed to what the code
+guarantees. Final sweep `rg -n "history\.jsonl|piher\.subs|HistoryEntry|piher-tree" packages/ext/src`: empty.
+
+Run closed: five phases, all on `master` (base `98951cf`), never pushed. One persistent worker (route:
+delegated) authored every phase; four fresh reviews, each of which found something real — one blocker per
+phase in P1/P2/P3, none in P4, none in P5 — and every accepted finding was fixed by the author, not by me.
+Suite: 473 tests at base, 456 at the end (the difference is the deleted specs of deleted modules), all green.
