@@ -312,7 +312,9 @@ async function withHarness(fn: (h: WtHarness) => Promise<void>): Promise<void> {
       },
     },
     client: {
-      getTerminal: async (id: string) => terminalInfo({ id }),
+      // The harness panes report an idle agent: settlement is observed through the pipe, and a
+      // close must see a finished turn rather than a silent one.
+      getTerminal: async (id: string) => terminalInfo({ id, status: 'idle' }),
       listTerminals: async () => listed,
       // Parked forever: an unparked fake watch makes the poll loop spin on microtasks.
       watchChildren: () => fakeWatch({ terminals: () => [], park: () => new Promise<boolean>(() => {}) }),

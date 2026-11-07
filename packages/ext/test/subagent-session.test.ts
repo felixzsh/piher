@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CoreClientLike } from '../src/core-client.ts';
-import type { TaskEntry } from '../src/task-row.ts';
+import type { TaskSeed } from './test-utils.ts';
 import { sessionDirName } from '../src/session-tail.ts';
 import {
   cleanPaneChrome, computeSubagentOutputDelta, createSessionIo, cutPaneReportCopy, formatSubagentOutput, resolveSubagentStatus, tailOfPaneRead,
@@ -275,15 +275,17 @@ test('computeSubagentOutputDelta: ambiguous tails, partial scrolls and clears re
 });
 
 test('resolveSubagentStatus: blocked > working > settled > idle, running as the default', () => {
-  assert.equal(resolveSubagentStatus({ localStatus: 'running', status: 'blocked' }), 'blocked');
-  assert.equal(resolveSubagentStatus({ localStatus: 'running', status: 'working' }), 'running');
-  assert.equal(resolveSubagentStatus({ localStatus: 'settled', status: 'idle' }), 'settled');
-  assert.equal(resolveSubagentStatus({ localStatus: 'closed', status: 'idle' }), 'settled');
-  assert.equal(resolveSubagentStatus({ localStatus: 'running', status: 'done' }), 'settled');
-  assert.equal(resolveSubagentStatus({ localStatus: 'running', status: 'error' }), 'settled', 'an error terminal ended its turn');
-  assert.equal(resolveSubagentStatus({ localStatus: 'running', status: 'idle' }), 'idle');
-  assert.equal(resolveSubagentStatus({ localStatus: 'running', status: 'unknown' }), 'running');
-  assert.equal(resolveSubagentStatus({ localStatus: 'running', status: null }), 'running');
+  const local = { consumed: false, closed: false };
+  assert.equal(resolveSubagentStatus({ ...local, status: 'blocked' }), 'blocked');
+  assert.equal(resolveSubagentStatus({ ...local, status: 'working' }), 'running');
+  assert.equal(resolveSubagentStatus({ consumed: true, closed: false, status: 'idle' }), 'settled');
+  assert.equal(resolveSubagentStatus({ consumed: false, closed: true, status: 'idle' }), 'settled');
+  assert.equal(resolveSubagentStatus({ ...local, status: 'done' }), 'settled');
+  const errored = resolveSubagentStatus({ ...local, status: 'error' });
+  assert.equal(errored, 'settled', 'an error ends the turn');
+  assert.equal(resolveSubagentStatus({ ...local, status: 'idle' }), 'idle');
+  assert.equal(resolveSubagentStatus({ ...local, status: 'unknown' }), 'running');
+  assert.equal(resolveSubagentStatus({ ...local, status: null }), 'running');
 });
 
 test('formatSubagentOutput: header, body, empty-delta notice and flags', () => {
@@ -307,20 +309,22 @@ test('formatSubagentOutput: header, body, empty-delta notice and flags', () => {
 
 /* ── output action ──────────────────────────────────────────────── */
 
-const worker = (paneId: string, status: TaskEntry['status'] = 'running') =>
-  taskRow({ paneId, taskId: `task-${paneId}`, tabId: 't1', tabName: 'worker', status });
+const worker = (paneId: string, over: TaskSeed = {}) =>
+  taskRow({ paneId, taskId: `task-${paneId}`, tabId: 't1', tabName: 'worker', ...over });
 
-/** A throwing terminal list stands the zombie sweep and the settlement-watch recovery down, so
- * neither can rewrite a seeded row mid-test (no poller is armed to consume it). */
+/** A throwing terminal list stands the settlement-watch recovery down, so it cannot re-arm
+ * a seeded row mid-test (no poller is armed to consume it). */
 const NO_TERMINALS = { listTerminals: async (): Promise<never> => { throw new Error('terminal.list unavailable in this fixture'); } };
 
 /** Mounts the plugin over a scripted core client with one seeded worker row, then disposes it. */
 async function withWorker(
   body: (pi: FakePi) => Promise<void>,
   client: Partial<CoreClientLike> = {},
-  status: TaskEntry['status'] = 'running',
+  seed: TaskSeed = {},
 ): Promise<void> {
-  const { root, pi } = await mountSubagent({ client: { ...NO_TERMINALS, ...client }, tasks: [worker('pWorker', status)] });
+  const { root, pi } = await mountSubagent({
+    client: { ...NO_TERMINALS, ...client }, tasks: [worker('pWorker', seed)],
+  });
   try {
     await body(pi);
   } finally {
@@ -400,7 +404,7 @@ test('output action: a settled row reports settled even while the pane is idle',
     const res = await runSubagent(pi, { action: 'output', agentId: 'pWorker' });
     assert.equal(res.details!.status, 'settled');
     assert.match(res.content[0]!.text, /status: settled/);
-  }, outputPane(() => 'Task completed successfully.\n', { status: 'idle' }), 'settled');
+  }, outputPane(() => 'Task completed successfully.\n', { status: 'idle' }), { consumedAt: 5 });
 });
 
 test('output action: an idle pane showing only its overlay still surfaces the transcript report, once', async () => {
@@ -553,7 +557,7 @@ test('applyReplySession: a bare session id self-report repairs a poisoned sessio
   const taskId = '11111111-2222-4333-8444-555555555555';
   seedTaskDocuments(viewFile, [{
     taskId, paneId: 'p2', tabId: 't0', tabName: 'main',
-    cwd, description: 'Investigate bug 19803', status: 'settled',
+    cwd, description: 'Investigate bug 19803',
     sessionFile: poisoned, createdAt: Date.now() - 60_000,
   }]);
   const { root, pi, port } = await mountSubagent({
@@ -589,7 +593,7 @@ test('session recovery: a still-running subagent gets its settlement watch re-ar
   const createdAt = Date.now() - 120_000;
   seedTaskDocuments(viewFile, [{
     taskId, paneId: 'pAlive', tabId: 't0', tabName: 'main',
-    cwd, description: 'Fix bugs in a separate checkout', status: 'running',
+    cwd, description: 'Fix bugs in a separate checkout',
     sessionFile: null, createdAt,
   }]);
   const { root, pi } = await mountSubagent({

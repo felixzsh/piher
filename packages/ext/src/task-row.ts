@@ -9,9 +9,31 @@
 import { foldWorktree, type WorktreeRecord } from './worktree.ts';
 import type { Lifecycle } from './role-manifest.ts';
 
-/** Memory-only turn state. Observed, never stored: no reload may restore it (S11), and no
- *  durable shape carries it (S12). P2 removes the last in-memory uses. */
-export type TaskStatus = 'running' | 'settled' | 'consumed' | 'closed';
+/** One observation of a task's liveness, read from core when a surface needs it (S11). It feeds
+ *  only the state text a surface prints; an action never reads it to decide (S26). A stale
+ *  observation can mislabel a row — never revive, close or steer the wrong one. */
+export interface TaskObservation {
+  paneExists: boolean;
+  agentStatus: string | null;
+  lastActivityMs: number | null;
+  at: number;
+}
+
+/** The state text `list` and the widget print (contracts): the three predicates plus what core
+ *  last said. Without an observation the durable facts alone decide: a delivered report reads
+ *  `idle`, anything else `running` — the zero-observation base a fresh spawn shares. */
+export type TaskStateText = 'running' | 'idle' | 'no report' | 'no pane';
+
+export function describeTaskState(
+  row: Pick<TaskRow, 'gen'>,
+  obs?: Pick<TaskObservation, 'paneExists' | 'agentStatus'> | null,
+): TaskStateText {
+  if (obs) {
+    if (!obs.paneExists) return 'no pane';
+    if (obs.agentStatus === 'working' || obs.agentStatus === 'blocked') return 'running';
+  }
+  return row.gen.consumedAt !== null ? 'idle' : obs ? 'no report' : 'running';
+}
 
 /** One generation: the pane, tab and transcript a revive replaces wholesale (S3). Earlier
  *  generations leave no durable trace. */
@@ -46,9 +68,9 @@ export interface TaskRow {
 }
 
 /** A task resident in memory: the durable row plus transient control state. The transient
- *  fields are stripped at the document seam (`toTaskRow`) and never reach disk. */
+ *  fields are stripped at the document seam (`toTaskRow`) and never reach disk. Liveness is
+ *  not among them: it is observed from core per surface, never stored (S11, S12). */
 export interface TaskEntry extends TaskRow {
-  status: TaskStatus;
   /** Settle window start (poller state): settlement waits until the transcript settles. */
   settleWindowStartedAt?: number | null;
   /** The closing text already announced for this pane (fingerprint + time). Two pollers can
@@ -60,8 +82,7 @@ export interface TaskEntry extends TaskRow {
 
 /** The durable row alone: what a record file holds. */
 export function toTaskRow(entry: TaskEntry): TaskRow {
-  const { status: _s, settleWindowStartedAt: _w, noticeAnnounced: _n, ...row } = entry;
-  void _s;
+  const { settleWindowStartedAt: _w, noticeAnnounced: _n, ...row } = entry;
   void _w;
   void _n;
   const fingerprint = row.gen.reportDelivered ? { ...row.gen.reportDelivered } : null;

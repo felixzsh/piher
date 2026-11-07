@@ -10,7 +10,7 @@ import type { DisposeLedger } from '../src/ledger.ts';
 import subagentPlugin from '../src/plugins/subagent.ts';
 import type { SubagentDeps } from '../src/plugins/subagent.ts';
 import { emptySubagentPortBox, type SubagentPortBox } from '../src/subagent-core.ts';
-import type { TaskEntry, TaskRow, TaskStatus } from '../src/task-row.ts';
+import type { TaskEntry, TaskRow } from '../src/task-row.ts';
 import { writeTaskRecord, writeTaskView } from '../src/task-store.ts';
 
 export { listTaskRecords, readTaskRecord, readTaskView, repoTasksDir } from '../src/task-store.ts';
@@ -293,8 +293,6 @@ export function fakeCore(over: Partial<CoreClientLike> = {}): CoreClientLike {
 export type TaskSeed = Partial<Omit<TaskRow, 'gen' | 'lifecycle' | 'closedAt'>> & {
   lifecycle?: TaskRow['lifecycle'];
   closedAt?: number | null;
-  /** Memory-only turn state (never written to a document). */
-  status?: TaskStatus;
   paneId?: string;
   slug?: string;
   tabId?: string;
@@ -310,7 +308,6 @@ export type TaskSeed = Partial<Omit<TaskRow, 'gen' | 'lifecycle' | 'closedAt'>> 
 
 export function taskRow(over: TaskSeed = {}): TaskEntry {
   const {
-    status = 'running',
     paneId = 't2',
     slug = '',
     tabId = 'tb0',
@@ -349,7 +346,6 @@ export function taskRow(over: TaskSeed = {}): TaskEntry {
       consumedAt,
       reportDelivered,
     },
-    status,
     ...(settleWindowStartedAt !== undefined ? { settleWindowStartedAt } : {}),
     ...(noticeAnnounced !== undefined ? { noticeAnnounced } : {}),
     ...rest,

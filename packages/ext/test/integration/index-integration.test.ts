@@ -492,7 +492,10 @@ test('widget + /piher-tree: both follow the restored tasks, and only the master 
   const sessionFile = join(cleanup.tempDir('piher-tree-sess').path, '2026-01-01T00-00-00-000Z_dddddddd-0000-4000-8000-000000000000.jsonl');
   seedTaskDocuments(sessionFile, [
     { taskId: 'task-1', paneId: 'w2', slug: 'harden-pipe', description: 'harden pipe channel', kind: 'worker', cwd, createdAt: Date.now() - 120_000 },
-    { taskId: 'task-2', paneId: 'w3', slug: 'run-e2e', description: 'e2e', status: 'settled', consumedAt: Date.now() - 60_000, cwd },
+    {
+      taskId: 'task-2', paneId: 'w3', slug: 'run-e2e', description: 'e2e',
+      consumedAt: Date.now() - 60_000, cwd,
+    },
   ]);
   const widgets: Array<{ id: string; lines: string[] | undefined }> = [];
   const master = await mountIndex(cleanup, 'master', { HC_TERMINAL_SOCKET: '/tmp/piher-test-sock-tree', HC_TERMINAL_ID: 't1' });

@@ -21,7 +21,9 @@ import { sessionStatePath } from './session-state.ts';
 import { pipeRequestTo } from './pipe-channel.ts';
 import { runtimePolicy } from './runtime-policy.ts';
 import { sleep } from './subagent-core.ts';
-import { isClosed, type TaskEntry, type TaskRow } from './task-row.ts';
+import {
+  isClosed, type TaskEntry, type TaskObservation, type TaskRow,
+} from './task-row.ts';
 import { readTaskRecord, readTaskView, seedTaskView, TASK_VIEW_NAME } from './task-store.ts';
 import type { PaneStateSlot } from './plugins/bg-job.ts';
 
@@ -41,7 +43,6 @@ export interface TaskBoardHost {
   client: CoreClientLike;
   tasks: Map<string, TaskEntry>;
   panes: Map<string, string>;
-  writeRecord(entry: TaskEntry): void;
   /** Repository the restore reads records from (the session's own checkout). */
   restoreCwd: () => string;
   /** This session's transcript path; null when it has none (S25: the view stays in memory). */
@@ -58,7 +59,6 @@ function seedEntryFromRow(host: Pick<TaskBoardHost, 'tasks' | 'panes'>, row: Tas
     ...row,
     gen: { ...row.gen },
     ...(row.worktree ? { worktree: { ...row.worktree } } : {}),
-    status: row.gen.consumedAt !== null ? 'consumed' : 'running',
   };
   host.tasks.set(row.taskId, entry);
   if (row.gen.paneId) host.panes.set(row.gen.paneId, row.taskId);
@@ -80,10 +80,10 @@ export function restoreTasks(host: TaskBoardHost, via = 'session_start', cwd?: s
       const row = readTaskRecord(repo, taskId);
       if (!row) continue;
       const known = host.tasks.get(taskId);
-      if (isClosed(row)) {
-        if (known) known.status = 'closed';
-        continue;
-      }
+      // `close` is final across sessions (S24): the record's decision wins over memory, and it
+      // only ever moves one way, so adopting it here can never resurrect a task.
+      if (known && row.closedAt !== null) known.closedAt = row.closedAt;
+      if (isClosed(row)) continue;
       if (!known) {
         seedEntryFromRow(host, row);
         restored += 1;
@@ -106,35 +106,14 @@ export function seedForkView(sessionFile: string | null, previousSessionFile: st
   trace(traceRole, 'tasks-seed', { from: from ?? null, to: to ?? null });
 }
 
-/** Startup sweep: a row still marked running whose pane core no longer lists is not running —
- *  but nothing ended it. A vanished pane is unfinished work, and unfinished work is what
- *  `resume` exists for. Only `close` may write `closed`. */
-export async function sweepZombieTasks(
-  host: Pick<TaskBoardHost, 'client' | 'tasks' | 'writeRecord'>,
-): Promise<void> {
-  if (!host.client.available || host.tasks.size === 0) return;
-  let liveTerminalIds: ReadonlySet<string>;
-  try {
-    liveTerminalIds = new Set((await host.client.listTerminals()).map((terminal) => terminal.id));
-  } catch {
-    return; // do not close agents when the liveness lookup itself failed
-  }
-  for (const entry of host.tasks.values()) {
-    if (entry.status !== 'running' || (entry.gen.paneId && liveTerminalIds.has(entry.gen.paneId))) continue;
-    entry.status = 'settled';
-    host.writeRecord(entry);
-    trace(traceRole, 'gc-release', { pane: entry.gen.paneId, via: 'zombie-sweep', taskId: entry.taskId });
-  }
-}
-
 /* ── GC ─────────────────────────────────────────────────────────── */
 
 interface GcHost {
   client: CoreClientLike;
   env: CoreEnv | null;
   tasks: Map<string, TaskEntry>;
-  panes: Map<string, string>;
-  writeRecord(e: TaskEntry): void;
+  /** Refreshed from the pass snapshot; feeds only the state text surfaces print (S26). */
+  noteObservation?: (taskId: string, obs: TaskObservation) => void;
   terminalState: PaneStateSlot;
   noticePending?: () => ReadonlySet<string>;
   /** The app's window on a checkout. Closing it ends the terminals inside, so only an empty one goes. */
@@ -164,8 +143,8 @@ export function createGcController(h: GcHost): GcController {
       .filter((e) => e.worktree?.path)
       .map((e) => ({
         kind: e.kind,
-        status: e.status,
         consumedAt: e.gen.consumedAt ?? null,
+        closedAt: e.closedAt,
         worktreePath: e.worktree?.path ?? null,
       }));
     if (rows.length === 0) return;
@@ -201,12 +180,24 @@ export function createGcController(h: GcHost): GcController {
     const terminals = watch.list().filter((t) => t.state === 'live');
     const statuses = new Map(terminals.map((t) => [t.id, t.status]));
     const tabOf = (t: TerminalInfo): string => t.labels['herdr.tab'] ?? '';
-    // Piher's own view of the running rows, side by side with what core says: the comparison that
-    // shows a desync (`hc` sees `done`, the row still says `running`).
+    const liveIds = new Set(terminals.map((t) => t.id));
+    // The snapshot is this pass's observation: it refreshes the cache displays read from, and
+    // nothing else — housekeeping never ends a task, so a stale view can only mislabel one (S26).
+    const now = Date.now();
+    for (const e of h.tasks.values()) {
+      if (!e.gen.paneId) continue;
+      h.noteObservation?.(e.taskId, {
+        paneExists: liveIds.has(e.gen.paneId),
+        agentStatus: statuses.get(e.gen.paneId) ?? null,
+        lastActivityMs: null,
+        at: now,
+      });
+    }
+    // Piher's own view of the rows still awaiting a report, side by side with what core says.
     trace(traceRole, 'gc-view', {
       panes: terminals.length,
       running: [...h.tasks.values()]
-        .filter((e) => e.status === 'running')
+        .filter((e) => !isClosed(e) && e.gen.consumedAt === null)
         .slice(0, 8)
         .map((e) => `${e.gen.paneId}:${statuses.get(e.gen.paneId) ?? 'absent'}`)
         .join(','),
@@ -224,31 +215,22 @@ export function createGcController(h: GcHost): GcController {
     }
     const mainTabId = (await h.client.placementLabels())['herdr.tab'] ?? '';
 
-    /**
-     * Housekeeping never ends a task. The pane and the tab are piher's to reclaim, but the row is the
-     * master's: it becomes `settled` (unfinished, resumable) and only `close` writes `closed`. A sweep
-     * that stamped `closed` used to be undone by `send` reviving it, which is exactly the coupling
-     * that made "close is final" contradictory.
-     */
-    const releaseRow = (e: TaskEntry): void => {
-      if (e.status !== 'running') return;
-      e.status = 'settled';
-      h.writeRecord(e);
-      trace(traceRole, 'gc-release', { pane: e.gen.paneId, via: 'gc', taskId: e.taskId });
-    };
+    /** Housekeeping never ends a task: it reclaims panes, tabs and checkout spaces, and the rows
+     *  stay exactly as the master left them — only `close` writes `closed` (S8, S9). */
     /** The pair `close` and a one-shot settlement use as well. */
     const retire = (id: string): Promise<void> => retirePane(h.client, id);
 
     for (const [tabId, entries] of byTab) {
       if (tabId === mainTabId) continue;
       const tabTerminals = terminals.filter((t) => tabOf(t) === tabId);
-      if (tabTerminals.length === 0) {
-        for (const e of entries) releaseRow(e);
-        continue;
-      }
+      // A tab with no terminals holds no live work; its rows stay listed as `no pane` until the
+      // master closes them or sends them back to life.
+      if (tabTerminals.length === 0) continue;
       if (!autoCloseTabs) continue;
       if (!shouldCloseTaskTab({
-        entries: entries.map((e) => ({ kind: e.kind, status: e.status, consumedAt: e.gen.consumedAt })),
+        entries: entries.map((e) => ({
+          kind: e.kind, consumedAt: e.gen.consumedAt, closedAt: e.closedAt,
+        })),
         paneStatuses: tabTerminals.map((t) => t.status),
         ttlMs,
         now: Date.now(),
@@ -256,13 +238,13 @@ export function createGcController(h: GcHost): GcController {
       // Live terminal panes and not-yet-delivered settlement notices keep the tab alive.
       if (tabTerminals.some((t) => termPaneIds.has(t.id) || pendingNoticeIds.has(t.id))) continue;
       for (const t of tabTerminals) await retire(t.id);
-      for (const e of entries) releaseRow(e);
       await sleep(300);
     }
 
     const closableTaskTabIds = new Set([...byTab.keys()].filter((t) => t !== mainTabId));
     const candidates = [...h.tasks.values()].filter(
-      (e) => e.status === 'consumed' && !(e.gen.tabId && closableTaskTabIds.has(e.gen.tabId)),
+      (e) => e.gen.consumedAt !== null && !isClosed(e)
+        && !(e.gen.tabId && closableTaskTabIds.has(e.gen.tabId)),
     );
     for (const e of candidates) {
       if (termPaneIds.has(e.gen.paneId) || pendingNoticeIds.has(e.gen.paneId)) continue;
@@ -274,12 +256,10 @@ export function createGcController(h: GcHost): GcController {
         prevTurnStart,
         lifecycle: e.lifecycle,
       })) continue;
-      if (statuses.get(e.gen.paneId) === undefined) {
-        releaseRow(e);
-        continue;
-      }
+      // A terminal the snapshot does not list is left alone: its row stays truthful, and the next
+      // pass retries the decision instead of acting on a stale view.
+      if (statuses.get(e.gen.paneId) === undefined) continue;
       await retire(e.gen.paneId);
-      releaseRow(e);
       await sleep(300);
     }
     await sweepCheckoutSpaces(ttlMs);
@@ -293,7 +273,11 @@ export function createGcController(h: GcHost): GcController {
     for (const e of [...h.tasks.values()]) {
       if (!e.gen.paneId) continue;
       const status = statuses.get(e.gen.paneId);
-      if (planChannelCheck({ rowStatus: e.status, terminalStatus: status }) === 'skip') continue;
+      if (planChannelCheck({
+        closed: isClosed(e),
+        consumed: e.gen.consumedAt !== null,
+        terminalStatus: status,
+      }) === 'skip') continue;
       // Past the planner the terminal is listed and reported: the notice may name its state.
       const reported = status ?? 'unknown';
       let ok = false;

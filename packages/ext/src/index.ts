@@ -138,7 +138,7 @@ export default async function (pi: ExtensionAPI) {
     return formatDelegationTree({
       workers: subagentPort.current?.listRunningSubs() ?? [],
       settled: rows
-        .filter((r) => r.status === 'settled' || r.status === 'consumed')
+        .filter((r) => r.settledAt != null)
         .map((r) => ({ paneId: r.paneId, slug: r.slug, description: r.description, settledAt: r.settledAt })),
       now: Date.now(),
     });

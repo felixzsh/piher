@@ -15,7 +15,7 @@ import {
   type SubSessionState,
 } from './session-tail.ts';
 import { idParam, reportFingerprint, type AliveProbe } from './subagent-core.ts';
-import type { TaskEntry, TaskStatus } from './task-row.ts';
+import { isClosed, type TaskEntry } from './task-row.ts';
 import { toolError } from './tool-error.ts';
 import { trace, traceRole } from './trace.ts';
 
@@ -150,14 +150,18 @@ export function computeSubagentOutputDelta(
   return carry(currText, true);
 }
 
-type StatusInput = { localStatus: TaskStatus; status?: CoreStatus | null };
+type StatusInput = { consumed: boolean; closed: boolean; status?: CoreStatus | null };
 
 /** First matching rule wins; a worker with no other signal is running. An `error` terminal ended
- *  its turn like `done`, so the transcript decides what came out. */
+ *  its turn like `done`, so the transcript decides what came out. The local facts are durable
+ *  ones (a delivered report, the master's decision), never a stored status (S12). */
 const STATUS_RULES: ReadonlyArray<{ status: SubagentStatus; match: (i: StatusInput) => boolean }> = [
   { status: 'blocked', match: (i) => i.status === 'blocked' },
   { status: 'running', match: (i) => i.status === 'working' },
-  { status: 'settled', match: (i) => i.localStatus === 'settled' || i.localStatus === 'closed' || i.status === 'done' || i.status === 'error' },
+  {
+    status: 'settled',
+    match: (i) => i.closed || i.consumed || i.status === 'done' || i.status === 'error',
+  },
   { status: 'idle', match: (i) => i.status === 'idle' },
 ];
 
@@ -467,7 +471,11 @@ export async function executeSubagentOutput(
   } catch {
   }
 
-  const status = resolveSubagentStatus({ localStatus: entry.status, status: terminalStatus });
+  const status = resolveSubagentStatus({
+    consumed: entry.gen.consumedAt !== null,
+    closed: isClosed(entry),
+    status: terminalStatus,
+  });
   const askQuestion = terminalStatus === 'blocked' ? await readBlockedQuestion(deps.client, entry.gen.paneId) : null;
 
   let rawRead: SubagentOutputRead;

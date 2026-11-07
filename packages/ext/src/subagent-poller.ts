@@ -5,7 +5,9 @@
  */
 import { Context } from '@deepseek-ai/cordis';
 import type { CoreClientLike, CoreStatus, TerminalInfo } from './core-client.ts';
-import { applyReportedSessionFile, taskForPane, type TaskEntry } from './task-row.ts';
+import {
+  applyReportedSessionFile, isClosed, taskForPane, type TaskEntry, type TaskObservation,
+} from './task-row.ts';
 import { runtimePolicy, type RuntimePolicy } from './runtime-policy.ts';
 import { formatFailureNotice, formatSettlementNotice, type SettlementNullReason } from './vocab.ts';
 import { settlementCard, type SettlementCard, type SettlementOutcome } from './settlement-card.ts';
@@ -157,6 +159,8 @@ export interface PollerHost {
   tasks: Map<string, TaskEntry>;
   panes: Map<string, string>;
   writeRecord(e: TaskEntry): void;
+  /** Refreshed from each observation the loop makes; feeds only the state text (S26). */
+  noteObservation?: (paneId: string, obs: TaskObservation) => void;
   blockedGateNotified: Set<string>;
   session: SessionIo;
   injectNotice(content: string, paneId?: string, card?: SettlementCard | null): Promise<void>;
@@ -236,11 +240,11 @@ export function createPoller(h: PollerHost): Poller {
     /** Claimed settle key: on a rejected injection the claim stays ours, so the next wake retries
      *  the notice instead of suppressing it as someone else's. */
     let claimedKey: string | null = null;
-    /** Stop watching this pane: write the record first, or a restart replays a ghost running row. */
+    /** Stop watching this pane: stamp the delivery and write the record first, or a restart
+     *  replays a ghost running row. Settling is `consumedAt` plus the write — nothing else. */
     const consume = (at: number): void => {
       const row = taskForPane(h.tasks, h.panes, paneId);
       if (!row) return;
-      row.status = 'consumed';
       row.gen.consumedAt = at;
       h.writeRecord(row);
       // S54: a one-shot worker exits after pushing its report, so its pane is reclaimed here — the
@@ -321,15 +325,17 @@ export function createPoller(h: PollerHost): Poller {
     const watchReady = await watch.ready();
     trace(traceRole, 'poll-start', {
       pane: paneId, since: injectTs, request: requestId, cwd, file: taskForPane(h.tasks, h.panes, paneId)?.gen.sessionFile ?? null,
-      watchReady, watchConnected: watch.connected, row: taskForPane(h.tasks, h.panes, paneId)?.status ?? null,
+      watchReady, watchConnected: watch.connected,
     });
     try {
       while (true) {
         const current = requestByPane.get(paneId) ?? { injectTs, description, requestId };
         const entry = taskForPane(h.tasks, h.panes, paneId);
-        if (!entry || entry.status === 'settled' || entry.status === 'consumed' || entry.status === 'closed') {
+        if (!entry || isClosed(entry) || entry.gen.consumedAt !== null) {
           trace(traceRole, 'poll-exit', {
-            pane: paneId, reason: entry ? entry.status : 'row-gone', request: current.requestId,
+            pane: paneId,
+            reason: !entry ? 'row-gone' : isClosed(entry) ? 'closed' : 'consumed',
+            request: current.requestId,
           });
           return;
         }
@@ -342,6 +348,16 @@ export function createPoller(h: PollerHost): Poller {
           return woke;
         };
         const { state, alive } = await observe(paneId);
+        // The loop's own observations refresh the display cache; a blind watch notes nothing, so a
+        // stale snapshot can never overwrite a liveness the loop actually saw (S26).
+        if (watch.connected) {
+          h.noteObservation?.(paneId, {
+            paneExists: alive,
+            agentStatus: state === 'exited' ? null : state,
+            lastActivityMs: null,
+            at: now(),
+          });
+        }
         // Working is activity (vacuum heartbeat); `exited`/`unknown` carry no word to gate or settle on.
         const waitState: WaitState = state === 'exited' || state === 'unknown' || state === 'working' ? null : state;
         if (state === 'working' && entry.settleWindowStartedAt) {
@@ -386,7 +402,7 @@ export function createPoller(h: PollerHost): Poller {
             pane: paneId, state, textLen: s.text ? s.text.length : null, pend: s.pendingTool,
             act: s.activity, ended: s.turnEnded ?? null, window: entry.settleWindowStartedAt ?? null,
             since: current.injectTs, request: current.requestId, file: entry.gen.sessionFile,
-            watch: watch.connected, row: entry.status,
+            watch: watch.connected,
           });
 
           const terminalIdle = state === 'idle' || state === 'done' || state === 'error';

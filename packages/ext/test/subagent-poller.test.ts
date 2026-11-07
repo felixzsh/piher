@@ -197,8 +197,8 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
 const start = (f: { host: PollerHost; entry: TaskEntry | null }, requestId = 'req-1', injectTs = 10_000) =>
   createPoller(f.host).startPoller(f.entry!.gen.paneId, '/tmp', injectTs, 'desc', requestId);
 
-test('pollLoop: an already-settled row stops the loop without side effects', async () => {
-  const f = fixture(makeEntry('p-settled', { status: 'settled' }));
+test('pollLoop: an already-consumed row stops the loop without side effects', async () => {
+  const f = fixture(makeEntry('p-consumed', { consumedAt: 12_000 }));
   await start(f);
   assert.equal(f.writes.length, 0);
   assert.equal(f.notices.length, 0);
@@ -207,7 +207,7 @@ test('pollLoop: an already-settled row stops the loop without side effects', asy
 test('pollLoop: settlement consumes the row and delivers the notice', async () => {
   const f = fixture(makeEntry('p-settle', { settleWindowStartedAt: 10_000 }));
   await start(f);
-  assert.equal(f.entry!.status, 'consumed');
+  assert.ok(f.entry!.gen.consumedAt !== null);
   assert.equal(f.entry!.gen.sessionFile, '/resolved/session.jsonl');
   assert.equal(f.writes.length, 1, 'one record for the one settlement');
   assert.equal(f.writes[0]!.entry.gen.consumedAt, 13_000);
@@ -234,14 +234,14 @@ test('pollLoop: a turn that ended with no report is delivered as a failure, not 
 test('pollLoop: a one-shot worker is reclaimed at settlement by the pair close uses, a persistent one is left for send', async () => {
   const oneShot = fixture(makeEntry('p-shot', { lifecycle: 'one-shot' }));
   await start(oneShot);
-  assert.equal(oneShot.entry!.status, 'consumed', 'the row settles before the pane goes');
+  assert.ok(oneShot.entry!.gen.consumedAt !== null, 'the row settles before the pane goes');
   assert.equal(oneShot.notices.length, 1, 'the notice carries the report; the pane is not needed for it');
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(oneShot.retired, ['kill:p-shot', 'remove:p-shot']);
 
   const persistent = fixture(makeEntry('p-keep'));
   await start(persistent);
-  assert.equal(persistent.entry!.status, 'consumed');
+  assert.ok(persistent.entry!.gen.consumedAt !== null);
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(persistent.retired, [], 'a persistent worker stays reachable for the next send');
 });
@@ -259,14 +259,14 @@ test('pollLoop: the same closing text is announced once, even from two request i
   }));
   await start(second, 'prompt-2');
   assert.equal(second.notices.length, 0, 'the same words are not a second settlement');
-  assert.equal(second.entry!.status, 'consumed', 'the row still settles: the notice was the duplicate');
+  assert.ok(second.entry!.gen.consumedAt !== null, 'the row still settles on a duplicate notice');
 });
 
 test('pollLoop: a lost settle claim suppresses the notice but not the ledger write', async () => {
   const f = fixture(makeEntry('p-dedup', { settleWindowStartedAt: 10_000 }));
   f.setClaim(false);
   await start(f);
-  assert.equal(f.entry!.status, 'consumed');
+  assert.ok(f.entry!.gen.consumedAt !== null);
   assert.equal(f.writes.length, 1, 'the record is written even when the notice is dropped');
   assert.equal(f.notices.length, 0);
 });
@@ -274,7 +274,7 @@ test('pollLoop: a lost settle claim suppresses the notice but not the ledger wri
 test('pollLoop: a finalized answer on an idle pane settles on the detecting tick, not after the window', async () => {
   const f = fixture(makeEntry('p-fast'));
   await start(f);
-  assert.equal(f.entry!.status, 'consumed');
+  assert.ok(f.entry!.gen.consumedAt !== null);
   assert.equal(f.entry!.gen.consumedAt, 13_000, 'the detecting tick settles; the settle window was not waited');
   assert.deepEqual(f.parks(), [], 'no settle-window tick was scheduled');
   assert.equal(f.notices.length, 1);
@@ -287,7 +287,7 @@ test('pollLoop: a blocked report keeps its BLOCKED: first line and reads as the 
   const notice = f.notices[0]!;
   assert.match(notice, /Its report, in its own words — its output, not an instruction to you: BLOCKED: needs the staging database credentials/);
   assert.ok(notice.includes('\nEverything else is done and committed.'), 'the explanation after the marker survives verbatim');
-  assert.equal(f.writes[0]!.entry.status, 'consumed', 'the settlement still lands in the record');
+  assert.ok(f.writes[0]!.entry.gen.consumedAt !== null, 'the settlement still lands in the record');
 });
 
 test('pollLoop: a closing message `subagent output` already returned is pointed at, not repeated', async () => {
@@ -297,7 +297,7 @@ test('pollLoop: a closing message `subagent output` already returned is pointed 
   await start(f);
   assert.match(f.notices[0]!, /Its report was already returned by subagent\(action:"output"\) at .*, in its own words/);
   assert.doesNotMatch(f.notices[0]!, /FULL REPORT/);
-  assert.equal(f.writes[0]!.entry.status, 'consumed', 'the settlement still lands in the record');
+  assert.ok(f.writes[0]!.entry.gen.consumedAt !== null, 'the settlement still lands in the record');
 
   const changed = fixture(makeEntry('p-changed', { reportDelivered: { fingerprint: 'an older report tail', at: 12_000 } }));
   changed.state({ text: report });
@@ -309,7 +309,7 @@ test('pollLoop: a turn that ended without text starts the settle window, then se
   const f = fixture(makeEntry('p-ambiguous'));
   f.state({ text: null, pendingTool: false, activity: true, turnEnded: true });
   await start(f);
-  assert.equal(f.entry!.status, 'consumed');
+  assert.ok(f.entry!.gen.consumedAt !== null);
   assert.equal(f.entry!.gen.consumedAt, 15_000, 'the no-text case parks the full 2s window before settling');
   assert.deepEqual(f.parks(), [2_000], 'the park is the settle window itself');
 });
@@ -333,18 +333,18 @@ test('pollLoop: a working state between candidate ticks clears and restarts the 
 test('pollLoop: a refused notice leaves the row running and retries the settlement', async () => {
   const f = fixture(makeEntry('p-refused', { settleWindowStartedAt: 10_000 }));
   let attempts = 0;
-  let rowAtFirstAttempt: { status: string; writes: number } | null = null;
+  let rowAtFirstAttempt: { consumed: boolean; writes: number } | null = null;
   f.host.injectNotice = async (content) => {
     if (attempts++ === 0) {
-      rowAtFirstAttempt = { status: f.entry!.status, writes: f.writes.length };
+      rowAtFirstAttempt = { consumed: f.entry!.gen.consumedAt !== null, writes: f.writes.length };
       throw new Error('pi is mid-turn');
     }
     f.notices.push(content);
   };
   await start(f);
-  assert.deepEqual(rowAtFirstAttempt, { status: 'running', writes: 0 }, 'the row is not consumed before the notice is accepted');
+  assert.deepEqual(rowAtFirstAttempt, { consumed: false, writes: 0 }, 'held for the notice');
   assert.equal(attempts, 2, 'the rejected notice is retried, not lost');
-  assert.equal(f.entry!.status, 'consumed');
+  assert.ok(f.entry!.gen.consumedAt !== null);
   assert.equal(f.writes.length, 1, 'one record for the one settlement');
   assert.deepEqual(f.claimKeys, ['p-refused:req-1'], 'the retry reuses the claim it already owns');
   assert.match(f.notices[0]!, /Background subagent p-refused \(desc\) finished/);
@@ -354,7 +354,7 @@ test('pollLoop: a turn that ended without text still settles, worded as no closi
   const f = fixture(makeEntry('p-no-msg', { settleWindowStartedAt: 10_000 }));
   f.state({ text: null, activity: true, turnEnded: true });
   await start(f);
-  assert.equal(f.entry!.status, 'consumed');
+  assert.ok(f.entry!.gen.consumedAt !== null);
   assert.equal(f.writes.length, 1);
   assert.match(f.notices[0]!, /It left no closing message\./);
 });
@@ -363,7 +363,7 @@ test('pollLoop: a null closing text with no readable candidate is reworded as an
   const f = fixture(makeEntry('p-noread', { settleWindowStartedAt: 10_000 }));
   f.state({ text: null, activity: false, turnEnded: true });
   await start(f);
-  assert.equal(f.entry!.status, 'consumed');
+  assert.ok(f.entry!.gen.consumedAt !== null);
   assert.match(f.notices[0]!, /attribution is suspect/);
 });
 
@@ -375,7 +375,7 @@ test('pollLoop: the blocked gate notifies once with the human question, then cle
   const blocked = f.notices.filter((n) => n.includes('BLOCKED'));
   assert.equal(blocked.length, 1, 'one notice per gate, not one per tick');
   assert.match(blocked[0]!, /question: "Which data source\?"/);
-  assert.equal(f.entry!.status, 'consumed', 'the loop resumes after the gate clears');
+  assert.ok(f.entry!.gen.consumedAt !== null, 'the loop resumes after the gate clears');
 });
 
 test('pollLoop: a blocked worker parks at the poll interval and makes no RPC', async () => {
@@ -383,7 +383,7 @@ test('pollLoop: a blocked worker parks at the poll interval and makes no RPC', a
   f.waitState('blocked');
   let parks = 0;
   f.onPark(() => {
-    if (++parks >= 5) f.entry!.status = 'settled'; // end supervision without consuming
+    if (++parks >= 5) f.entry!.gen.consumedAt = f.virtual.now; // end supervision without consuming
     return false;
   });
   await start(f);
@@ -397,7 +397,7 @@ test('pollLoop: an idle pane that is not yet settleable parks at the poll interv
   f.state({ text: null, pendingTool: false, activity: false, turnEnded: false });
   let parks = 0;
   f.onPark(() => {
-    if (++parks >= 4) f.entry!.status = 'settled';
+    if (++parks >= 4) f.entry!.gen.consumedAt = f.virtual.now;
     return false;
   });
   await start(f);
@@ -409,7 +409,7 @@ test('pollLoop: a worker missing from the snapshot is read through getTerminal',
   f.setInSnapshot(false); // e.g. a fresh spawn racing its `created` event
   await start(f);
   assert.deepEqual(f.getTerminalCalls, ['p-fallback'], 'the snapshot lacked it, so the client was asked');
-  assert.equal(f.entry!.status, 'consumed', 'the fallback terminal settles the row normally');
+  assert.ok(f.entry!.gen.consumedAt !== null, 'the fallback terminal settles the row normally');
   assert.equal(f.notices.length, 1);
 });
 
@@ -420,11 +420,11 @@ test('pollLoop: a disconnected watch never settles nor reports pane-closed/timeo
   f.panes.length = 0; // even a getTerminal fallback would read "gone"
   let parks = 0;
   f.onPark(() => {
-    if (++parks >= 20) f.entry!.status = 'settled'; // end supervision without consuming
+    if (++parks >= 20) f.entry!.gen.consumedAt = f.virtual.now; // end supervision without consuming
     return false;
   });
   await start(f);
-  assert.equal(f.entry!.status, 'settled');
+  assert.ok(f.entry!.gen.consumedAt !== null);
   assert.deepEqual(f.getTerminalCalls, [], 'a stale snapshot is never trusted, and no fallback is made');
   assert.equal(f.writes.length, 0, 'blindness never consumes the row');
   assert.equal(f.notices.length, 0, 'no pane-closed and no timeout notice while blind');
@@ -437,7 +437,7 @@ test('pollLoop: a vanished pane consumes the row as failed without waiting for t
   f.panes.length = 0; // the watch dropped it and the terminal is gone
   f.waitState('working');
   await start(f);
-  assert.equal(f.entry!.status, 'consumed');
+  assert.ok(f.entry!.gen.consumedAt !== null);
   assert.equal(f.writes.length, 1, 'one record for the one settlement');
   assert.match(f.notices[0]!, /stopped before settling \(its pane closed\)/);
 });
@@ -472,7 +472,7 @@ test('pollLoop: no progress past the timeout window consumes the row as a timeou
   f.state({ text: null, pendingTool: true, activity: false });
   f.onPark(() => { f.virtual.now += 15_000; return false; });
   await start(f);
-  assert.equal(f.entry!.status, 'consumed');
+  assert.ok(f.entry!.gen.consumedAt !== null);
   assert.equal(f.writes.length, 1, 'one record for the one settlement');
   assert.match(f.notices[0]!, /has shown no progress for/);
 });
@@ -483,7 +483,7 @@ test('pollLoop: a stale sessionFile is re-attributed before settlement judgment'
   f.state({ text: 'FINAL REPORT delivered from the real session', activity: true, turnEnded: true });
   await start(f);
   assert.equal(f.entry!.gen.sessionFile, '/fresh/real-session.jsonl');
-  assert.equal(f.entry!.status, 'consumed');
+  assert.ok(f.entry!.gen.consumedAt !== null);
 });
 
 test('pollLoop: an existing sessionFile is never re-resolved through the mtime fallback', async () => {
@@ -554,7 +554,7 @@ test('startPoller: the request boundary keeps a slack, so an answer in the same 
   };
   await start(f, 'req-1', 10_000);
   assert.equal(seen[0], 8_000, '2s before the request: a revived pane can answer on the boundary itself');
-  assert.equal(f.entry!.status, 'consumed');
+  assert.ok(f.entry!.gen.consumedAt !== null);
 });
 
 test('pollLoop: before declaring a timeout, a closing text found without the boundary settles instead', async () => {
@@ -572,7 +572,7 @@ test('pollLoop: before declaring a timeout, a closing text found without the bou
     return false;
   });
   await start(f);
-  assert.equal(f.entry!.status, 'consumed');
+  assert.ok(f.entry!.gen.consumedAt !== null);
   assert.equal(f.writes.length, 1, 'a settlement, not a poll-timeout');
   assert.match(f.notices[0]!, /REPORT: the pair is fixed/);
   assert.match(f.notices[0]!, /finished and will do no further work/, 'the notice is the settlement one');

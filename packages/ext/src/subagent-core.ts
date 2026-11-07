@@ -5,7 +5,7 @@
  * The row itself lives in task-row.ts; the documents in task-store.ts.
  */
 import { normalizeEntryKind, taskRef } from './task-row.ts';
-import type { TaskStatus } from './task-row.ts';
+import type { TaskStateText } from './task-row.ts';
 import { CORE_REQUIRED } from './core-client.ts';
 import type { SettlementCard, SettlementOutcome } from './settlement-card.ts';
 import type { WorkerWidgetRow } from './tree-view.ts';
@@ -530,7 +530,10 @@ export interface SubagentPort {
   applyReplySession(paneId: string, sessionFile: string | null): void;
   listRunningSubs(): WorkerWidgetRow[];
   /** D113: non-closed rows for the /piher-tree view (settled nodes carry their settle time). */
-  listRows(): Array<{ paneId: string; slug?: string; description: string; kind: string; status: TaskStatus; settledAt: number | null }>;
+  listRows(): Array<{
+    paneId: string; slug?: string; description: string; kind: string; status: TaskStateText;
+    settledAt: number | null;
+  }>;
   /** The `piher.settlement` card for a pipe-delivered settlement (S57). */
   settlementCard(paneId: string, outcome: SettlementOutcome): SettlementCard;
   /** Pipe settlement: drop the row out of listRunningSubs before the finish notice wakes the master. */

@@ -3,12 +3,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DisposeLedger } from '../src/ledger.ts';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  TempHome, fire, mountSubagent, runSubagent, runSubagentRejects, seedTaskDocuments, readTaskRecord, taskRow,
-  terminalInfo,
+  TempHome, fire, mountSubagent, runSubagent, runSubagentRejects, seedTaskDocuments, readTaskRecord,
+  repoTasksDir, taskRow, terminalInfo,
 } from './test-utils.ts';
 import { forgetTaskPrompt, readTaskPrompt, saveTaskPrompt } from '../src/prompt-store.ts';
 import {
@@ -18,7 +18,7 @@ import {
   flattenToolParams, idParam, sleepWhileSubsRunningNote, tabNameForTask, type AliveProbe,
 } from '../src/subagent-core.ts';
 import {
-  allocateTaskSlug, isActionable, isClosed, isSpent, slugifyTask, taskRef, type TaskEntry,
+  allocateTaskSlug, parseTaskDocument, slugifyTask, taskRef, type TaskEntry,
 } from '../src/task-row.ts';
 import { planReadyAttempt, readyBackoffMs, readyFailureText } from '../src/subagent-spawn.ts';
 
@@ -143,24 +143,6 @@ test('attachSubagentStructuredContent: stamps the action onto details; non-objec
     'empty details still yield the action',
   );
   assert.equal(attachSubagentStructuredContent('output', undefined), undefined);
-});
-
-test('task predicates: closed, spent and actionable derive from the row alone', () => {
-  const open = taskRow({ taskId: 't-open', status: 'running' });
-  assert.equal(isClosed(open), false);
-  assert.equal(isSpent(open), false);
-  assert.equal(isActionable(open), true);
-  const closed = taskRow({ taskId: 't-closed', status: 'closed', closedAt: 7 });
-  assert.equal(isClosed(closed), true);
-  assert.equal(isActionable(closed), false);
-  const spent = taskRow({
-    taskId: 't-spent', status: 'consumed', lifecycle: 'one-shot', consumedAt: 9,
-  });
-  assert.equal(isSpent(spent), true);
-  assert.equal(isActionable(spent), false);
-  const persistent = taskRow({ taskId: 't-p', status: 'consumed', consumedAt: 9 });
-  assert.equal(isSpent(persistent), false, 'a persistent worker is never spent');
-  assert.equal(isActionable(persistent), true);
 });
 
 test('Semaphore: queues past the cap, releases in order, reusable after drain', async () => {
@@ -409,30 +391,73 @@ test('subagent plugin: a reload restores the session view from the records and d
     seedTaskDocuments(sessionFile, [
       {
         taskId: 'a1b2c3d4-0000-4000-8000-000000000001', paneId: 'w1:p9', cwd: repo,
-        description: 'pruned worker', status: 'running', closedAt: Date.now(), tabName: '',
+        description: 'pruned worker', closedAt: Date.now(), tabName: '',
       },
       // Unfinished business in the same directory: a consumed row is resumable, so it must still show.
       {
         taskId: 'b2c3d4e5-0000-4000-8000-000000000002', paneId: 'w1:p8', cwd: repo,
-        description: 'settled worker', status: 'settled', consumedAt: 6, tabName: '',
+        description: 'settled worker', consumedAt: 6, tabName: '',
       },
       {
-        taskId: 'live-1', paneId: 'w1:p4', cwd: repo, description: 'live worker',
-        status: 'running', tabName: '',
+        taskId: 'live-1', paneId: 'w1:p4', cwd: repo, description: 'live worker', tabName: '',
       },
     ]);
     const { root, pi } = await mountSubagent({
-      // No core in a restore test: the startup zombie sweep would settle the running rows (its fake
-      // terminal list is empty), and a live row would arm a recovery poll.
-      client: { available: false },
+      // No core behind the mount: a live row would arm a recovery poll. The probes below still
+      // answer, because `list` probes the rows it touches.
+      client: {
+        available: false,
+        getTerminal: async (id: string) => terminalInfo({
+          id, status: id === 'w1:p4' ? 'working' : 'idle',
+        }),
+      },
       deps: { getSessionFile: () => sessionFile, getCwd: () => repo },
     });
     try {
       await fire(pi, 'session_start', { reason: 'reload' }, {});
       const text = (await runSubagent(pi, { action: 'list' }, repo)).content[0]!.text;
       assert.doesNotMatch(text, /pruned worker/, 'a closed task was a decision: it is not listed');
-      assert.match(text, /w1:p8 \[idle\] \(task · persistent, settled; action send revives\) settled worker/);
-      assert.match(text, /w1:p4 \[running[^\n]*live worker/);
+      assert.match(text, /w1:p8 \[idle\] \(task · persistent\) settled worker/);
+      assert.match(text, /w1:p4 \[running\] \(task · persistent\) live worker/);
+    } finally {
+      await root.fiber.dispose();
+    }
+  } finally {
+    home.dispose();
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('subagent plugin: eleven settlements prune nothing, the oldest still closes', async () => {
+  // Records are never pruned by count or age: twelve settled tasks all survive a reload, and the
+  // oldest one still closes by the ref `list` printed.
+  const repo = mkdtempSync(join(tmpdir(), 'piher-no-tail-'));
+  mkdirSync(join(repo, '.git'), { recursive: true });
+  const home = new TempHome('piher-no-tail-');
+  try {
+    const stamp = '2026-01-04T00-00-00-000Z_dddddddd-0000-4000-8000-000000000000.jsonl';
+    const sessionFile = join(home.dir('sessions'), stamp);
+    seedTaskDocuments(sessionFile, Array.from({ length: 12 }, (_, i) => ({
+      taskId: `settle-${i}`, paneId: `p${i}`, cwd: repo, description: `settled worker ${i}`,
+      createdAt: i, consumedAt: 1000 + i,
+    })));
+    const { root, pi } = await mountSubagent({
+      client: { listTerminals: async () => [] },
+      deps: { getSessionFile: () => sessionFile, getCwd: () => repo },
+    });
+    try {
+      await fire(pi, 'session_start', { reason: 'reload' }, {});
+      const text = (await runSubagent(pi, { action: 'list' }, repo)).content[0]!.text;
+      assert.equal(text.split('\n').length, 12, 'every settled row survives the reload');
+      // No document the suite wrote carries a status field: liveness is observed, never stored.
+      const dir = repoTasksDir(repo)!;
+      for (const name of readdirSync(dir)) {
+        const parsed: unknown = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+        for (const row of parseTaskDocument(parsed).rows) assert.ok(!('status' in row));
+      }
+      const closed = await runSubagent(pi, { action: 'close', agentId: 'p0' }, repo);
+      assert.match(closed.content[0]!.text, /closed — pane and tab gone/);
+      assert.ok(readTaskRecord(repo, 'settle-0')?.closedAt !== null, 'the oldest row closes');
     } finally {
       await root.fiber.dispose();
     }
@@ -459,18 +484,18 @@ test('subagent plugin: a restored row answers the ref `list` printed, and its cl
       tabId: '',
       cwd: repo,
       description: 'T2 8A.2 shared escalation log',
-      status: 'consumed',
       createdAt: 5,
       consumedAt: 6,
     }]);
     const { root, pi } = await mountSubagent({
+      client: { getTerminal: async (id: string) => terminalInfo({ id, status: 'idle' }) },
       tasks: [taskRow({ taskId: 'live-1', paneId: 'w1:p4', cwd: repo, description: 'live worker' })],
       deps: { getSessionFile: () => sessionFile, getCwd: () => repo },
     });
     try {
       await fire(pi, 'session_start', { reason: 'reload' }, {});
       const listed = (await runSubagent(pi, { action: 'list' }, repo)).content[0]!.text;
-      assert.match(listed, /t2-8a-2-shared-escalatio@t195 \[idle\]/, 'list offers the restored row');
+      assert.match(listed, /t2-8a-2-shared-escalatio@t195 \[idle\] \(task · persistent\)/);
       // The combined ref spawn prints is what a master copies back, and it used to answer "unknown".
       const closed = await runSubagent(pi, { action: 'close', agentId: 't2-8a-2-shared-escalatio@t195' }, repo);
       assert.match(closed.content[0]!.text, /Subagent t2-8a-2-shared-escalatio@t195 closed/);
@@ -536,13 +561,13 @@ test('subagent plugin: close records the decision even when the memory row is al
   mkdirSync(join(repo, '.git'), { recursive: true });
   try {
     seedTaskDocuments(null, [{
-      taskId: 'task-idem', description: 'already closed', status: 'consumed', paneId: 'pGone',
+      taskId: 'task-idem', description: 'already closed', paneId: 'pGone',
       createdAt: 1, consumedAt: 2, kind: 'worker', cwd: repo,
       tabId: 't1', tabName: 'w', lifecycle: 'persistent',
     }]);
     const { root, pi } = await mountSubagent({
       client: { listTerminals: async () => [] },
-      tasks: [taskRow({ paneId: 'pGone', taskId: 'task-idem', cwd: repo, status: 'closed' })],
+      tasks: [taskRow({ paneId: 'pGone', taskId: 'task-idem', cwd: repo, closedAt: 1 })],
     });
     try {
       const res = await runSubagent(pi, { action: 'close', agentId: 'task-idem' }, repo);
@@ -567,14 +592,14 @@ test('subagent plugin: a task closed in another session does not come back as se
   try {
     const sessionFile = join(home.dir('sessions'), '2026-01-03T00-00-00-000Z_cccccccc-0000-4000-8000-000000000000.jsonl');
     seedTaskDocuments(sessionFile, [{
-      taskId: 'task-closed', description: 'already handled', status: 'running', paneId: 'pGone',
+      taskId: 'task-closed', description: 'already handled', paneId: 'pGone',
       createdAt: Date.now() - 60_000, closedAt: Date.now() - 30_000, kind: 'worker',
       cwd, tabId: 't1', tabName: 'w', lifecycle: 'persistent',
     }]);
     const { root, pi } = await mountSubagent({
       client: { listTerminals: async () => [] },
       // The session holds a settled copy of the same task; the restore retires it from the record.
-      tasks: [taskRow({ paneId: 'pGone', taskId: 'task-closed', tabId: 't1', tabName: 'w', status: 'settled', cwd })],
+      tasks: [taskRow({ paneId: 'pGone', taskId: 'task-closed', tabId: 't1', tabName: 'w', cwd })],
       deps: { getSessionFile: () => sessionFile, getCwd: () => cwd },
     });
     try {
@@ -599,7 +624,7 @@ test('subagent plugin: resume refuses a record closed before its report was cons
   try {
     seedTaskDocuments(null, [{
       taskId, paneId: 'pGone', cwd: repo, description: 'closed before report',
-      status: 'settled', createdAt: 1, closedAt: 2, consumedAt: null,
+      createdAt: 1, closedAt: 2, consumedAt: null,
     }]);
     const { root, pi } = await mountSubagent({ deps: { getCwd: () => repo } });
     try {
@@ -624,14 +649,14 @@ test('subagent plugin: send to a disk-closed task never revives a new generation
   const seed = (closedAt: number | null): void => {
     seedTaskDocuments(null, [{
       taskId, paneId: 'pDead', cwd: repo, description: 'closed elsewhere',
-      status: 'running', createdAt: 1, closedAt, consumedAt: null,
+      createdAt: 1, closedAt, consumedAt: null,
     }]);
   };
   try {
     seed(null);
     const { root, pi } = await mountSubagent({
       client: { getTerminal: async () => null },
-      tasks: [taskRow({ paneId: 'pDead', taskId, cwd: repo, status: 'running' })],
+      tasks: [taskRow({ paneId: 'pDead', taskId, cwd: repo })],
       deps: { getCwd: () => repo },
     });
     try {
@@ -658,7 +683,7 @@ test('subagent plugin: close reclaims a running row whose pane is already gone',
       kill: async (id: string) => { retired.push(id); },
       remove: async (id: string) => { retired.push(id); },
     },
-    tasks: [taskRow({ paneId: 'pZombie', taskId: 'task-zombie', tabId: 't1', tabName: 'w', status: 'running' })],
+    tasks: [taskRow({ paneId: 'pZombie', taskId: 'task-zombie', tabId: 't1', tabName: 'w' })],
   });
   try {
     // Outside any repository the decision has nowhere to land, so the test checkout stays clean.
@@ -677,7 +702,7 @@ test('subagent plugin: send to a live pane with a dead pipe fails fast and says 
   // while the message never arrived (a real session spent 92 s on it, twice).
   const { root, pi } = await mountSubagent({
     client: { getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'working' }) },
-    tasks: [taskRow({ paneId: 't-dead-pipe', taskId: 'task-dead-pipe', status: 'running', cwd: '/test/no-pipe' })],
+    tasks: [taskRow({ paneId: 't-dead-pipe', taskId: 'task-dead-pipe', cwd: '/test/no-pipe' })],
   });
   try {
     const startedAt = Date.now();
@@ -702,7 +727,7 @@ test('subagent plugin: retry re-sends the stored prompt instead of asking the ma
     assert.equal(readTaskPrompt(taskId), 'the original brief');
     const { root, pi } = await mountSubagent({
       client: { getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'idle' }) },
-      tasks: [taskRow({ paneId: 't-retry', taskId, status: 'running', cwd: '/test/no-pipe' })],
+      tasks: [taskRow({ paneId: 't-retry', taskId, cwd: '/test/no-pipe' })],
     });
     try {
       // No pipe server behind that cwd: the send path reports the dead channel, which proves the stored
@@ -732,7 +757,7 @@ test('subagent plugin: retry on a spent one-shot spawns the same brief instead o
     const { root, pi } = await mountSubagent({
       client: { available: false },
       tasks: [taskRow({
-        paneId: 't-shot', taskId, status: 'consumed', lifecycle: 'one-shot', kind: 'reviewer',
+        paneId: 't-shot', taskId, consumedAt: 5, lifecycle: 'one-shot', kind: 'reviewer',
         description: 'review X', cwd: '/test/checkout',
       })],
     });
@@ -758,7 +783,9 @@ test('subagent plugin: retry works from a closed row too, by starting a new work
     saveTaskPrompt(taskId, 'a brief');
     const { root, pi } = await mountSubagent({
       client: { available: false },
-      tasks: [taskRow({ paneId: 't-closed', taskId, status: 'closed', kind: 'reviewer', description: 'review Y' })],
+      tasks: [taskRow({
+        paneId: 't-closed', taskId, closedAt: 5, kind: 'reviewer', description: 'review Y',
+      })],
     });
     try {
       const text = await runSubagentRejects(pi, { action: 'retry', agentId: 't-closed' });
@@ -786,7 +813,7 @@ test('subagent plugin: close reclaims a running row whose pane has no turn in fl
         kill: async (id: string) => { retired.push(id); },
         remove: async (id: string) => { retired.push(id); },
       },
-      tasks: [taskRow({ paneId: 'p-idle', taskId: 'task-idle', status: 'running', consumedAt: null, cwd: repo })],
+      tasks: [taskRow({ paneId: 'p-idle', taskId: 'task-idle', cwd: repo })],
     });
     try {
       const res = await runSubagent(pi, { action: 'close', agentId: 'p-idle' }, repo);
@@ -809,10 +836,12 @@ test('subagent plugin: close refuses a running worker with a pointer at interrup
       kill: async (id: string) => { retired.push(`kill:${id}`); },
       remove: async (id: string) => { retired.push(`remove:${id}`); },
     },
-    tasks: [taskRow({ paneId: 'p-busy', taskId: 'task-busy', status: 'running', consumedAt: null })],
+    tasks: [taskRow({ paneId: 'p-busy', taskId: 'task-busy' })],
   });
   try {
-    assert.match(await runSubagentRejects(pi, { action: 'close', agentId: 'p-busy' }), /still running[\s\S]*interrupt/);
+    const refused = await runSubagentRejects(pi, { action: 'close', agentId: 'p-busy' });
+    assert.match(refused, /still running[\s\S]*interrupt/);
+    assert.match(refused, /once it has finished/, 'S12: no turn is ever called settled');
     assert.deepEqual(retired, [], 'a refused close touches nothing');
   } finally {
     await root.fiber.dispose();
@@ -824,13 +853,15 @@ test('subagent plugin: interrupt names the way back for a settled and for a clos
     // Both refusals happen before anything touches a pane: no pipe, no core calls.
     client: { available: false },
     tasks: [
-      taskRow({ paneId: 'p-settled', taskId: 'task-settled', status: 'settled', consumedAt: 1 }),
-      taskRow({ paneId: 'p-closed', taskId: 'task-closed', status: 'closed' }),
+      taskRow({ paneId: 'p-settled', taskId: 'task-settled', consumedAt: 1 }),
+      taskRow({ paneId: 'p-closed', taskId: 'task-closed', closedAt: 1 }),
     ],
   });
   try {
     const settled = await runSubagentRejects(pi, { action: 'interrupt', agentId: 'p-settled' });
     assert.match(settled, /no running turn/, 'a settled worker has no turn to stop, and says so');
+    assert.match(settled, /\(its pane is gone\)/, 'the refusal names what it observed');
+    assert.match(settled, /action "close"/, 'and points at close, not a wait');
     assert.match(settled, /resume[\s\S]*task-settled/, 'the refusal names resume(taskId)');
     const closed = await runSubagentRejects(pi, { action: 'interrupt', agentId: 'p-closed' });
     assert.match(closed, /closed[\s\S]*resume/, 'a closed worker points at resume');
@@ -848,7 +879,7 @@ test('subagent plugin: close reclaims a finished worker and keeps its task resum
       kill: async (id: string) => { retired.push(`kill:${id}`); },
       remove: async (id: string) => { retired.push(`remove:${id}`); },
     },
-    tasks: [taskRow({ paneId: 'p-done', taskId: 'task-done', status: 'consumed', consumedAt: 5 })],
+    tasks: [taskRow({ paneId: 'p-done', taskId: 'task-done', consumedAt: 5 })],
   });
   try {
     // Outside any repository the decision has nowhere to land, so the test checkout stays clean.
@@ -881,8 +912,8 @@ test('subagent plugin: list shows every row with its live state', async () => {
   });
   try {
     const lines = (await runSubagent(pi, { action: 'list' })).content[0]!.text.split('\n');
-    assert.equal(lines[0], 'p-1 [running working] (task · persistent) Worker 1');
-    assert.equal(lines[1], 'p-2 [running working] (task · persistent) Worker 2');
+    assert.equal(lines[0], 'p-1 [running] (task · persistent) Worker 1');
+    assert.equal(lines[1], 'p-2 [running] (task · persistent) Worker 2');
   } finally {
     await root.fiber.dispose();
   }
@@ -911,13 +942,13 @@ test('subagent plugin: a closed memory row is not resurrected from its record', 
   const repo = mkdtempSync(join(tmpdir(), 'piher-no-resurrect-'));
   mkdirSync(join(repo, '.git'), { recursive: true });
   seedTaskDocuments(null, [{
-    taskId: 'task-ended', description: 'ended worker', status: 'consumed', paneId: 'pGone',
+    taskId: 'task-ended', description: 'ended worker', paneId: 'pGone',
     createdAt: 10, consumedAt: 20, kind: 'worker', cwd: repo,
     tabId: 't1', tabName: 'w', lifecycle: 'persistent',
   }]);
   const { root, pi } = await mountSubagent({
     client: { listTerminals: async () => [] },
-    tasks: [taskRow({ paneId: 'pGone', taskId: 'task-ended', cwd: repo, status: 'closed' })],
+    tasks: [taskRow({ paneId: 'pGone', taskId: 'task-ended', cwd: repo, closedAt: 20 })],
   });
   try {
     const text = (await runSubagent(pi, { action: 'list' }, repo)).content[0]!.text;

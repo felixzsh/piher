@@ -228,7 +228,9 @@ test('spawn action: an acknowledgement now, the prompt later, the report as a no
       assert.deepEqual(running.map((s) => s.description).sort(), ['long probe', 'probe']);
       assert.ok(running.some((s) => s.paneId === 'p2' && s.description === 'long probe'));
       const listed = (await runSubagent(env.pi, { action: 'list' }, env.cwd)).content[0]!.text;
-      assert.match(listed, /p2 \[running/);
+      // The harness panes never report an agent status, so the contract reads `no report` here —
+      // the row is still listed as actionable, which is what this subtest proves.
+      assert.match(listed, /p2 \[no report/);
       assert.match(listed, /long probe/);
     });
 
@@ -367,7 +369,7 @@ test('send/resume: short prefixes resolve at four characters and report ambiguit
     seedTaskDocuments(null, [{
       taskId: ambiguousTaskId, kind: 'task', paneId: 'p3', tabId: 't0', cwd: env.cwd,
       description: 'ambiguous conflict task', sessionFile: null, launchCommand: ['node', 'cli.js'],
-      status: 'settled', createdAt: Date.now() + 10,
+      createdAt: Date.now() + 10,
     }]);
     env.port.current?.consumeReply(String(resumed.details?.paneId), 'done');
     const ambiguous = await runSubagentRejects(env.pi, { action: 'resume', taskId: short4 }, env.cwd);
@@ -593,8 +595,9 @@ test('tasks: a reload restores two workers from the records, and both close by r
     const piBefore = env.pi;
 
     // A master restart: the branch is empty, so whatever `list` shows comes from the view
-    // and the records alone.
+    // and the records alone. The old panes are gone with the old session, so core lists nothing.
     await env.remount!('reload');
+    env.paneGone = true;
     const text = (await runSubagent(env.pi, { action: 'list' }, env.cwd)).content[0]!.text;
     const refs = text.split('\n').map((line) => line.split(' ')[0]!);
     assert.equal(refs.length, 2, `a reload lists both workers: ${text}`);

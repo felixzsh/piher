@@ -604,7 +604,6 @@ export function createSpawnAction(h: SpawnActionHost) {
           consumedAt: null,
           reportDelivered: null,
         },
-        status: 'running',
       };
       // A spawn's acknowledgement is the whole answer: what follows happens off the caller's turn.
       // Spawn writes the record and the view, then answers (domain: spawn reads nothing).

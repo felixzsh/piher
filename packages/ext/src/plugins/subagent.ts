@@ -12,7 +12,6 @@ import { CORE_REQUIRED, type CoreClientLike, type CoreEnv } from '../core-client
 import {
   Semaphore,
   SUBAGENT_OUTPUT_SCHEMA,
-  agoText,
   attachSubagentStructuredContent,
   buildAliveNotice,
   buildLaunchLine,
@@ -32,11 +31,14 @@ import {
 } from '../subagent-core.ts';
 import {
   applyReportedSessionFile,
+  describeTaskState,
+  isActionable,
   isClosed,
   isSpent,
   taskForPane,
   taskRef,
   type TaskEntry,
+  type TaskObservation,
   type TaskRow,
 } from '../task-row.ts';
 import {
@@ -71,7 +73,7 @@ import {
   type CheckoutSpace,
 } from '../worktree.ts';
 import { createPoller } from '../subagent-poller.ts';
-import { createGcController, restoreTasks, retirePane, seedForkView, sweepZombieTasks } from '../subagent-gc.ts';
+import { createGcController, restoreTasks, retirePane, seedForkView } from '../subagent-gc.ts';
 import { trace, traceRole } from '../trace.ts';
 import { createSessionIo, executeSubagentOutput, type SubagentOutputCursor } from '../subagent-session.ts';
 import type { WorkerWidgetRow } from '../tree-view.ts';
@@ -196,6 +198,19 @@ export default function subagentPlugin(ctx: Context): void {
   /* In-memory session view: the task ids this session delegated, in order (S4). Spawn appends;
    * without a transcript path it stays in memory only (S25). */
   const viewIds: string[] = [];
+  /* Observation cache: the last liveness core reported per task. It feeds only the state text
+   *  surfaces print; an action never reads it to decide (S26). */
+  const observations = new Map<string, TaskObservation>();
+
+  /** Record one probe result for the state text. Stale entries mislabel, never authorize (S26). */
+  function noteObservation(taskId: string, probe: AliveProbe): void {
+    observations.set(taskId, {
+      paneExists: probe.paneExists,
+      agentStatus: probe.agentStatus,
+      lastActivityMs: probe.lastActivityMs,
+      at: Date.now(),
+    });
+  }
   const outputCursors = new Map<string, SubagentOutputCursor>();
   /** Read counters shown in `subagent output` headers (one monotonic number per worker). */
   const outputRevisions = new Map<string, number>();
@@ -220,6 +235,7 @@ export default function subagentPlugin(ctx: Context): void {
   function dropTask(taskId: string): void {
     const entry = tasks.get(taskId);
     if (entry) deleteTaskRecord(entry.cwd, taskId);
+    observations.delete(taskId);
     const at = viewIds.indexOf(taskId);
     if (at >= 0) {
       viewIds.splice(at, 1);
@@ -231,7 +247,6 @@ export default function subagentPlugin(ctx: Context): void {
     client,
     tasks,
     panes,
-    writeRecord,
     restoreCwd: () => d.getCwd?.() ?? process.cwd(),
     sessionFile: () => d.getSessionFile?.() ?? null,
     viewIds,
@@ -252,7 +267,7 @@ export default function subagentPlugin(ctx: Context): void {
    *  under the survivor takes its tab away while the worker keeps running in it. */
   function checkoutInUseByAnother(entry: TaskEntry, path: string): boolean {
     for (const other of tasks.values()) {
-      if (other === entry || other.status === 'closed') continue;
+      if (other === entry || isClosed(other)) continue;
       if (other.worktree?.path === path) return true;
     }
     return false;
@@ -289,26 +304,28 @@ export default function subagentPlugin(ctx: Context): void {
       writeRecord(entry);
     },
     listRunningSubs() {
+      // The widget shows the tasks still awaiting a report. The state text comes from the last
+      // observation, defaulting to the zero-observation base a fresh spawn shares (S26).
       return [...tasks.values()]
-        .filter((s) => s.status === 'running')
+        .filter((s) => isActionable(s) && s.gen.consumedAt === null)
         .map((s): WorkerWidgetRow => ({
           paneId: s.gen.paneId,
           slug: s.gen.slug,
           role: s.kind,
-          state: s.status,
+          state: describeTaskState(s, observations.get(s.taskId)),
           startedAt: s.createdAt,
           description: s.description,
         }));
     },
     listRows() {
       return [...tasks.values()]
-        .filter((s) => s.status !== 'closed')
+        .filter((s) => !isClosed(s))
         .map((s) => ({
           paneId: s.gen.paneId,
           slug: s.gen.slug,
           description: s.description,
           kind: s.kind,
-          status: s.status,
+          status: describeTaskState(s, observations.get(s.taskId)),
           settledAt: s.gen.consumedAt ?? null,
         }));
     },
@@ -322,8 +339,7 @@ export default function subagentPlugin(ctx: Context): void {
     },
     consumeReply(paneId, _outcome) {
       const entry = taskForPane(tasks, panes, paneId);
-      if (!entry || entry.status === 'consumed' || entry.status === 'closed') return;
-      entry.status = 'consumed';
+      if (!entry || entry.gen.consumedAt !== null || isClosed(entry)) return;
       entry.gen.consumedAt = Date.now();
       writeRecord(entry);
       // S54: a one-shot worker exits right after this push; its pane goes now, not at the GC TTL.
@@ -349,6 +365,10 @@ export default function subagentPlugin(ctx: Context): void {
     tasks,
     panes,
     writeRecord,
+    noteObservation: (paneId, obs) => {
+      const taskId = panes.get(paneId);
+      if (taskId) noteObservation(taskId, obs);
+    },
     blockedGateNotified,
     session,
     injectNotice,
@@ -361,8 +381,7 @@ export default function subagentPlugin(ctx: Context): void {
     client,
     env,
     tasks,
-    panes,
-    writeRecord,
+    noteObservation,
     terminalState,
     noticePending: d.noticePending,
     checkoutSpace,
@@ -370,14 +389,18 @@ export default function subagentPlugin(ctx: Context): void {
   });
   gc.startTicker(ctx);
   scoped.on('turn_start', () => gc.onTurnStart());
-  const { readAskFlag, probeAlive } = session;
+  const { probeAlive } = session;
   const { spawnPaneInTaskTab, launchParts, approveFor, waitSubReady, findExistingPane } = spawn;
 
   /** P0-2: re-arm pollers for live running panes after a master restart, or settle notices stop arriving
    * and ledger rows stay 'running'. The `recover-*` requestId is never echoed by a worker, so this claim wins. */
+  /** Re-arm settlement watches after a restart: only rows still awaiting a report whose pane core
+   *  still lists. A delivered report needs no watch; a closed task is final; a gone pane is
+   *  `resume` work, not a re-arm. The liveness lookup decides — never a stored status. */
   async function recoverRunningPollers(via: string): Promise<void> {
     if (!client.available) return;
-    const running = [...tasks.values()].filter((s) => s.status === 'running' && !pollers.has(s.gen.paneId));
+    const running = [...tasks.values()].filter((s) =>
+      isActionable(s) && s.gen.consumedAt === null && !pollers.has(s.gen.paneId));
     if (running.length === 0) return;
     let liveTerminalIds: ReadonlySet<string>;
     try {
@@ -387,7 +410,8 @@ export default function subagentPlugin(ctx: Context): void {
     }
     const recovered: string[] = [];
     for (const entry of running) {
-      if (!liveTerminalIds.has(entry.gen.paneId)) continue; // zombie sweep already settled those
+      // A gone pane is resume work, not a re-arm.
+      if (!liveTerminalIds.has(entry.gen.paneId)) continue;
       try {
         await startPoller(entry.gen.paneId, entry.cwd, entry.gen.startedAt, entry.description, `recover-${via}-${entry.gen.paneId}`);
         recovered.push(`${entry.gen.paneId} (${entry.description})`);
@@ -415,13 +439,11 @@ export default function subagentPlugin(ctx: Context): void {
     // configured override, else the process checkout.
     const ctxCwd = (eventCtx as { cwd?: string } | undefined)?.cwd;
     restoreTasks(board, reason ?? 'session_start', typeof ctxCwd === 'string' ? ctxCwd : undefined);
-    await sweepZombieTasks(board);
     await recoverRunningPollers('session_start');
   });
   scoped.on('session_tree', async (_event: unknown, eventCtx: unknown) => {
     const ctxCwd = (eventCtx as { cwd?: string } | undefined)?.cwd;
     restoreTasks(board, 'session_tree', typeof ctxCwd === 'string' ? ctxCwd : undefined);
-    await sweepZombieTasks(board);
     await recoverRunningPollers('session_tree');
   });
 
@@ -435,7 +457,7 @@ export default function subagentPlugin(ctx: Context): void {
     const paneId = [...panes.keys()].find((id) => errText.includes(id));
     if (!paneId) return;
     const entry = taskForPane(tasks, panes, paneId);
-    if (!entry || entry.status === 'settled' || entry.status === 'consumed') return;
+    if (!entry || isClosed(entry) || isSpent(entry)) return;
     const probe = await probeAlive(paneId, entry.cwd);
     if (!isAlive(probe, Date.now())) return; // keep the original error only when the agent is truly dead
     // Move a live agent to the poller so its eventual result replaces the false error.
@@ -513,7 +535,6 @@ export default function subagentPlugin(ctx: Context): void {
       launchCommand: [buildLaunchLine(argv)],
       startedAt: Date.now(),
     });
-    entry.status = 'running';
     // S3: only the generation is replaced — `createdAt` is the task's durable fact, and the new
     // generation's start rides `gen.startedAt` above.
     // A revived row is reclaimed at settlement too when its role still declares one-shot (S54).
@@ -584,8 +605,9 @@ export default function subagentPlugin(ctx: Context): void {
    * state. They are different: a closed task is final, a vanished pane is unfinished work.
    */
   /** Returns whether a pane was actually made: only a fresh pane is still booting. */
+  /** Bring back a worker whose pane is gone but whose task is still actionable. The probe decides;
+   *  a closed or spent task never reaches here (`send` refuses it first, `reviveEntry` guards). */
   async function ensureLive(entry: TaskEntry): Promise<boolean> {
-    if (entry.status === 'closed') return false; // final: `send` on it is refused by spentText
     let alive = false;
     try {
       alive = (await probeAlive(entry.gen.paneId, entry.cwd)).paneExists;
@@ -609,16 +631,39 @@ export default function subagentPlugin(ctx: Context): void {
       }
     }
     if (!rawTaskId) return toolError('missing taskId for resume (see action list).');
-    const running = newestPerTaskId([...tasks.values()].filter((s) => s.status === 'running'));
-    const live = resolveTaskIdPrefix(rawTaskId, running.keys());
-    const liveError = taskIdResolutionError(live, 'task id', rawTaskId);
-    if (liveError) return toolError(liveError);
-    if (live.kind === 'resolved') {
-      const entry = running.get(live.taskId)!;
-      return {
-        content: [{ type: 'text', text: `task ${entry.taskId} is already running as pane ${entry.gen.paneId}. Use action send or output; resume is only for a collected task whose pane is gone.` }],
-        details: { paneId: entry.gen.paneId, taskId: entry.taskId, alreadyRunning: true },
-      };
+    // A task with a turn in flight is not resumed — use send or output. The probe decides (S26).
+    // A delivered report ends the turn, so consumed rows skip the probe; a live but silent pane
+    // with an active settlement watch still counts as in flight, so resume never doubles it.
+    {
+      const live = resolveTaskIdPrefix(rawTaskId, tasks.keys());
+      if (live.kind === 'resolved') {
+        const entry = tasks.get(live.taskId)!;
+        let running = false;
+        if (entry.gen.consumedAt === null) {
+          try {
+            const probe = await probeAlive(entry.gen.paneId, entry.cwd);
+            noteObservation(entry.taskId, probe);
+            const silent = probe.agentStatus === null || probe.agentStatus === 'unknown';
+            running = probe.paneExists && (probe.agentStatus === 'working'
+              || probe.agentStatus === 'blocked'
+              || (silent && pollers.has(entry.gen.paneId)));
+          } catch {
+            running = false; // a failed probe never strands a resume; the revive path re-checks
+          }
+        }
+        if (running) {
+          const busyText =
+            `task ${entry.taskId} is already running as pane ${entry.gen.paneId}. `
+            + 'Use action send or output; resume is only for a collected task whose pane is gone.';
+          return {
+            content: [{ type: 'text', text: busyText }],
+            details: { paneId: entry.gen.paneId, taskId: entry.taskId, alreadyRunning: true },
+          };
+        }
+      } else {
+        const liveError = taskIdResolutionError(live, 'task id', rawTaskId);
+        if (liveError) return toolError(liveError);
+      }
     }
     // S41: one task directory per repository, so resume resolves against the current one — never a
     // sweep of other checkouts this master happened to spawn into.
@@ -665,7 +710,6 @@ export default function subagentPlugin(ctx: Context): void {
           tabName: latest.gen.tabName || tabNameForTask(latest.description),
           consumedAt: null,
         },
-        status: 'running',
       };
       // One row per task: the revived generation replaces whatever the restore seeded, and stale
       // pane ids for it go so the index never points at the dead generation.
@@ -790,19 +834,16 @@ export default function subagentPlugin(ctx: Context): void {
         steer: true,
       }),
       ok: (_res, reqId) => {
-        // An exception between status='running' and startPoller would leave a ghost running entry
-        // with no poller (never settles, skipped by GC): roll back the status on failure.
-        const prevStatus = entry.status;
-        entry.status = 'running';
-        // A follow_up re-arms the row: keeping the old consume time would make GC and the checkout
-        // sweep read it as finished while a turn is in flight.
+        // A follow_up re-arms the row: keeping the old consume time would read as finished while
+        // a turn is in flight. Roll it back if no poller takes over.
+        const prevConsumedAt = entry.gen.consumedAt;
         entry.gen.consumedAt = null;
         writeRecord(entry);
         try {
           lastRequestIdByPane.set(entry.gen.paneId, reqId);
           startPoller(entry.gen.paneId, entry.cwd, Date.now(), entry.description, reqId);
         } catch (inner) {
-          entry.status = prevStatus;
+          entry.gen.consumedAt = prevConsumedAt;
           writeRecord(entry);
           throw inner;
         }
@@ -826,7 +867,7 @@ export default function subagentPlugin(ctx: Context): void {
     // Every kind of worker retries: a closed row is final and a spent one-shot has no session left to
     // revive, so those two get a new worker with the same brief, role and checkout. The rest keep
     // their own pane or session.
-    if (entry.status === 'closed' || (entry.status === 'consumed' && entry.lifecycle === 'one-shot')) {
+    if (isClosed(entry) || isSpent(entry)) {
       return executeSubagentSpawn({
         prompt,
         description: entry.description,
@@ -838,9 +879,10 @@ export default function subagentPlugin(ctx: Context): void {
     if (spentText(entry) !== null) {
       // A collected task whose pane is gone: revive the same session, then deliver the stored prompt.
       await executeSubagentResume({ ...params, taskId: entry.taskId }, toolCtx);
-      const revived = newestPerTaskId([...tasks.values()].filter((s) => s.taskId === entry.taskId && s.status === 'running'));
-      const target = revived.get(entry.taskId);
-      if (!target) return toolError(`Error: retry could not revive task ${entry.taskId}.`);
+      const target = tasks.get(entry.taskId);
+      if (!target || isClosed(target) || isSpent(target)) {
+        return toolError(`Error: retry could not revive task ${entry.taskId}.`);
+      }
       return executeSubagentSend({ ...params, agentId: target.gen.paneId, message: prompt }, toolCtx);
     }
     return executeSubagentSend({ ...params, message: prompt }, toolCtx);
@@ -848,19 +890,34 @@ export default function subagentPlugin(ctx: Context): void {
 
   async function executeSubagentInterrupt(params: ToolParams, toolCtx: unknown) {
     const { entry } = targetOf(params, toolCtx);
-    // Interrupt stops the current turn and nothing else, so a worker with no turn in flight has
-    // nothing to stop. Both refusals name the way back: a no-op that also hides `resume` reads as
-    // success and strands the caller.
-    if (entry.status === 'closed') {
+    // Interrupt stops the current turn and nothing else. A closed task is final; otherwise the
+    // probe decides — a worker with no turn in flight has nothing to stop, and naming `close`
+    // points at the natural next step instead of a wait. A probe that fails never refuses: the
+    // pipe attempt itself is the honest test.
+    if (isClosed(entry)) {
       return toolError(
         `Error: subagent ${taskRef(entry.gen)} is closed — its pane and tab are gone, so there is no turn to interrupt. action "resume" with taskId ${entry.taskId} revives its session in a new pane.`,
       );
     }
-    if (entry.status !== 'running') {
-      // The natural move for a finished worker is to reclaim it; a pointer that omits `close` sends the
-      // master looking for a turn that will never come back.
+    let probe: AliveProbe;
+    try {
+      probe = await probeAlive(entry.gen.paneId, entry.cwd);
+    } catch {
+      probe = { paneExists: true, agentStatus: null, lastActivityMs: null };
+    }
+    noteObservation(entry.taskId, probe);
+    const inFlight = probe.paneExists
+      && (probe.agentStatus === 'working' || probe.agentStatus === 'blocked');
+    if (!inFlight) {
+      const observed = !probe.paneExists
+        ? 'its pane is gone'
+        : `its agent reports ${probe.agentStatus ?? 'no turn'}`;
       return toolError(
-        `Error: subagent ${taskRef(entry.gen)} has no running turn (status: ${entry.status}) — interrupt stops the current turn only, and this worker already finished its last one. Close it with action "close" if its work is accepted, send it a follow-up with action "send" if its pane is still listed, or revive it with action "resume" and taskId ${entry.taskId}.`,
+        `Error: subagent ${taskRef(entry.gen)} has no running turn (${observed}) — interrupt stops `
+        + 'the current turn only, and there is nothing to stop. '
+        + 'Close it with action "close" if its work is accepted, send it a follow-up '
+        + 'with action "send" if its pane is still listed, or revive it with action "resume" '
+        + `and taskId ${entry.taskId}.`,
       );
     }
     return pipeAction(entry, {
@@ -879,30 +936,7 @@ export default function subagentPlugin(ctx: Context): void {
    *  running is refused with a pointer at `interrupt`, because a task must not vanish without a report. */
   async function executeSubagentClose(params: ToolParams, toolCtx: unknown) {
     const { entry } = targetOf(params, toolCtx);
-    if (entry.status === 'running') {
-      // A task must not disappear while someone could still report it. A pane that is provably gone
-      // cannot report anything, though — its row is a zombie the ledger would keep forever (a worker
-      // that stopped without a notice, seen from a session that was not the one that spawned it).
-      let live = true;
-      let finished = false;
-      try {
-        const probe = await probeAlive(entry.gen.paneId, entry.cwd);
-        live = probe.paneExists;
-        // A row can stay `running` after its turn ended (a settlement the poller missed). Refusing
-        // the close then strands the task forever: only a pane with a turn in flight is protected,
-        // and an unknown status is treated as in flight because core has not said otherwise.
-        finished = probe.agentStatus === 'idle' || probe.agentStatus === 'done' || probe.agentStatus === 'error';
-      } catch {
-        live = true; // a failed probe must not authorise the removal of a task
-      }
-      if (live && !finished) {
-        return toolError(
-          `Error: subagent ${taskRef(entry.gen)} is still running — close only reclaims a worker that already finished, and a task must not disappear without a report. Use action "interrupt" to stop its current turn (the pane and its session stay), then close it once it settles.`,
-        );
-      }
-      // Nothing to reclaim: fall through and record the decision, so `list` stops offering it.
-    }
-    if (entry.status === 'closed') {
+    if (isClosed(entry)) {
       // Memory can be closed while the record still holds no such decision (a close that happened
       // elsewhere, or a sweep). Record the decision here too, so the record says who ended it
       // instead of trailing off at `consumed`.
@@ -916,6 +950,31 @@ export default function subagentPlugin(ctx: Context): void {
         details: { paneId: entry.gen.paneId, taskId: entry.taskId, alreadyClosed: true },
       };
     }
+    // S14: a task must not disappear while someone could still report it. The probe decides for
+    // every row now that no stored status says otherwise: only a pane with a turn in flight is
+    // protected, and an unknown status is treated as in flight because core has not said otherwise.
+    // A failed probe must not authorise the removal of a task.
+    let live = true;
+    let finished = false;
+    try {
+      const probe = await probeAlive(entry.gen.paneId, entry.cwd);
+      noteObservation(entry.taskId, probe);
+      live = probe.paneExists;
+      finished = probe.agentStatus === 'idle'
+        || probe.agentStatus === 'done'
+        || probe.agentStatus === 'error';
+    } catch {
+      live = true;
+    }
+    if (live && !finished) {
+      return toolError(
+        `Error: subagent ${taskRef(entry.gen)} is still running — close only reclaims `
+        + 'a worker that already finished, and a task must not disappear without a report. '
+        + 'Use action "interrupt" to stop its current turn (the pane and its session stay), '
+        + 'then close it once it has finished.',
+      );
+    }
+    // Nothing to reclaim: fall through and record the decision, so `list` stops offering it.
     if (!client.available) return toolError(`subagent: ${CORE_REQUIRED}`);
     // S71: close is terminal for what piher created. The checkout goes first, because a dirty one is
     // a refusal that must leave the worker reachable. The record is resolved through the repository
@@ -931,7 +990,6 @@ export default function subagentPlugin(ctx: Context): void {
       checkoutLine = ` ${releasedCheckoutLine(entry.worktree, released.removed)};`;
     }
     await retirePane(client, entry.gen.paneId);
-    entry.status = 'closed';
     entry.closedAt = Date.now();
     // The record survives the pane: `resume` answers from it, so the decision is not lost.
     writeTaskRecord(recordCwd, entry);
@@ -941,46 +999,26 @@ export default function subagentPlugin(ctx: Context): void {
     };
   }
 
-  /** Live tasks; closed rows stay in memory so `close` answers them as final. What the session
-   *  works on is what the restore seeded from the view and the records — `list` reads memory. */
+  /** The session's actionable tasks (S13): a closed or spent row is never printed. Every row is
+   *  probed — the probe feeds the state text, and the cache keeps it for the widget (S26). */
   async function executeSubagentList() {
-    // Only work that is still the master's business: running, settled, or a result not yet read.
-    // A closed worker was a decision, and a one-shot whose result was consumed has delivered its
-    // verdict — listing either would spend the master's context on something it already handled.
-    const visible = (sub: TaskEntry): boolean => sub.status !== 'closed'
-      && !(sub.status === 'consumed' && sub.lifecycle === 'one-shot');
-    const byTask = new Map([...newestPerTaskId(tasks.values())].filter(([, sub]) => visible(sub)));
-    if (byTask.size === 0) {
+    const rows = [...tasks.values()].filter(isActionable);
+    if (rows.length === 0) {
       return { content: [{ type: 'text', text: 'No subagents started (from this session view).' }], details: {} };
     }
     const probes = new Map<string, AliveProbe>();
-    await Promise.all([...byTask.values()].map(async (sub) => {
-      if (sub.status === 'closed') return;
+    await Promise.all(rows.map(async (row) => {
       try {
-        probes.set(sub.gen.paneId, await probeAlive(sub.gen.paneId, sub.cwd));
-      } catch { /* best effort for display */ }
+        const probe = await probeAlive(row.gen.paneId, row.cwd);
+        probes.set(row.taskId, probe);
+        noteObservation(row.taskId, probe);
+      } catch { /* best effort: the cache below covers a failed probe */ }
     }));
-    const now = Date.now();
     const lines: string[] = [];
-    for (const sub of byTask.values()) {
-      const tabTag = sub.gen.tabName ? ` [tab: ${sub.gen.tabName}]` : '';
-      if (sub.status === 'consumed' || sub.status === 'settled') {
-        const life = sub.lifecycle === 'one-shot' ? 'one-shot' : 'persistent';
-        const advice = sub.lifecycle === 'one-shot' ? 'consumed at its next report' : 'action send revives';
-        lines.push(`${taskRef(sub.gen)} [idle] (${sub.kind} · ${life}, settled; ${advice})${tabTag} ${sub.description}`);
-        continue;
-      }
-      const state = 'running';
-      const probe = probes.get(sub.gen.paneId);
-      const statusTag = probe?.agentStatus ? ` ${probe.agentStatus}` : '';
-      const activityTag = probe?.lastActivityMs != null ? `, active ${agoText(probe.lastActivityMs, now)}` : '';
-      let gateTag = '';
-      if (probe?.agentStatus === 'blocked') {
-        const question = await readAskFlag(sub.gen.paneId);
-        gateTag = question ? ` — AWAITING HUMAN: "${question}"` : ' — AWAITING HUMAN decision';
-      }
-      const life = sub.lifecycle === 'one-shot' ? 'one-shot' : 'persistent';
-      lines.push(`${taskRef(sub.gen)} [${state}${statusTag}${activityTag}${gateTag}] (${sub.kind} · ${life})${tabTag} ${sub.description}`);
+    for (const row of rows) {
+      const cached = probes.get(row.taskId) ?? observations.get(row.taskId) ?? null;
+      const head = `${taskRef(row.gen)} [${describeTaskState(row, cached)}]`;
+      lines.push(`${head} (${row.kind} · ${row.lifecycle}) ${row.description}`);
     }
     return { content: [{ type: 'text', text: lines.join('\n') }], details: {} };
   }

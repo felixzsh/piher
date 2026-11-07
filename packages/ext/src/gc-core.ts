@@ -1,17 +1,21 @@
 /** Task-tab GC decisions (D29 rules as a pure function; no I/O, no pi/herdr). */
 export type GcEntryKind = string;
-export type GcEntryStatus = 'running' | 'settled' | 'consumed' | 'closed';
 
 export interface GcEntryLike {
   /** 'task' or a role name; legacy short/resident is a label only. */
   kind: GcEntryKind;
-  status: GcEntryStatus;
-  /** Consume timestamp (GC grace); closed rows keep the original value. */
+  /** Report-delivered time (GC grace); null while the turn is still the master's business. */
   consumedAt?: number | null;
+  /** Close decision time; a closed task is finished whatever else it says. */
+  closedAt?: number | null;
 }
 
-function isFinished(status: GcEntryStatus): boolean {
-  return status === 'consumed' || status === 'closed' || status === 'settled';
+/** A row is finished for its tab when the master ended it, or its report was delivered long
+ *  enough ago that the grace TTL elapsed. An undelivered report is still the master's business. */
+function isTabFinished(e: GcEntryLike, now: number, ttlMs: number): boolean {
+  if (e.closedAt != null) return true;
+  const consumedAt = e.consumedAt ?? 0;
+  return consumedAt > 0 && consumedAt < now - ttlMs;
 }
 
 /** Close a task tab only when every work pane finished, the grace TTL elapsed (`ttlMs=0` means never
@@ -23,15 +27,16 @@ export function shouldCloseTaskTab(opts: {
   now: number;
 }): boolean {
   if (opts.entries.length === 0) return false;
-  if (!opts.entries.every((e) => isFinished(e.status))) return false;
-  if (!opts.entries.every((e) => (e.consumedAt ?? 0) > 0 && (e.consumedAt ?? 0) < opts.now - opts.ttlMs)) return false;
+  if (!opts.entries.every((e) => isTabFinished(e, opts.now, opts.ttlMs))) return false;
   if (opts.paneStatuses.some((s) => s === 'blocked')) return false;
   if (!opts.paneStatuses.every((s) => s === 'idle' || s === 'done' || s === 'error' || s === 'unknown')) return false;
   return true;
 }
 
 /** Pane-level collection (orphan / compat path): consumed before the previous turn (grace so the
- *  settlement notice is still visible); a missing terminal → record closed (caller handles the write). */export function shouldClosePane(opts: {
+ *  settlement notice is still visible); a missing terminal is skipped by the caller, never closed.
+ */
+export function shouldClosePane(opts: {
   consumedAt: number | null;
   status: string | undefined;
   prevTurnStart: number;
@@ -85,12 +90,12 @@ export function decideCheckoutSpaces(opts: {
   const close: string[] = [];
   const remind: Array<{ path: string; since: number }> = [];
   for (const [path, rows] of byPath) {
-    if (rows.every((r) => r.status === 'closed')) {
+    if (rows.every((r) => r.closedAt != null)) {
       close.push(path);
       continue;
     }
     if (opts.ttlMs <= 0) continue;
-    if (!rows.every((r) => isFinished(r.status))) continue;
+    if (!rows.every((r) => r.closedAt != null || r.consumedAt != null)) continue;
     const since = Math.max(...rows.map((r) => r.consumedAt ?? 0));
     if (since <= 0 || since >= opts.now - opts.ttlMs) continue;
     if (since <= (opts.remindedAt?.get(path) ?? 0)) continue;
@@ -101,16 +106,19 @@ export function decideCheckoutSpaces(opts: {
 
 /** One line the master can act on. It names the decision, never a countdown: nothing closes by
  *  itself, and housekeeping never ends a window that still holds an idle worker. */
-/** Whether the channel heartbeat should ping this row at all. Only a worker with a turn in flight has a
- *  channel to lose: a settled row's pane may be exiting, and `unknown` means pi has not reported a state
- *  yet — the process is still booting and its pipe is seconds away. Announcing a loss in either case is
- *  noise the master has to read and act on. */
+/** Whether the channel heartbeat should ping this row at all. Only a worker with a turn in flight
+ *  has a channel to lose: a delivered report means the turn is over, and `unknown` means pi has
+ *  not reported a state yet — the process is still booting and its pipe is seconds away. Announcing
+ *  a loss in either case is noise the master has to read and act on. */
 export function planChannelCheck(input: {
-  rowStatus: string;
+  /** The master's decision stands: a closed task has no channel to lose. */
+  closed: boolean;
+  /** A delivered report means no turn is in flight, so there is no channel to lose either. */
+  consumed: boolean;
   /** What core reports for the pane; `undefined` when it does not list the terminal at all. */
   terminalStatus: string | undefined;
 }): 'skip' | 'ping' {
-  if (input.rowStatus !== 'running') return 'skip';
+  if (input.closed || input.consumed) return 'skip';
   if (input.terminalStatus === undefined) return 'skip';
   if (input.terminalStatus === 'unknown') return 'skip';
   return 'ping';

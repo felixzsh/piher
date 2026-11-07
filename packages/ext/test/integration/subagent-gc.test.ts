@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fakeWatch, fire, mountSubagent, taskRow, terminalInfo, type TaskSeed } from '../test-utils.ts';
+import {
+  fakeWatch, fire, mountSubagent, runSubagent, taskRow, terminalInfo, type TaskSeed,
+} from '../test-utils.ts';
 import type { TaskEntry } from '../../src/task-row.ts';
 import { checkoutSpaceId } from '../../src/worktree.ts';
 import type { TerminalInfo } from '../../src/core-client.ts';
@@ -17,7 +19,6 @@ const NOW = 1_000_000;
 const TTL = 600_000;
 const work = (over: Partial<GcEntryLike> = {}): GcEntryLike => ({
   kind: 'task',
-  status: 'consumed',
   consumedAt: NOW - TTL - 1000,
   ...over,
 });
@@ -27,10 +28,10 @@ test('shouldCloseTaskTab: closes only when every work pane finished and the grac
     shouldCloseTaskTab({ entries: [work(over)], paneStatuses, ttlMs: ms, now });
   assert.equal(tab({}, ['idle', 'unknown']), true);
   assert.equal(shouldCloseTaskTab({ entries: [], paneStatuses: ['idle'], ttlMs: TTL, now: NOW }), false, 'the main tab never closes');
-  assert.equal(tab({ status: 'running', consumedAt: null }, ['working']), false);
+  assert.equal(tab({ consumedAt: null }, ['working']), false, 'an undelivered report holds it');
   assert.equal(tab({ consumedAt: NOW - 1000 }, ['idle']), false, 'grace period');
-  assert.equal(tab({ kind: 'resident', status: 'settled' }, ['idle']), true, 'legacy resident is not exempt');
-  assert.equal(tab({ kind: 'advisor', status: 'running', consumedAt: null }, ['working']), false);
+  assert.equal(tab({ closedAt: NOW - TTL - 1000 }, ['idle']), true, 'a closed task needs no grace');
+  assert.equal(tab({ kind: 'advisor', consumedAt: null }, ['working']), false);
   assert.equal(tab({}, ['blocked']), false, 'a human gate keeps the tab');
   assert.equal(tab({}, ['working']), false);
 });
@@ -58,7 +59,7 @@ test('shouldClosePane: only a one-shot pane is reclaimed; a persistent worker is
 const pane = (id: string): TerminalInfo => terminalInfo({ id, status: 'idle', labels: { 'herdr.tab': 'tMAIN' } });
 const consumed = (paneId: string, cwd: string, over: TaskSeed = {}) => taskRow({
   paneId, taskId: `task-${paneId}`, tabId: 'tMAIN', tabName: 'main', cwd, description: 'pane-gc regression',
-  status: 'consumed', consumedAt: Date.now() - 120_000, createdAt: Date.now() - 150_000,
+  consumedAt: Date.now() - 120_000, createdAt: Date.now() - 150_000,
   lifecycle: 'one-shot', ...over,
 });
 
@@ -67,7 +68,7 @@ const consumed = (paneId: string, cwd: string, over: TaskSeed = {}) => taskRow({
 async function gcPass(
   liveTerminals: string[],
   tasks: TaskEntry[],
-): Promise<{ closed: string[]; subs: Array<{ paneId: string; status: TaskEntry['status'] }> }> {
+): Promise<{ closed: string[]; subs: Array<{ paneId: string; settledAt: number | null }> }> {
   const closed: string[] = [];
   const { root, pi, port } = await mountSubagent({
     client: {
@@ -87,30 +88,34 @@ async function gcPass(
 }
 
 test('GC pass: panes are reclaimed, tasks are not closed', async () => {  const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-'));
-  const { closed, subs } = await gcPass(['pAlive'], [consumed('pAlive', cwd), consumed('pGone', cwd)]);
+  const seeded = [consumed('pAlive', cwd), consumed('pGone', cwd)];
+  const { closed, subs } = await gcPass(['pAlive'], seeded);
   assert.deepEqual(closed, ['pAlive'], 'the pane is retired');
-  const byId = new Map(subs.map((s) => [s.paneId, s.status]));
-  // Housekeeping frees panes; only `close` ends a task. A consumed row keeps its result unread state.
-  assert.equal(byId.get('pAlive'), 'consumed');
-  assert.equal(byId.get('pGone'), 'consumed');
+  // Housekeeping frees panes; only `close` ends a task. Both rows stay listed with their facts.
+  assert.deepEqual(subs.map((s) => s.paneId).sort(), ['pAlive', 'pGone']);
+  for (const sub of subs) assert.ok(sub.settledAt !== null, 'delivery time is kept');
 });
 
 test('GC pass: the master terminal is never collected, whatever the registry claims', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-self-'));
   const { closed, subs } = await gcPass(['t0'], [consumed('t0', cwd)]); // t0 is the master itself
   assert.deepEqual(closed, [], 'kill must never target the master');
-  assert.equal(subs.find((s) => s.paneId === 't0')!.status, 'consumed', 'the row is left alone');
+  assert.ok(subs.some((s) => s.paneId === 't0'), 'the row is left alone');
 });
 
-test('tasks: startup settles zombie running rows whose terminal core no longer lists', async () => {
+test('tasks: a worker whose pane is gone is listed as actionable, not dropped', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'pane-gc-zombie-'));
-  const { root, port } = await mountSubagent({
+  const { root, pi } = await mountSubagent({
     client: { listTerminals: async () => [] },
-    tasks: [consumed('pZombie', cwd, { status: 'running', consumedAt: null })],
+    tasks: [taskRow({
+      paneId: 'pZombie', taskId: 'task-zombie', cwd, description: 'zombie worker',
+    })],
   });
   try {
-    // Not closed: the work is unfinished, which is what `resume` is for. Only `close` writes closed.
-    assert.equal(port.current!.listRows().find((s) => s.paneId === 'pZombie')?.status, 'settled');
+    // No sweep settles it anymore: a vanished pane is unfinished work, shown as `no pane` until
+    // the master closes it or sends it back to life.
+    const text = (await runSubagent(pi, { action: 'list' }, cwd)).content[0]!.text;
+    assert.match(text, /pZombie \[no pane\] \(task · persistent\) zombie worker/);
   } finally {
     await root.fiber.dispose();
   }
@@ -119,12 +124,18 @@ test('tasks: startup settles zombie running rows whose terminal core no longer l
 test('planChannelCheck: only a worker with a turn in flight has a channel to lose', () => {
   // Seen live: the heartbeat announced "its message channel is gone" for a worker that was still booting
   // (`unknown`, no OSC report yet) — one second before that worker registered its own pipe.
-  assert.equal(planChannelCheck({ rowStatus: 'running', terminalStatus: 'working' }), 'ping');
-  assert.equal(planChannelCheck({ rowStatus: 'running', terminalStatus: 'idle' }), 'ping', 'an idle worker is still addressable');
-  assert.equal(planChannelCheck({ rowStatus: 'running', terminalStatus: 'unknown' }), 'skip', 'a booting pane has no channel yet');
-  assert.equal(planChannelCheck({ rowStatus: 'running', terminalStatus: undefined }), 'skip', 'a pane core does not list is revive/close work');
-  assert.equal(planChannelCheck({ rowStatus: 'settled', terminalStatus: 'idle' }), 'skip', 'a settled row needs no channel');
-  assert.equal(planChannelCheck({ rowStatus: 'consumed', terminalStatus: 'working' }), 'skip', 'nor a consumed one');
+  const live = { closed: false, consumed: false };
+  assert.equal(planChannelCheck({ ...live, terminalStatus: 'working' }), 'ping');
+  const idle = planChannelCheck({ ...live, terminalStatus: 'idle' });
+  assert.equal(idle, 'ping', 'idle is still addressable');
+  const booting = planChannelCheck({ ...live, terminalStatus: 'unknown' });
+  assert.equal(booting, 'skip', 'a booting pane waits');
+  const unlisted = planChannelCheck({ ...live, terminalStatus: undefined });
+  assert.equal(unlisted, 'skip', 'an unlisted pane is revive work');
+  const shut = planChannelCheck({ closed: true, consumed: false, terminalStatus: 'idle' });
+  assert.equal(shut, 'skip', 'a closed task is skipped');
+  const done = planChannelCheck({ closed: false, consumed: true, terminalStatus: 'working' });
+  assert.equal(done, 'skip', 'as is a delivered one');
 });
 
 test('decideCheckoutSpaces: an empty window closes, a finished-but-open one only gets a reminder', () => {
@@ -134,11 +145,12 @@ test('decideCheckoutSpaces: an empty window closes, a finished-but-open one only
     decideCheckoutSpaces({ rows, ttlMs: TTL, now: NOW, remindedAt });
 
   // Every row closed → the space is an empty window: cleanup, no reminder.
-  assert.deepEqual(decide([row({ status: 'closed' }), row({ status: 'closed' })]), { close: [path], remind: [] });
+  const shut = { closedAt: NOW - TTL - 1000 };
+  assert.deepEqual(decide([row(shut), row(shut)]), { close: [path], remind: [] });
   // A finished row nobody closed keeps its window: a reminder, never a close.
   assert.deepEqual(decide([row()]), { close: [], remind: [{ path, since: NOW - TTL - 1000 }] });
   // One live sibling is enough to hold both decisions.
-  assert.deepEqual(decide([row({ status: 'closed' }), row({ status: 'running', consumedAt: null })]), { close: [], remind: [] });
+  assert.deepEqual(decide([row(shut), row({ consumedAt: null })]), { close: [], remind: [] });
   // The grace window still runs.
   assert.deepEqual(decide([row({ consumedAt: NOW - 1000 })]), { close: [], remind: [] });
   // One reminder per settlement: the same `since` never fires twice.
@@ -158,7 +170,7 @@ test('decideCheckoutSpaces: an empty window closes, a finished-but-open one only
 
 /** A checkout sweep pass: one row per worker, all in the same checkout. */
 async function checkoutPass(tasks: TaskEntry[], passes = 1): Promise<{
-  closed: string[]; notices: string[]; subs: Array<{ paneId: string; status: TaskEntry['status'] }>;
+  closed: string[]; notices: string[]; subs: Array<{ paneId: string; status: string }>;
 }> {
   const closed: string[] = [];
   const notices: string[] = [];
@@ -202,7 +214,7 @@ test('GC pass: a checkout whose workers are all closed has its space closed', as
   const cwd = mkdtempSync(join(tmpdir(), 'checkout-gc-closed-'));
   const path = join(cwd, 'probe');
   const wt = { path, branch: 'probe' };
-  const rows = [consumed('p2', path, { tabId: '', worktree: wt, status: 'closed' })];
+  const rows = [consumed('p2', path, { tabId: '', worktree: wt, closedAt: Date.now() - 600_000 })];
   const { closed, notices } = await checkoutPass(rows);
   assert.deepEqual(closed, [checkoutSpaceId(path)], 'an empty window is cleanup, not a decision');
   assert.deepEqual(notices, []);
