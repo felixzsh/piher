@@ -504,6 +504,27 @@ test('resume: a record pointing at the master session is refused; another pane i
   const otherFile = join(cwd, 'other-session.jsonl');
   writeFileSync(masterFile, '{}\n');
   writeFileSync(otherFile, '{}\n');
+  // The records belong to the repository: a main checkout is a directory holding `.git`.
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  // Both rows are this session's own: the view names them, so resume may act on them.
+  const stamp = '2026-01-05T00-00-00-000Z_ffffffff-0000-4000-8000-000000000000.jsonl';
+  const sessionFile = join(home.dir('sessions'), stamp);
+  const base = {
+    kind: 'task' as const, tabId: 't0', cwd,
+    launchCommand: ['node', 'cli.js'],
+  };
+  const t1 = '8183022d-a733-4292-911b-850e6dffba5a';
+  const t2 = '937f4abf-0000-4111-8222-333333333333';
+  seedTaskDocuments(sessionFile, [
+    {
+      ...base, taskId: t1, paneId: 'wA:p25', description: 'Investigate bug 19812',
+      sessionFile: masterFile, createdAt: Date.now(),
+    },
+    {
+      ...base, taskId: t2, paneId: 'wA:p2old', description: 'healthy task',
+      sessionFile: otherFile, createdAt: Date.now() + 1,
+    },
+  ]);
 
   const { root, pi, port } = await mountSubagent({
     env: { terminalId: 'p0' },
@@ -517,18 +538,10 @@ test('resume: a record pointing at the master session is refused; another pane i
         labels: { 'piher.session': id === 'p0' ? masterFile : otherFile },
       }),
     },
+    deps: { getSessionFile: () => sessionFile, getCwd: () => cwd },
   });
   try {
-    // The records belong to the repository: a main checkout is a directory holding `.git`.
-    mkdirSync(join(cwd, '.git'), { recursive: true });
-    const base = {
-      kind: 'task' as const, tabId: 't0', cwd,
-      launchCommand: ['node', 'cli.js'], status: 'settled' as const,
-    };
-    seedTaskDocuments(null, [
-      { ...base, taskId: '8183022d-a733-4292-911b-850e6dffba5a', paneId: 'wA:p25', description: 'Investigate bug 19812', sessionFile: masterFile, createdAt: Date.now() },
-      { ...base, taskId: '937f4abf-0000-4111-8222-333333333333', paneId: 'wA:p2old', description: 'healthy task', sessionFile: otherFile, createdAt: Date.now() + 1 },
-    ]);
+    await fire(pi, 'session_start', { reason: 'reload' }, {});
 
     assert.match(await runSubagentRejects(pi, { action: 'resume', taskId: '8183022d' }, cwd), /master's own session/);
     assert.ok(!port.current!.listRows().some((s) => s.paneId === 'p0'), 'the master pane never enters the board');

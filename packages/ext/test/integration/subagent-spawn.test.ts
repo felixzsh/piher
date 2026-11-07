@@ -629,6 +629,82 @@ test('tasks: a reload restores two workers from the records, and both close by r
   }, { paneSeq: true, sessionFile: sessionFor });
 });
 
+const aStamp = '2026-11-07T00-00-00-000Z_aaaaaaaa-0000-4000-8000-000000000000.jsonl';
+
+test('ownership: B lists A’s live worker foreign, drops and closes it', async () => {
+  // Two mounts share one repository directory with different session files. Foreignness derives
+  // from the view alone: a record the view does not name belongs to another session (S10 keeps
+  // the durable facts fixed, so no owner field exists to read).
+  const bStamp = '2026-11-07T00-00-00-000Z_bbbbbbbb-0000-4000-8000-000000000000.jsonl';
+  await withPipeEnv(async (env) => {
+    env.parkPollers();
+    const spawned = await runSubagent(
+      env.pi, { description: 'shared worker', prompt: PROMPT }, env.cwd);
+    await waitFor(() => env.frames.length === 1);
+    const taskId = spawned.details?.taskId as string;
+    const slug = /started subagent ([a-z0-9-]+)@/.exec(spawned.content[0]!.text)![1];
+    const ref = `${slug}@p2`;
+
+    let bMode: 'working' | 'gone' | 'idle' = 'working';
+    const bSession = join(env.cwd, bStamp);
+    const bKilled: string[] = [];
+    const bMount = await mountSubagent({
+      client: {
+        getTerminal: async (id: string) => bMode === 'gone'
+          ? null
+          : terminalInfo({ id, state: 'live', status: bMode }),
+        kill: async (id: string) => { bKilled.push(`kill:${id}`); },
+        remove: async (id: string) => { bKilled.push(`remove:${id}`); },
+      },
+      deps: { getSessionFile: () => bSession },
+    });
+    try {
+      // B lists A's live worker with the foreign prefix, in the contract's line format.
+      const listed = (await runSubagent(bMount.pi, { action: 'list' }, env.cwd)).content[0]!.text;
+      const foreignLine = `\\[otra sesión\\] ${slug}@p2 \\[running\\] ` +
+        `\\(task · persistent\\) shared worker`;
+      assert.match(listed, new RegExp(foreignLine));
+
+      // Once the pane reports gone, B stops listing it: no `no pane` line for foreign rows.
+      bMode = 'gone';
+      const gone = (await runSubagent(bMount.pi, { action: 'list' }, env.cwd)).content[0]!.text;
+      assert.equal(gone, 'No subagents started (from this session view).');
+
+      // B's close writes the decision into A's record and reclaims the pane — no adoption step.
+      // The agent is idle, so no turn blocks the close.
+      bMode = 'idle';
+      const closed = await runSubagent(bMount.pi, { action: 'close', agentId: ref }, env.cwd);
+      assert.match(closed.content[0]!.text, /closed — pane and tab gone/);
+      assert.deepEqual(bKilled, ['kill:p2', 'remove:p2'], 'the foreign pane is retired');
+      const record = readTaskRecord(env.cwd, taskId);
+      assert.ok(record?.closedAt !== null, 'the decision lands in A’s record');
+      assert.equal(readTaskView(bSession), null, 'no view document grows from foreign rows');
+
+      // A's row is still open in A's memory, but its pane is gone with the old session: every
+      // action now derives the finality from the record instead.
+      env.paneGone = true;
+      env.deadPipes = 100;
+      assert.match(
+        await runSubagentRejects(env.pi, { action: 'send', agentId: 'p2', message: 'x' }, env.cwd),
+        /closed by the master/);
+      assert.match(
+        await runSubagentRejects(env.pi, { action: 'resume', taskId }, env.cwd),
+        /closed by the master/);
+      assert.match(
+        await runSubagentRejects(env.pi, { action: 'retry', agentId: 'p2' }, env.cwd),
+        /closed by the master/);
+
+      // A's next read drops it: the record's decision wins over memory.
+      await fire(env.pi, 'session_start', { reason: 'reload' }, {});
+      assert.equal(
+        (await runSubagent(env.pi, { action: 'list' }, env.cwd)).content[0]!.text,
+        'No subagents started (from this session view).');
+    } finally {
+      await bMount.root.fiber.dispose();
+    }
+  }, { sessionFile: (cwd) => join(cwd, aStamp) });
+});
+
 test('tasks: no transcript path keeps the view in memory, records still land (S25)', async () => {
   // No `sessionFile` option: the host reports no transcript path, so there is no view document —
   // only the in-memory view — while task records still land under the repository.

@@ -15,7 +15,7 @@ import {
   type SubSessionState,
 } from './session-tail.ts';
 import { idParam, reportFingerprint, type AliveProbe } from './subagent-core.ts';
-import { isClosed, type TaskEntry } from './task-row.ts';
+import { isClosed, type ResolvedTaskEntry, type TaskEntry } from './task-row.ts';
 import { toolError } from './tool-error.ts';
 import { trace, traceRole } from './trace.ts';
 
@@ -444,10 +444,10 @@ async function readBlockedQuestion(client: CoreClientLike, paneId: string): Prom
 
 export async function executeSubagentOutput(
   params: Record<string, unknown> | undefined,
-  _toolCtx: unknown,
+  toolCtx: unknown,
   deps: {
     client: CoreClientLike;
-    resolveEntry: (rawId: string) => { entry: TaskEntry } | { error: string };
+    resolveEntry: (rawId: string, cwd?: string) => ResolvedTaskEntry;
     outputCursors: Map<string, SubagentOutputCursor>;
     /** Monotonic per-pane read counter shown in the header. */
     nextRevision: (paneId: string) => number;
@@ -461,10 +461,12 @@ export async function executeSubagentOutput(
   const rawId = idParam(params, 'agentId', 'taskId');
   if (!rawId) return toolError('Error: missing agentId for output. Pass it as a top-level argument {"action":"output","agentId":"<pane id>"}, not nested under parameters.');
 
-  const resolved = deps.resolveEntry(rawId);
+  const cwd = (toolCtx as { cwd?: string } | undefined)?.cwd;
+  const resolved = deps.resolveEntry(rawId, cwd);
   if ('error' in resolved) return toolError(resolved.error);
 
   const entry = resolved.entry;
+  const foreign = resolved.foreign;
   let terminalStatus: CoreStatus | null = null;
   try {
     terminalStatus = (await deps.client.getTerminal(entry.gen.paneId))?.status ?? null;
@@ -506,7 +508,8 @@ export async function executeSubagentOutput(
         reportSection = `[Subagent Report | latest finalized message from session transcript${bounded.truncated ? ' | truncated' : ''}]\n${bounded.text}`;
         deltaResult.nextCursor.reportTail = fingerprint;
         deltaResult.delta = cutPaneReportCopy(deltaResult.delta, report) ?? deltaResult.delta;
-        if (!bounded.truncated) {
+        // Another session's delivery marker is its own to persist; reading here stays read-only.
+        if (!bounded.truncated && !foreign) {
           entry.gen.reportDelivered = { fingerprint, at: Date.now() };
           deps.writeRecord?.(entry);
         }

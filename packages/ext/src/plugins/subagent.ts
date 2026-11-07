@@ -37,6 +37,7 @@ import {
   isSpent,
   taskForPane,
   taskRef,
+  type ResolvedTaskEntry,
   type TaskEntry,
   type TaskObservation,
   type TaskRow,
@@ -471,6 +472,14 @@ export default function subagentPlugin(ctx: Context): void {
   });
 
   async function reviveEntry(entry: TaskEntry): Promise<TaskEntry> {
+    // A revive only continues a resident row: a transient record copy from another session must
+    // never grow a generation here — that write belongs to its own session (S7).
+    if (tasks.get(entry.taskId) !== entry) {
+      throw new ToolError(
+        `Error: task ${entry.taskId} belongs to another session; only its own session can revive `
+        + 'it — close it with action "close" if its work is over.',
+      );
+    }
     const latest: TaskRow = readTaskRecord(entry.cwd, entry.taskId) ?? entry;
     // S9: close is final for every session, and the disk is the authority. A closed (or spent)
     // task never grows a new generation — otherwise a live pane would sit behind a record that
@@ -547,13 +556,28 @@ export default function subagentPlugin(ctx: Context): void {
     return entry;
   }
 
-  /** Resolve every id `list` prints against the session's tasks: pane id, slug, `slug@paneId`,
-   *  and a taskId prefix (S17). The view and the records seed memory at restore, so every id the
-   *  session offered resolves here — no ledger fallback. */
-  function resolveSubEntry(rawId: string): { entry: TaskEntry } | { error: string } {
+  /** A row that lives only as a record, never adopted: actions read it, never join it to the
+   *  tasks, the panes or the view (S4). */
+  function transientFromRecord(row: TaskRow): TaskEntry {
+    const worktree = row.worktree ? { worktree: { ...row.worktree } } : {};
+    return { ...row, gen: { ...row.gen }, ...worktree };
+  }
+
+  /** Ownership refusal: the row belongs to another session, so this one may only close it (S24).
+   *  Close and interrupt never reach here; send, retry and resume do. */
+  function foreignRefusal(taskId: string, action: string): string {
+    return `Error: task ${taskId} belongs to another session (list marks it [otra sesión]); `
+      + `action "${action}" only runs where the task lives. Close it with action "close" `
+      + 'if its work is over — close is final for every session.';
+  }
+
+  /** Resolve every id `list` prints (S17): this session's rows first, then the repository records
+   *  in the same form order — pane id, `slug@paneId`, bare slug, taskId prefix. A record match
+   *  belongs to another session: resolved for action, never adopted into the view (S4). */
+  function resolveSubEntry(rawId: string, cwd?: string): ResolvedTaskEntry {
     if (!rawId) return { error: 'Error: unknown subagent id "" (see action list)' };
     const direct = taskForPane(tasks, panes, rawId);
-    if (direct) return { entry: direct };
+    if (direct) return { entry: direct, foreign: false };
     // Slug reference: exact match against live rows (paneId stays first for back-compat).
     // `slug@paneId` accepts both parts; a revived task changed its paneId, so the slug part wins then.
     const at = rawId.indexOf('@');
@@ -563,15 +587,41 @@ export default function subagentPlugin(ctx: Context): void {
       ? (taskForPane(tasks, panes, panePart)
         ?? [...tasks.values()].find((s) => s.gen.slug === slugPart && s.gen.paneId === panePart) ?? null)
       : null;
-    if (combined) return { entry: combined };
+    if (combined) return { entry: combined, foreign: false };
     const bySlug = [...tasks.values()].find((s) => s.gen.slug === slugPart);
-    if (bySlug) return { entry: bySlug };
+    if (bySlug) return { entry: bySlug, foreign: false };
+
+    // Beyond the view: another session's record, same form order. Exact pane and slug ids match
+    // at any length; only prefixes keep the four-character rule.
+    const records = listTaskRecords(cwd ?? d.getCwd?.() ?? process.cwd());
+    const recordByPane = new Map<string, TaskRow>();
+    for (const row of records) {
+      if (!row.gen.paneId || recordByPane.has(row.gen.paneId)) continue;
+      recordByPane.set(row.gen.paneId, row);
+    }
+    const foreignPane = recordByPane.get(rawId);
+    if (foreignPane) return { entry: transientFromRecord(foreignPane), foreign: true };
+    const foreignCombined = panePart !== null
+      ? (recordByPane.get(panePart)
+        ?? records.find((r) => r.gen.slug === slugPart && r.gen.paneId === panePart) ?? null)
+      : null;
+    if (foreignCombined) return { entry: transientFromRecord(foreignCombined), foreign: true };
+    const foreignSlug = records.find((r) => r.gen.slug === slugPart);
+    if (foreignSlug) return { entry: transientFromRecord(foreignSlug), foreign: true };
 
     const byTaskId = newestPerTaskId(tasks.values());
     const res = resolveTaskIdPrefix(rawId, byTaskId.keys());
-    if (res.kind === 'resolved') return { entry: byTaskId.get(res.taskId)! };
+    if (res.kind === 'resolved') return { entry: byTaskId.get(res.taskId)!, foreign: false };
     const resError = taskIdResolutionError(res, 'subagent id', rawId);
     if (resError) return { error: resError };
+
+    const recordRes = resolveTaskIdPrefix(rawId, records.map((r) => r.taskId));
+    if (recordRes.kind === 'resolved') {
+      const row = records.find((r) => r.taskId === recordRes.taskId)!;
+      return { entry: transientFromRecord(row), foreign: true };
+    }
+    const recordError = taskIdResolutionError(recordRes, 'subagent id', rawId);
+    if (recordError) return { error: recordError };
     return { error: `Error: unknown subagent id "${rawId}" (see action list)` };
   }
 
@@ -591,11 +641,14 @@ export default function subagentPlugin(ctx: Context): void {
     return null;
   }
 
-  function targetOf(params: ToolParams, toolCtx: unknown): { entry: TaskEntry; cwd: string } {
+  function targetOf(
+    params: ToolParams,
+    toolCtx: unknown,
+  ): { entry: TaskEntry; cwd: string; foreign: boolean } {
     const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
-    const resolved = resolveSubEntry(idParam(params, 'agentId', 'taskId'));
+    const resolved = resolveSubEntry(idParam(params, 'agentId', 'taskId'), cwd);
     if ('error' in resolved) toolError(resolved.error);
-    return { entry: resolved.entry, cwd };
+    return { entry: resolved.entry, cwd, foreign: resolved.foreign };
   }
 
   /**
@@ -633,7 +686,8 @@ export default function subagentPlugin(ctx: Context): void {
     if (!rawTaskId) return toolError('missing taskId for resume (see action list).');
     // A task with a turn in flight is not resumed — use send or output. The probe decides (S26).
     // A delivered report ends the turn, so consumed rows skip the probe; a live but silent pane
-    // with an active settlement watch still counts as in flight, so resume never doubles it.
+    // with an active settlement watch — or a boot still injecting its first prompt — still counts
+    // as in flight, so resume never doubles it.
     {
       const live = resolveTaskIdPrefix(rawTaskId, tasks.keys());
       if (live.kind === 'resolved') {
@@ -644,9 +698,10 @@ export default function subagentPlugin(ctx: Context): void {
             const probe = await probeAlive(entry.gen.paneId, entry.cwd);
             noteObservation(entry.taskId, probe);
             const silent = probe.agentStatus === null || probe.agentStatus === 'unknown';
+            const tracked = pollers.has(entry.gen.paneId) || boots.has(entry.gen.paneId);
             running = probe.paneExists && (probe.agentStatus === 'working'
               || probe.agentStatus === 'blocked'
-              || (silent && pollers.has(entry.gen.paneId)));
+              || (silent && tracked));
           } catch {
             running = false; // a failed probe never strands a resume; the revive path re-checks
           }
@@ -690,17 +745,24 @@ export default function subagentPlugin(ctx: Context): void {
       const verdict = spentText(latest);
       if (verdict !== null) return toolError(verdict);
     }
+    // D94: reuse an existing pane for the same session to avoid competing pi processes. This
+    // lookup only reads terminal labels, so it runs before the ownership check below.
+    const existing = await findExistingPane(latest.gen.sessionFile);
+    // A record sessionFile mis-attributed to the master's own transcript would match the MASTER
+    // terminal here, registering the master as its own subagent — never adopt self, whatever
+    // session the row belongs to.
+    if (existing?.paneId === env?.terminalId) {
+      return toolError(
+        `Error: task ${taskId} is attributed to the master's own session (mis-recorded sessionFile `
+        + 'in the record); it cannot be resumed here — '
+        + 'spawn a fresh subagent for this work instead.',
+      );
+    }
+    // Reviving would write a generation this session does not own (S7): another session's task
+    // is resumed where it lives, never adopted here (S4).
+    if (!viewIds.includes(taskId)) return toolError(foreignRefusal(taskId, 'resume'));
 
     try {
-      // D94: reuse an existing pane for the same session to avoid competing pi processes.
-      const existing = await findExistingPane(latest.gen.sessionFile);
-      // A record sessionFile mis-attributed to the master's own transcript would match the MASTER terminal here,
-      // registering the master as its own subagent (later consumed, then closed by GC mid-run) — never adopt self.
-      if (existing?.paneId === env?.terminalId) {
-        return toolError(
-          `Error: task ${taskId} is attributed to the master's own session (mis-recorded sessionFile in the record); it cannot be resumed here — spawn a fresh subagent for this work instead.`,
-        );
-      }
       const entry: TaskEntry = {
         ...latest,
         gen: {
@@ -819,10 +881,13 @@ export default function subagentPlugin(ctx: Context): void {
   /** Follow_up goes through the extension pipe with steering so supplemental instructions reach a
    * long-running worker within seconds during a tool-call gap; a plain queue waits for the run. */
   function executeSubagentSend(params: ToolParams, toolCtx: unknown) {
-    const { entry, cwd } = targetOf(params, toolCtx);
+    const { entry, cwd, foreign } = targetOf(params, toolCtx);
     // A closed worker or a spent one-shot is not a conversation partner any more.
     const spent = spentText(entry);
     if (spent !== null) return toolError(spent);
+    // Another session's live task resolves so it can be closed, not steered: steering would
+    // write a generation this session does not own (S7).
+    if (foreign) return toolError(foreignRefusal(entry.taskId, 'send'));
     return pipeAction(entry, {
       build: () => ({
         type: 'follow_up',
@@ -857,7 +922,10 @@ export default function subagentPlugin(ctx: Context): void {
    *  stored prompt makes the retry free. A spent row is revived first, because a one-shot that already
    *  reported has no pane left to take the text. */
   async function executeSubagentRetry(params: ToolParams, toolCtx: unknown) {
-    const { entry } = targetOf(params, toolCtx);
+    const { entry, foreign } = targetOf(params, toolCtx);
+    // A retry re-sends the spawning session's brief or starts its next worker: neither is this
+    // session's to do for another session's task.
+    if (foreign) return toolError(foreignRefusal(entry.taskId, 'retry'));
     const prompt = readTaskPrompt(entry.taskId);
     if (prompt === null) {
       return toolError(
@@ -1005,26 +1073,42 @@ export default function subagentPlugin(ctx: Context): void {
     };
   }
 
-  /** The session's actionable tasks (S13): a closed or spent row is never printed. Every row is
-   *  probed — the probe feeds the state text, and the cache keeps it for the widget (S26). */
-  async function executeSubagentList() {
+  /** The session's actionable tasks first, then another session's live ones, marked (S13/S23).
+   *  A closed or spent row is never printed, and a foreign record whose pane is gone is not
+   *  printed at all. Every row shown is probed — the probe feeds the state text (S26). */
+  async function executeSubagentList(toolCtx?: unknown) {
     const rows = [...tasks.values()].filter(isActionable);
-    if (rows.length === 0) {
-      return { content: [{ type: 'text', text: 'No subagents started (from this session view).' }], details: {} };
-    }
+    const cwd = (toolCtx as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+    const foreign = listTaskRecords(cwd)
+      .filter((row) => isActionable(row) && !viewIds.includes(row.taskId) && !tasks.has(row.taskId))
+      .sort((a, b) => a.createdAt - b.createdAt || (a.taskId < b.taskId ? -1 : 1));
     const probes = new Map<string, AliveProbe>();
-    await Promise.all(rows.map(async (row) => {
+    const probeRow = async (row: TaskRow, note: boolean): Promise<void> => {
       try {
         const probe = await probeAlive(row.gen.paneId, row.cwd);
         probes.set(row.taskId, probe);
-        noteObservation(row.taskId, probe);
+        if (note) noteObservation(row.taskId, probe);
       } catch { /* best effort: the cache below covers a failed probe */ }
-    }));
+    };
+    await Promise.all([
+      ...rows.map((row) => probeRow(row, true)),
+      ...foreign.map((row) => probeRow(row, false)),
+    ]);
     const lines: string[] = [];
     for (const row of rows) {
       const cached = probes.get(row.taskId) ?? observations.get(row.taskId) ?? null;
       const head = `${taskRef(row.gen)} [${describeTaskState(row, cached)}]`;
       lines.push(`${head} (${row.kind} · ${row.lifecycle}) ${row.description}`);
+    }
+    for (const row of foreign) {
+      const probe = probes.get(row.taskId);
+      if (!probe?.paneExists) continue;
+      const head = `${taskRef(row.gen)} [${describeTaskState(row, probe)}]`;
+      lines.push(`[otra sesión] ${head} (${row.kind} · ${row.lifecycle}) ${row.description}`);
+    }
+    if (lines.length === 0) {
+      const text = 'No subagents started (from this session view).';
+      return { content: [{ type: 'text', text }], details: {} };
     }
     return { content: [{ type: 'text', text: lines.join('\n') }], details: {} };
   }
@@ -1052,7 +1136,7 @@ export default function subagentPlugin(ctx: Context): void {
 
   const outputActionDeps = {
     client,
-    resolveEntry: (rawId: string) => resolveSubEntry(rawId),
+    resolveEntry: (rawId: string, cwd?: string) => resolveSubEntry(rawId, cwd),
     outputCursors,
     nextRevision: (paneId: string): number => {
       const next = (outputRevisions.get(paneId) ?? 0) + 1;
@@ -1069,7 +1153,7 @@ export default function subagentPlugin(ctx: Context): void {
   const ACTIONS: Record<string, (params: ToolParams, toolCtx: unknown, onUpdate?: (u: unknown) => void) => Promise<unknown>> = {
     spawn: (params, toolCtx) => executeSubagentSpawn(params, toolCtx),
     resume: (params, toolCtx) => executeSubagentResume(params, toolCtx),
-    list: () => executeSubagentList(),
+    list: (_params, toolCtx) => executeSubagentList(toolCtx),
     send: (params, toolCtx) => executeSubagentSend(params, toolCtx),
     retry: (params, toolCtx) => executeSubagentRetry(params, toolCtx),
     interrupt: (params, toolCtx) => executeSubagentInterrupt(params, toolCtx),

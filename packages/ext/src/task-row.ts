@@ -67,6 +67,10 @@ export interface TaskRow {
   gen: TaskGeneration;
 }
 
+/** What id resolution answers: a resident memory row or a transient record copy, flagged when
+ *  the row belongs to another session (S17). Transient rows resolve for action, never adopted. */
+export type ResolvedTaskEntry = { entry: TaskEntry; foreign: boolean } | { error: string };
+
 /** A task resident in memory: the durable row plus transient control state. The transient
  *  fields are stripped at the document seam (`toTaskRow`) and never reach disk. Liveness is
  *  not among them: it is observed from core per surface, never stored (S11, S12). */
