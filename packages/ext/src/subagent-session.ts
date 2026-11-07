@@ -381,6 +381,9 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     } catch {
       /* core unavailable: liveness stays unknown (false), never a guessed death */
     }
+    trace(traceRole, 'probe', {
+      pane: paneId, paneExists: probe.paneExists, agentStatus: probe.agentStatus,
+    });
     for await (const { stamp } of readableCandidates(paneId, cwd)) {
       if (probe.lastActivityMs == null || stamp.mtimeMs > probe.lastActivityMs) probe.lastActivityMs = stamp.mtimeMs;
     }

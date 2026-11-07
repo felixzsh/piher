@@ -206,7 +206,14 @@ export function createPoller(h: PollerHost): Poller {
       // Not in the snapshot: a fresh spawn racing its `created` event, or a terminal that is gone.
       try {
         info = await h.client.getTerminal(paneId);
-      } catch {
+        // Where the state came from decides whether a stale snapshot or core itself is the problem.
+        trace(traceRole, 'observe-fallback', {
+          pane: paneId, source: 'getTerminal', state: info?.state ?? null, status: info?.status ?? null,
+        });
+      } catch (err) {
+        trace(traceRole, 'observe-fallback', {
+          pane: paneId, source: 'unavailable', error: String((err as Error)?.message ?? err),
+        });
         return { state: null, alive: true }; // an unreachable socket must not be read as a dead terminal
       }
     }

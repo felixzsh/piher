@@ -61,6 +61,9 @@ and the order of their lines is the story.
 | Event | Fields | Answers |
 |---|---|---|
 | `resolve-session` | `pane cwd preferred reported candidates count` | which transcript this pane may be read from, and where each candidate came from |
+| `observe-fallback` | `pane source=getTerminal\|unavailable state status` / `… error` | the children snapshot lacked the pane, so core was asked directly — or could not be asked at all |
+| `probe` | `pane paneExists agentStatus` | the liveness/status core reports, the same answer `hc` gives |
+| `gc-view` | `panes running watch` | piher's own view each sweep: every running row with the status core reports for it (`absent` = core does not know that terminal) |
 | `recover` | `via running rearmed panes` | which running rows got a watcher back at session start |
 | `gc-release` | `pane via taskId` | housekeeping moved a row out of `running` (`gc` / `zombie-sweep`) |
 | `notice-buffered` | `pane queued contentLen` | the master was mid-turn, so the notice waits |
@@ -87,3 +90,5 @@ grep 'pane=t187' ~/.pi/agent/piher/trace.log
 | `park wokeByEvent=false` over and over | core is not sending status events for that pane |
 | `notice-buffered` and never `notice-flushed` | the master never finished a turn, so the batch stayed queued |
 | `gc-release` while the agent was still working | housekeeping ended a row it should have left alone |
+| `gc-view` shows `t187:done` while the row is `running` | piher's own view disagrees with core: the desync is on the reading side, not the event side |
+| `observe-fallback source=unavailable` repeated | core cannot be asked about that pane, so every state read is blind |

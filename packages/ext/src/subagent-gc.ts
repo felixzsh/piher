@@ -170,6 +170,17 @@ export function createGcController(h: GcHost): GcController {
     const terminals = watch.list().filter((t) => t.state === 'live');
     const statuses = new Map(terminals.map((t) => [t.id, t.status]));
     const tabOf = (t: TerminalInfo): string => t.labels['herdr.tab'] ?? '';
+    // Piher's own view of the running rows, side by side with what core says: the comparison that
+    // shows a desync (`hc` sees `done`, the row still says `running`).
+    trace(traceRole, 'gc-view', {
+      panes: terminals.length,
+      running: [...h.subs.values()]
+        .filter((e) => e.status === 'running')
+        .slice(0, 8)
+        .map((e) => `${e.paneId}:${statuses.get(e.paneId) ?? 'absent'}`)
+        .join(','),
+      watch: watch.connected,
+    });
     const termPaneIds = h.terminalState.activePaneIds();
     const pendingNoticeIds = h.noticePending?.() ?? new Set<string>();
 
