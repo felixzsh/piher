@@ -37,12 +37,15 @@ function formatAge(ms: number): string {
 }
 
 /**
- * One widget row: `↳ <slug> · <role> · <state> · <elapsed>`. Those four fields are the whole row — a
- * label or a description would cost the line the fold budget pays for.
+ * One widget row: `↳ <slug> (<paneId>) · <role> · <state> · <elapsed>`. The pane id rides beside the
+ * name because it is the address the app and `send`/`output` take; a row without a slug is the pane
+ * id alone, since `↳ p9 (p9)` would spend the width on a duplicate. A label or a description is still
+ * not a field — those would cost the line the fold budget pays for.
  */
 export function workerLine(row: WorkerWidgetRow, now = Date.now()): string {
   const elapsed = row.startedAt != null ? formatAge(Math.max(now - row.startedAt, 0)) : undefined;
-  const fields = [row.slug ?? row.paneId, row.role, row.state, elapsed]
+  const handle = row.slug ? `${row.slug} (${row.paneId})` : row.paneId;
+  const fields = [handle, row.role, row.state, elapsed]
     .filter((field): field is string => typeof field === 'string' && field.length > 0);
   return `↳ ${fields.join(' · ')}`;
 }

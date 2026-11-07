@@ -516,7 +516,7 @@ test('widget + /piher-tree: both follow the subagent registry, and only the mast
     assert.equal(widgets.at(-1)?.id, 'piher-agents');
     assert.deepEqual(
       widgets.at(-1)?.lines,
-      ['↳ harden-pipe · worker · running · 2m'],
+      ['↳ harden-pipe (w2) · worker · running · 2m'],
       'the widget carries the running worker only, with its role, state and elapsed time',
     );
 

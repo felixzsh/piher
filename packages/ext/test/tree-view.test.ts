@@ -7,25 +7,25 @@ const NOW = 1_700_000_000_000;
 const worker = (over: Partial<WorkerWidgetRow> = {}): WorkerWidgetRow =>
   ({ paneId: 'p2', slug: 'fix-auth', role: 'worker', state: 'running', startedAt: NOW - 120_000, ...over });
 
-test('workerLine: slug, role, state, elapsed', () => {
-  assert.equal(workerLine(worker(), NOW), '↳ fix-auth · worker · running · 2m');
+test('workerLine: slug, pane id, role, state, elapsed', () => {
+  assert.equal(workerLine(worker(), NOW), '↳ fix-auth (p2) · worker · running · 2m');
   // A worker spawned without a role carries `task`, the ledger's own label for it.
-  assert.equal(workerLine(worker({ role: 'task', startedAt: NOW - 5_000 }), NOW), '↳ fix-auth · task · running · 5s');
-  // No slug: the pane id is the handle, so the row never falls back to prose.
+  assert.equal(workerLine(worker({ role: 'task', startedAt: NOW - 5_000 }), NOW), '↳ fix-auth (p2) · task · running · 5s');
+  // No slug: the pane id is the handle, so the row never falls back to prose (and never repeats it).
   assert.equal(workerLine({ paneId: 'p9', role: 'reviewer', state: 'running' }, NOW), '↳ p9 · reviewer · running');
   // A label or a description is not a widget field, whatever the row carries.
-  assert.equal(workerLine(worker({ description: 'fix the auth bug' }), NOW), '↳ fix-auth · worker · running · 2m');
+  assert.equal(workerLine(worker({ description: 'fix the auth bug' }), NOW), '↳ fix-auth (p2) · worker · running · 2m');
 });
 
 test('workerLine: elapsed never renders as a negative age', () => {
-  assert.equal(workerLine(worker({ startedAt: NOW + 60_000 }), NOW), '↳ fix-auth · worker · running · 0s');
+  assert.equal(workerLine(worker({ startedAt: NOW + 60_000 }), NOW), '↳ fix-auth (p2) · worker · running · 0s');
 });
 
 test('widgetLines: one line per running worker, and the fold tail stays inside the budget', () => {
   assert.deepEqual(widgetLines([], NOW), [], 'nothing running renders no widget at all');
   assert.deepEqual(
     widgetLines([worker(), worker({ paneId: 'p3', slug: 'migrate', role: 'reviewer' })], NOW),
-    ['↳ fix-auth · worker · running · 2m', '↳ migrate · reviewer · running · 2m'],
+    ['↳ fix-auth (p2) · worker · running · 2m', '↳ migrate (p3) · reviewer · running · 2m'],
   );
 
   // Exactly at the budget: every row fits, so there is nothing to fold and nothing to warn about.
