@@ -75,3 +75,9 @@ open: `spec-loop` can run in a clean session from the files in `docs/spec/` alon
 L9. S26 added before P1 (a precision of S11, not a new decision): an observation never authorizes an
 action — `list` and every action probe core for the rows they touch, and only the printed state text comes
 from the cache. It closes the one place a fresh implementer could have trusted a stale status.
+
+P1 done: `a9cdb9c` (range `64786f5..a9cdb9c` on `master`), Risk: item 1 (S9/S25 review), `npm test`
+460/460 green (~12 s, run by the parent on that commit), Route: delegated. `task-row.ts` + `task-store.ts`
+replace `history-store.ts`, `subagent-registry-file.ts` and the branch snapshot; one correction round after
+the review found `resume` reviving a closed-but-unconsumed record (S9), a `createdAt` overwritten by a
+revive (S3/S10), and S25 unproven at the plugin seam.
