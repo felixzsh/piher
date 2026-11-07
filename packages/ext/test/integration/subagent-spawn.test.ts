@@ -640,7 +640,8 @@ const aStamp = '2026-11-07T00-00-00-000Z_aaaaaaaa-0000-4000-8000-000000000000.js
 // A foreign action must leave the row's identity and decision alone. The owning session's
 // poller still watches the pane and may honestly write delivery fields (gen.consumedAt,
 // gen.reportDelivered) into its own record at any moment — one writer per document — so
-// those two are excluded: a byte comparison would fail on the owner's write, not on ours.
+// only those two are excluded; everything else is fixed at spawn or by a decision this
+// session would have seen. A byte comparison would fail on the owner's write, not on ours.
 function stableRowFields(row: TaskRow) {
   return {
     taskId: row.taskId,
@@ -648,12 +649,14 @@ function stableRowFields(row: TaskRow) {
     kind: row.kind,
     lifecycle: row.lifecycle,
     cwd: row.cwd,
+    worktree: row.worktree,
     createdAt: row.createdAt,
     closedAt: row.closedAt,
     gen: {
       paneId: row.gen.paneId,
       slug: row.gen.slug,
       tabId: row.gen.tabId,
+      tabName: row.gen.tabName,
       sessionFile: row.gen.sessionFile,
       launchCommand: row.gen.launchCommand,
       startedAt: row.gen.startedAt,
