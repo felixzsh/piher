@@ -207,37 +207,38 @@ test('registry self-consistency: PIHER_* names, integer fallbacks', () => {
 
 test('swallow: records tag/cause/time instead of throwing (cleanup must continue)', () => {
   resetSwallowedErrors();
-  assert.doesNotThrow(() => swallow('role.persist-switch', new ReferenceError('persistEdit is not defined'), {}));
+  const broken = new ReferenceError('persistEdit is not defined');
+  assert.doesNotThrow(() => swallow('role.persist-switch', broken));
   const [entry] = swallowedErrors();
   assert.equal(entry!.tag, 'role.persist-switch'); assert.match(entry!.message, /ReferenceError: persistEdit is not defined/); assert.ok(entry!.at > 0);
 });
 
 test('swallow: the ring buffer is bounded (no unbounded growth per session)', () => {
   resetSwallowedErrors();
-  for (let i = 0; i < SWALLOW_BUFFER_MAX + 25; i += 1) swallow('t', new Error(`e${i}`), {});
+  for (let i = 0; i < SWALLOW_BUFFER_MAX + 25; i += 1) swallow('t', new Error(`e${i}`));
   const entries = swallowedErrors();
   assert.equal(entries.length, SWALLOW_BUFFER_MAX); assert.match(entries[entries.length - 1]!.message, /e74$/, 'the newest entry is kept');
 });
 
-test('swallow: PIHER_TRACE writes the entry to stderr, silence otherwise', () => {
+test('swallow: records silently, never writing to stderr', () => {
   resetSwallowedErrors();
   const seen: string[] = [];
   const orig = console.error;
   console.error = (...args: unknown[]) => { seen.push(args.map(String).join(' ')); };
   try {
-    swallow('x.y', new Error('loud'), { PIHER_TRACE: '1' });
-    swallow('x.z', new Error('quiet'), {});
-    swallow('x.w', new Error('legacy'), { PIHER_TRACE: '1' });
+    swallow('x.y', new Error('loud'));
+    swallow('x.z', new Error('quiet'));
   } finally {
     console.error = orig;
   }
-  assert.equal(seen.length, 2); assert.match(seen[0]!, /swallowed x\.y: Error: loud/); assert.match(seen[1]!, /swallowed x\.w: Error: legacy/);
+  assert.equal(seen.length, 0, 'cleanup paths stay silent');
+  assert.match(swallowedErrors()[0]!.message, /Error: loud/);
 });
 
 test('formatSwallowedErrors: explicit empty state, otherwise the last 10', () => {
   resetSwallowedErrors();
   assert.match(formatSwallowedErrors(), /none this session/);
-  for (let i = 0; i < 12; i += 1) swallow(`tag${i}`, new Error(`m${i}`), {});
+  for (let i = 0; i < 12; i += 1) swallow(`tag${i}`, new Error(`m${i}`));
   const text = formatSwallowedErrors();
   assert.match(text, /swallowed errors: 12 this session \(last 10\)/); assert.match(text, /tag11: Error: m11/);
   assert.doesNotMatch(text, /tag1: Error: m1$/m, 'the oldest entries are dropped');

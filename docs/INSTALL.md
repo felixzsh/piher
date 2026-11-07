@@ -40,8 +40,8 @@ running anything — the preflight is in the tool result, not in a separate inst
 The old one-shot installer (`piher-setup`) is retired and no longer published: it only wrapped the
 commands in the table above, and the `hc` preflight now travels with the package itself.
 
-If a settlement notice ever arrives late or not at all, the trace in [`TRACE.md`](TRACE.md) records
-every decision that led there (it is on by default and rotated at 4 MB).
+If a settlement notice ever arrives late or not at all, read the worker's own transcript first
+(`subagent output`), then the session log: those two are the record, and nothing else is kept.
 
 Hot reload while developing needs node's `--expose-internals` flag before pi's own entry point and
 `PIHER_HMR=1`; without both there is no watcher.
@@ -50,13 +50,13 @@ Hot reload while developing needs node's `--expose-internals` flag before pi's o
 
 1. Start core and open a terminal (`hc run --bg pi`, or a terminal from the Herdr app), then run `pi`
    inside it. The extension detects `HC_TERMINAL_ID` / `HC_TERMINAL_SOCKET` and starts talking to core.
-2. The model calls `subagent` (delegate) and `terminal` (persistent shell).
+2. The model calls `subagent` (delegate) and `bg_job` (background shell).
 3. Every worker shows up as a terminal; the app adopts it as an unfocused pane of the caller's tab, or
    as its own tab when the spawn asked for a different `tab`/`worktree`.
 4. A human can attach to a worker's pane and talk to it directly. Status reaches the app through pi's
    native OSC 7501 report; piher never synthesizes it.
 5. If core stops, its terminals are gone with it. `subagent(action: "resume", taskId)` revives a
-   finished worker from the ledger in a new terminal.
+   finished worker's task record in a new terminal.
 
 ## Compatibility and known limits
 
@@ -67,7 +67,7 @@ Hot reload while developing needs node's `--expose-internals` flag before pi's o
 | Linux | not tested (expected to work) | same POSIX branch as macOS |
 | pi outside a core terminal | tested | degrades: `subagent` / `terminal` are not registered, nothing else breaks |
 | Herdr app closed | by design | core keeps the terminals; the sidebar is complete when it reopens |
-| core stopped or restarted | known limit | worker terminals are not re-created; use the ledger's `subagent resume` |
+| core stopped or restarted | known limit | worker terminals are not re-created; `subagent resume` revives the task from its record |
 | `terminal.send` | human-first gate | core refuses to type into a blocked terminal; piher surfaces it as a tool error |
 | Human and machine on one pane | soft locks | machine messages use pipe-channel, the keyboard channel belongs to the human; core parent notes are off for workers |
 

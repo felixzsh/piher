@@ -92,15 +92,7 @@ const CASES: RenderCase[] = [
 test('card renderers: each custom type renders its lines', async (t) => {
   for (const c of CASES) {
     await t.test(c.name, () => {
-      const saved = process.env.PIHER_SUBAGENT_CARDS;
-      if (c.env) Object.assign(process.env, c.env);
-      else delete process.env.PIHER_SUBAGENT_CARDS;
-      try {
-        assert.deepEqual(cardLines(c.kind, c.type, c.data, c.expanded ?? false, c.theme ?? plain), c.expect);
-      } finally {
-        if (saved === undefined) delete process.env.PIHER_SUBAGENT_CARDS;
-        else process.env.PIHER_SUBAGENT_CARDS = saved;
-      }
+      assert.deepEqual(cardLines(c.kind, c.type, c.data, c.expanded ?? false, c.theme ?? plain), c.expect);
     });
   }
 });

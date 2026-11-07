@@ -3,13 +3,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync,
+} from 'node:fs';
 import type { Server, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { CoreClientLike } from '../../src/core-client.ts';
 import { pipeNameFor, startPipeServer, type PipeRequest } from '../../src/pipe-channel.ts';
-import { readTaskRecord, repoTasksDir, taskRecordPath } from '../../src/task-store.ts';
+import {
+  readTaskRecord, repoTasksDir, taskRecordPath, TASK_VIEW_NAME,
+} from '../../src/task-store.ts';
+import { sessionStatePath } from '../../src/session-state.ts';
 import type { SubagentPortBox } from '../../src/subagent-core.ts';
 import { NodeGitAdapter, createSpawner, type GitExecFile } from '../../src/subagent-spawn.ts';
 import {
@@ -786,6 +791,75 @@ test('ownership: foreign rows list marked, close final, retry starts new', async
       await new Promise<void>((resolve) => qServer.close(() => resolve()));
     }
   }, { paneSeq: true, sessionFile: (cwd) => join(cwd, aStamp) });
+});
+
+test('tasks: spawn and close create exactly the two documents, nothing else', async () => {
+  // The phase headline: one task record plus the session view — no ledger, no registry file,
+  // no branch entry, and no status key anywhere in either document.
+  const stamp = '2026-11-07T00-00-00-000Z_dddddddd-0000-4000-8000-000000000000.jsonl';
+  const keysOf = (value: unknown, acc: string[] = []): string[] => {
+    if (Array.isArray(value)) {
+      for (const entry of value) keysOf(entry, acc);
+      return acc;
+    }
+    if (value !== null && typeof value === 'object') {
+      for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+        acc.push(key);
+        keysOf(entry, acc);
+      }
+    }
+    return acc;
+  };
+  const treeOf = (dir: string): string[] => {
+    const out: string[] = [];
+    const walk = (at: string, prefix: string): void => {
+      for (const name of readdirSync(at)) {
+        const full = join(at, name);
+        const rel = prefix ? `${prefix}/${name}` : name;
+        out.push(rel);
+        if (statSync(full).isDirectory()) walk(full, rel);
+      }
+    };
+    walk(dir, '');
+    return out.sort();
+  };
+  await withPipeEnv(async (env) => {
+    env.parkPollers();
+    const sessionFile = join(env.cwd, stamp);
+    const spawned = await runSubagent(
+      env.pi, { description: 'two-document probe', prompt: PROMPT }, env.cwd);
+    await waitFor(() => env.frames.length === 1);
+    const taskId = spawned.details?.taskId as string;
+    env.port.current!.consumeReply('p2', 'REPORT: done');
+    env.paneGone = true;
+    const closed = await runSubagent(env.pi, { action: 'close', agentId: 'p2' }, env.cwd);
+    assert.match(closed.content[0]!.text, /closed — pane and tab gone/);
+
+    // Document one: the task record holds exactly one row, with the decision and no status.
+    const recordFile = taskRecordPath(repoTasksDir(env.cwd)!, taskId);
+    const recordJson: unknown = JSON.parse(readFileSync(recordFile, 'utf8'));
+    const envelope = recordJson as { version: unknown; rows: unknown[] };
+    assert.equal(envelope.version, 1);
+    assert.equal(envelope.rows.length, 1, 'one row per record file');
+    const row = readTaskRecord(env.cwd, taskId);
+    assert.ok(row, 'the record parses');
+    assert.equal(row.taskId, taskId);
+    assert.ok(row.closedAt !== null, 'close wrote the decision');
+    assert.ok(!keysOf(recordJson).includes('status'), 'no status key anywhere in the record');
+
+    // Document two: the session view references exactly this task id, as ids and nothing else.
+    assert.deepEqual(readTaskView(sessionFile), [taskId]);
+    const viewPath = sessionStatePath(sessionFile, TASK_VIEW_NAME)!;
+    const viewJson: unknown = JSON.parse(readFileSync(viewPath, 'utf8'));
+    assert.equal((viewJson as { version: unknown }).version, 1);
+    assert.ok(!keysOf(viewJson).includes('status'), 'no status key in the view either');
+    assert.ok(!keysOf(viewJson).includes('rows'), 'the view holds ids, not rows');
+
+    // Nothing else: neither the repository nor the session state holds a third document.
+    assert.deepEqual(treeOf(join(env.cwd, '.piher')), ['tasks', `tasks/${taskId}.json`]);
+    const branched = env.pi.entries.some(([type]) => type === 'piher.subs');
+    assert.ok(!branched, 'no branch entry was appended');
+  }, { sessionFile: (cwd) => join(cwd, stamp) });
 });
 
 test('tasks: no transcript path keeps the view in memory, records still land (S25)', async () => {

@@ -553,7 +553,7 @@ test('subagent plugin: help returns the manual, and a missing action normalizes 
   const def = pi.tools.get('subagent')!;
   const help = await runSubagent(pi, { action: 'help' });
   assert.match(help.content[0]!.text, /^subagent manual/);
-  for (const topic of ['cwd', 'role + allowed_tools', 'resume', 'history.jsonl']) assert.ok(help.content[0]!.text.includes(topic), topic);
+  for (const topic of ['cwd', 'role + allowed_tools', 'resume', 'tasks.json']) assert.ok(help.content[0]!.text.includes(topic), topic);
   // Either shape answers "which agents do I have"; the machine's own role files decide which.
   assert.match(help.content[0]!.text, /role profiles( available here| — none)/, 'help lists the launchable profiles, so no hunting for role files');
   assert.equal(String(def.description).includes('history.jsonl'), false, 'ledger detail rides help, not every request');

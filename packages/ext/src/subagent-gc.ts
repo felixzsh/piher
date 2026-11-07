@@ -16,7 +16,6 @@ import {
 } from './gc-core.ts';
 import type { SettlementCard } from './settlement-card.ts';
 import { checkoutSpaceId, type CheckoutSpace } from './worktree.ts';
-import { trace, traceRole } from './trace.ts';
 import { sessionStatePath } from './session-state.ts';
 import { pipeRequestTo } from './pipe-channel.ts';
 import { runtimePolicy } from './runtime-policy.ts';
@@ -52,7 +51,7 @@ export interface TaskBoardHost {
 }
 
 /** Seed one memory entry from its record. Unresolved rows arrive running when no report was
- *  delivered yet, consumed when it was — so the recovery never re-arms a settled row. */
+ *  delivered yet, consumed when it was — so the recovery never re-arms a finished row. */
 function seedEntryFromRow(host: Pick<TaskBoardHost, 'tasks' | 'panes'>, row: TaskRow): void {
   if (isClosed(row) || host.tasks.has(row.taskId)) return;
   const entry: TaskEntry = {
@@ -70,12 +69,11 @@ function seedEntryFromRow(host: Pick<TaskBoardHost, 'tasks' | 'panes'>, row: Tas
  * record that now says closed retires its memory row so every surface drops it. A record the
  * session's own repository does not hold reads as "no record" (S6) and is skipped.
  */
-export function restoreTasks(host: TaskBoardHost, via = 'session_start', cwd?: string): void {
+export function restoreTasks(host: TaskBoardHost, cwd?: string): void {
   try {
     const ids = readTaskView(host.sessionFile());
     if (ids) for (const id of ids) if (!host.viewIds.includes(id)) host.viewIds.push(id);
     const repo = cwd ?? host.restoreCwd();
-    let restored = 0;
     for (const taskId of [...host.viewIds]) {
       const row = readTaskRecord(repo, taskId);
       if (!row) continue;
@@ -84,12 +82,8 @@ export function restoreTasks(host: TaskBoardHost, via = 'session_start', cwd?: s
       // only ever moves one way, so adopting it here can never resurrect a task.
       if (known && row.closedAt !== null) known.closedAt = row.closedAt;
       if (isClosed(row)) continue;
-      if (!known) {
-        seedEntryFromRow(host, row);
-        restored += 1;
-      }
+      if (!known) seedEntryFromRow(host, row);
     }
-    trace(traceRole, 'tasks-restore', { via, view: host.viewIds.length, restored, rows: host.tasks.size });
   } catch {
     /* recovery failure must not block the live session */
   }
@@ -102,8 +96,7 @@ export function restoreTasks(host: TaskBoardHost, via = 'session_start', cwd?: s
 export function seedForkView(sessionFile: string | null, previousSessionFile: string | null | undefined): void {
   const to = sessionStatePath(sessionFile ?? null, TASK_VIEW_NAME);
   const from = sessionStatePath(previousSessionFile ?? null, TASK_VIEW_NAME);
-  if (!seedTaskView(to, from)) return;
-  trace(traceRole, 'tasks-seed', { from: from ?? null, to: to ?? null });
+  seedTaskView(to, from);
 }
 
 /* ── GC ─────────────────────────────────────────────────────────── */
@@ -193,16 +186,6 @@ export function createGcController(h: GcHost): GcController {
         at: now,
       });
     }
-    // Piher's own view of the rows still awaiting a report, side by side with what core says.
-    trace(traceRole, 'gc-view', {
-      panes: terminals.length,
-      running: [...h.tasks.values()]
-        .filter((e) => !isClosed(e) && e.gen.consumedAt === null)
-        .slice(0, 8)
-        .map((e) => `${e.gen.paneId}:${statuses.get(e.gen.paneId) ?? 'absent'}`)
-        .join(','),
-      watch: watch.connected,
-    });
     const termPaneIds = h.terminalState.activePaneIds();
     const pendingNoticeIds = h.noticePending?.() ?? new Set<string>();
 
@@ -286,7 +269,6 @@ export function createGcController(h: GcHost): GcController {
       } catch {
         ok = false;
       }
-      trace(traceRole, 'pipe-heartbeat', { pane: e.gen.paneId, ok, status: reported });
       if (ok) {
         deadChannelNotified.delete(e.gen.paneId);
         continue;

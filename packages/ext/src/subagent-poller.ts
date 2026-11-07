@@ -14,7 +14,6 @@ import { settlementCard, type SettlementCard, type SettlementOutcome } from './s
 import { buildBlockedGateNotice, reportFingerprint } from './subagent-core.ts';
 import { retirePane } from './subagent-gc.ts';
 import type { SessionIo } from './subagent-session.ts';
-import { trace, traceRole } from './trace.ts';
 
 /** `null` = no word to act on (working, never reported, or the watch is blind). */
 type WaitState = CoreStatus | null;
@@ -213,14 +212,7 @@ export function createPoller(h: PollerHost): Poller {
       // Not in the snapshot: a fresh spawn racing its `created` event, or a terminal that is gone.
       try {
         info = await h.client.getTerminal(paneId);
-        // Where the state came from decides whether a stale snapshot or core itself is the problem.
-        trace(traceRole, 'observe-fallback', {
-          pane: paneId, source: 'getTerminal', state: info?.state ?? null, status: info?.status ?? null,
-        });
-      } catch (err) {
-        trace(traceRole, 'observe-fallback', {
-          pane: paneId, source: 'unavailable', error: String((err as Error)?.message ?? err),
-        });
+      } catch {
         return { state: null, alive: true }; // an unreachable socket must not be read as a dead terminal
       }
     }
@@ -280,7 +272,6 @@ export function createPoller(h: PollerHost): Poller {
       const claimKey = `${paneId}:${request.requestId}`;
       if (claimedKey !== claimKey) {
         const claimed = h.claimSettleNotice(claimKey);
-        trace(traceRole, 'claim', { pane: paneId, key: claimKey, claimed, closingLen: closing?.length ?? null });
         if (!claimed) {
           consume(now());
           return 'done';
@@ -294,7 +285,6 @@ export function createPoller(h: PollerHost): Poller {
       const announced = entry.noticeAnnounced;
       if (fingerprint !== null && announced && announced.fingerprint === fingerprint
         && now() - announced.at < NOTICE_DEDUPE_WINDOW_MS) {
-        trace(traceRole, 'notice-dup', { pane: paneId, request: request.requestId, at: announced.at });
         consume(now());
         return 'done';
       }
@@ -309,42 +299,27 @@ export function createPoller(h: PollerHost): Poller {
         // Tag the pane: a notice buffered while the master is busy must keep its row GC-exempt
         // until the flush actually delivers it.
         await h.injectNotice(notice, paneId, cardFor(entry, paneId, request.description, failure !== null ? 'failed' : 'settled'));
-        trace(traceRole, 'inject-ok', { pane: paneId, request: request.requestId, closingLen: closing?.length ?? null });
-      } catch (err) {
-        trace(traceRole, 'inject-failed', { pane: paneId, request: request.requestId, error: String((err as Error)?.message ?? err) });
+      } catch {
         return 'retry';
       }
       if (fingerprint !== null) {
         entry.noticeAnnounced = { fingerprint, at: now() };
       }
       consume(now());
-      trace(traceRole, 'consumed', { pane: paneId, via: 'poll-settle', request: request.requestId });
       return 'done';
     }
 
-    const watchReady = await watch.ready();
-    trace(traceRole, 'poll-start', {
-      pane: paneId, since: injectTs, request: requestId, cwd, file: taskForPane(h.tasks, h.panes, paneId)?.gen.sessionFile ?? null,
-      watchReady, watchConnected: watch.connected,
-    });
+    await watch.ready();
     try {
       while (true) {
         const current = requestByPane.get(paneId) ?? { injectTs, description, requestId };
         const entry = taskForPane(h.tasks, h.panes, paneId);
-        if (!entry || isClosed(entry) || entry.gen.consumedAt !== null) {
-          trace(traceRole, 'poll-exit', {
-            pane: paneId,
-            reason: !entry ? 'row-gone' : isClosed(entry) ? 'closed' : 'consumed',
-            request: current.requestId,
-          });
-          return;
-        }
+        if (!entry || isClosed(entry) || entry.gen.consumedAt !== null) return;
 
         // Read the version BEFORE the state: an event landing in between still wakes the park below.
         const seen = watch.version(paneId);
         const park = async (ms: number): Promise<boolean> => {
           const woke = await watch.changed(paneId, seen, Math.max(0, ms));
-          trace(traceRole, 'park', { pane: paneId, ms, wokeByEvent: woke, seen, version: watch.version(paneId) });
           return woke;
         };
         const { state, alive } = await observe(paneId);
@@ -398,21 +373,9 @@ export function createPoller(h: PollerHost): Poller {
             );
           }
           const s = await h.session.subSessionState(paneId, cwd, current.injectTs, entry.gen.sessionFile);
-          trace(traceRole, 'poll', {
-            pane: paneId, state, textLen: s.text ? s.text.length : null, pend: s.pendingTool,
-            act: s.activity, ended: s.turnEnded ?? null, window: entry.settleWindowStartedAt ?? null,
-            since: current.injectTs, request: current.requestId, file: entry.gen.sessionFile,
-            watch: watch.connected,
-          });
 
           const terminalIdle = state === 'idle' || state === 'done' || state === 'error';
           const candidate = isSettlementCandidate({ ...s, terminalIdle });
-          if (!candidate) {
-            trace(traceRole, 'no-candidate', {
-              pane: paneId, state, terminalIdle, textLen: s.text ? s.text.length : null,
-              pend: s.pendingTool, act: s.activity, ended: s.turnEnded ?? null,
-            });
-          }
           if (candidate) {
             // With no closing words, a stated reason (refused tool, errored turn) IS the report.
             const closing = s.text ?? s.why ?? null;
@@ -421,10 +384,6 @@ export function createPoller(h: PollerHost): Poller {
               now: now(),
               windowMs: settleWindowMs,
               finalized: closing != null && !s.pendingTool,
-            });
-            trace(traceRole, 'settle-candidate', {
-              pane: paneId, tick: tick.kind, closingLen: closing?.length ?? null, pend: s.pendingTool,
-              act: s.activity, window: entry.settleWindowStartedAt ?? null,
             });
             if (tick.kind === 'start-settle-window') {
               entry.settleWindowStartedAt = now();
@@ -466,11 +425,6 @@ export function createPoller(h: PollerHost): Poller {
           // the end of it IS the settlement, and "failed" for a worker that finished is a lie.
           const late = await h.session.subSessionState(paneId, cwd, 0, entry.gen.sessionFile).catch(() => null);
           const lateClosing = late?.text ?? late?.why ?? null;
-          trace(traceRole, 'timeout', {
-            pane: paneId, request: current.requestId, idleMs: now() - lastActivityAt,
-            lateTextLen: lateClosing?.length ?? null, latePend: late?.pendingTool ?? null,
-            lateAct: late?.activity ?? null, file: entry.gen.sessionFile,
-          });
           if (late && lateClosing != null && !late.pendingTool) {
             entry.settleWindowStartedAt = null;
             const lateFailure = late.text === null ? (late.why ?? null) : null;
@@ -481,7 +435,6 @@ export function createPoller(h: PollerHost): Poller {
             return;
           }
           consume(now());
-          trace(traceRole, 'consumed', { pane: paneId, via: 'poll-timeout', request: current.requestId });
           const notice = formatSettleTimeoutNotice({
             paneId,
             description: current.description,

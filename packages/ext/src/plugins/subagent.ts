@@ -75,7 +75,6 @@ import {
 } from '../worktree.ts';
 import { createPoller } from '../subagent-poller.ts';
 import { createGcController, restoreTasks, retirePane, seedForkView } from '../subagent-gc.ts';
-import { trace, traceRole } from '../trace.ts';
 import { createSessionIo, executeSubagentOutput, type SubagentOutputCursor } from '../subagent-session.ts';
 import type { WorkerWidgetRow } from '../tree-view.ts';
 
@@ -117,29 +116,31 @@ const SUBAGENT_DESCRIPTION = [
   'spawn: `prompt` is the COMPLETE task, since only it reaches the worker; `description` labels the pane. Several spawns per message run in parallel (max 4).',
   'spawn places the worker by `cwd` or by `worktree` (a name: piher creates the checkout and branch).',
   'spawn returns at once; the result arrives as a settlement notice at your next turn boundary — never sleep or poll.',
-  'retry: re-sends the spawned prompt after a failure that was not the task\'s fault. send: follow-up to a running or settled worker, steered between tool calls. output: report once finished or the latest lines while it runs, for a stuck run or re-read; normally unneeded. resume: revive a task that was left unfinished, by taskId.',
-  'help: the full manual (placement, role profiles, the ledger).',
+  'retry: re-sends the spawned prompt after a fault outside the task. send: follow-up steered between tool calls; a task with no pane revives first. output: report once finished, lines while it runs — normally unneeded. resume: revive an unfinished task by taskId. list: yours plus another session\'s live ones, marked.',
+  'help: the full manual (placement, role profiles, the two documents).',
 ].join(' ');
 
 /** Returned by `action: "help"`: the reference text kept out of the per-request description. */
 const SUBAGENT_MANUAL = [
   'subagent manual — `help` returns this text: what a call needs beyond the always-sent description.',
   '',
-  'spawn — an independent worker on this workspace; its result is its final text, delivered as a settlement notice, so return at once and never wait in-turn. `prompt` is the whole task (the worker does not see this conversation): paths, acceptance criteria, the proving command, what to report. Do not delegate the current step. Placement: no pane by default — the app nests it under you, and only a worker with its own checkout opens a space. `tab` joins or creates a task tab. `cwd` is a directory or worktree you already have. `worktree` is a name, never a path: piher creates `~/.herdr/worktrees/<repo>/<slug>` on branch `<name>` from your HEAD and reuses it on that branch. `description` labels the pane. `cwd` and `worktree` are mutually exclusive.',
+  'spawn — an independent worker on this workspace; its result arrives as a settlement notice, so return at once and never wait in-turn. `prompt` is the whole task (the worker does not see this conversation): paths, acceptance criteria, what to report. Every spawn mints a `taskId` for later actions. `description` labels the pane. No pane by default; `tab` joins or creates a task tab. `cwd` runs in a checkout you have, `worktree` names one piher creates (branch of the same name); they are mutually exclusive.',
   '',
-  'role + allowed_tools — see the profile list below (name, description, tools, lifecycle); no filesystem hunting. A profile is searched in workspace `.piher/roles/`, then the user directory, then builtin; `allowed_tools` adds on top of it and role denies always win. Unknown role names stay display labels; a worker\'s profile is fixed for its whole life.',
+  'role + allowed_tools — the profile list below (name, description, tools, lifecycle); profiles come from workspace `.piher/roles/`, then the user directory, then builtin. `allowed_tools` adds on top; role denies always win. Unknown names stay display labels; a profile is fixed for life.',
   '',
-  'list — every worker that is still your business: running, or settled with a result you have not acted on. Closed workers are gone, and so is a one-shot once its verdict was consumed.',
+  'durability — one task record per task at `<repo>/.piher/tasks/<taskId>.json` plus this session\'s view (`<sessionDir>/piher/<sessionId>/tasks.json`). Liveness is observed, never stored; spawn, settle, close write the record.',
   '',
-  'output — `agentId`; status plus the finalized report or, while it runs, the latest lines (`max_chars`, 100-16000; whole pane only with `full: true`). Normally unneeded: the settlement notice carries the words.',
+  'list — every actionable task, one line per row: `<slug>@<paneId> [<state>] (<kind> · <lifecycle>) <description>`. States: `running` (turn in flight), `idle` (report consumed), `no report`, `no pane` (gone pane). Another session\'s live task shows marked `[otra sesión]`; its gone pane never shows. Closed and spent rows never print.',
   '',
-  'send — `agentId` + `message`: steered into a working worker at its next tool gap; wakes an idle or settled one. `interrupt` aborts its current turn only — the pane and session stay, and no report arrives.',
+  'output — `agentId`; the state plus the finalized report or, while it runs, the latest lines (`max_chars`, 100-16000; whole pane only with `full: true`). Normally unneeded: the settlement notice carries the words.',
   '',
-  'close — `agentId`; reclaims a finished worker: pane and tab go, session and ledger row stay, so `resume` revives it. A running worker is refused — interrupt first. A one-shot role is reclaimed this way automatically; a `worktree` checkout is removed too (never forced; a dirty one is refused, the branch survives).',
+  'send — `agentId` + `message`: steered into a working worker at its next tool gap. A task whose pane is gone revives a new generation first, then takes the text. A closed or spent task is refused. `interrupt` aborts the current turn only — the pane and session stay, and no report arrives.',
   '',
-  'retry — `agentId` or `taskId`, no message: re-sends the prompt piher stored at spawn. Use it after a failure that says nothing about the task (an outage, a dropped stream); a spent row is revived first, and a row with no stored prompt says so.',
+  'close — `agentId`; reclaims a finished worker: pane and tab go, and the record keeps the decision — close is final for every session, so later calls are refused and a new subagent is the only next step. A turn in flight is refused — interrupt first. One-shots reclaim automatically; a `worktree` checkout goes too (never forced; dirty refused, branch survives). Another session\'s live task closes the same way, no adoption step.',
   '',
-  'resume — `taskId`; revives a collected worker from the ledger with `pi --session`. The ledger is append-only JSONL, one row per status change (taskId, description, status running|settled|consumed|closed, outcome, paneId, sessionFile, launchCommand, createdAt), one file per repository at `<repo>/.piher/history/history.jsonl` in the main checkout, shared by worktrees; outside a git repository nothing is recorded. A still-running task is not resumed — use send or output.',
+  'retry — `agentId` or `taskId`, no message: re-sends the prompt stored at spawn, after a fault outside the task. A closed task or spent one-shot starts a new task with the same brief, role and checkout; no stored prompt names `send`.',
+  '',
+  'resume — `taskId`; revives an unfinished task in a new generation, reusing a live pane for the same session when one exists, never the master\'s own. A turn in flight is not resumed — use send or output. Closed tasks are refused, as is another session\'s (only its own resumes it). A missing transcript names its path, with `retry` as the way out.',
 ].join('\n');
 
 const SUBAGENT_CONCURRENCY = 4;
@@ -436,7 +437,6 @@ export default function subagentPlugin(ctx: Context): void {
       } catch {
       }
     }
-    trace(traceRole, 'recover', { via, running: running.length, rearmed: recovered.length, panes: recovered.join('|') });
     if (recovered.length > 0) {
       try {
         await injectNotice(
@@ -456,12 +456,12 @@ export default function subagentPlugin(ctx: Context): void {
     // Records live in the session's own repository: its checkout from the event context, else the
     // configured override, else the process checkout.
     const ctxCwd = (eventCtx as { cwd?: string } | undefined)?.cwd;
-    restoreTasks(board, reason ?? 'session_start', typeof ctxCwd === 'string' ? ctxCwd : undefined);
+    restoreTasks(board, typeof ctxCwd === 'string' ? ctxCwd : undefined);
     await recoverRunningPollers('session_start');
   });
   scoped.on('session_tree', async (_event: unknown, eventCtx: unknown) => {
     const ctxCwd = (eventCtx as { cwd?: string } | undefined)?.cwd;
-    restoreTasks(board, 'session_tree', typeof ctxCwd === 'string' ? ctxCwd : undefined);
+    restoreTasks(board, typeof ctxCwd === 'string' ? ctxCwd : undefined);
     await recoverRunningPollers('session_tree');
   });
 
@@ -673,7 +673,7 @@ export default function subagentPlugin(ctx: Context): void {
 
   /**
    * Bring back a worker whose pane is gone but whose task was never closed. Housekeeping reclaims
-   * panes and tabs (`gc`), so a settled persistent worker usually has no pane left; `send` used to
+   * panes and tabs (`gc`), so a persistent worker with a consumed report usually has no pane left; `send` used to
    * read that as `closed` and revive, which collapsed "not live" and "closed by the master" into one
    * state. They are different: a closed task is final, a vanished pane is unfinished work.
    */
@@ -890,7 +890,6 @@ export default function subagentPlugin(ctx: Context): void {
     } catch {
       listening = false;
     }
-    trace(traceRole, 'pipe-unreachable', { pane: entry.gen.paneId, path, listening, error: String((err as Error)?.message ?? err) });
     const head = `subagent pane ${entry.gen.paneId} is alive but its message channel is dead (${path})`;
     const detail = String((err as Error)?.message ?? err);
     return listening

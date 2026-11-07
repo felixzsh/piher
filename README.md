@@ -18,7 +18,7 @@ its own rules.
 
 | Piece | Package | Role |
 |---|---|---|
-| **pi extension** | `packages/ext` (npm: [`piher`](https://www.npmjs.com/package/piher)) | Registers `subagent` and `bg_job`; starts, reads and reclaims their terminals through core; carries the role manifests and the delegation ledger |
+| **pi extension** | `packages/ext` (npm: [`piher`](https://www.npmjs.com/package/piher)) | Registers `subagent` and `bg_job`; starts, reads and reclaims their terminals through core; carries the role manifests and the task records |
 | **herdr-core** | `hc` ≥ 0.1.16 | Terminal server: `terminal.run/read/wait/send/keys/interrupt/label/kill/rm` plus status and events over `HC_TERMINAL_SOCKET` |
 | **Herdr app** | `herdr-app` (optional) | Displays core terminals as spaces, tabs and panes; its built-in sidebar shows agents and raises blocked notifications |
 
@@ -57,20 +57,20 @@ worker's result arrives later, as a settlement notice at the caller's next turn 
 | Action | What it does |
 |---|---|
 | `spawn` (default) | Start a worker from `prompt` (the whole task), `description`, `cwd` **or** `worktree`, `role`, `allowed_tools`, `tab`. Several spawns in one message run in parallel (cap four) |
-| `send` | Follow-up to a running or settled worker: at its next tool gap when it is working, as a new turn when it is idle |
+| `send` | Follow-up steered between tool calls; a task with no pane revives first, a closed or spent one is refused |
 | `output` | What the worker printed since the previous `output` call, plus the final report once it has one |
-| `list` | Every worker of this session with state, handle, role and last activity |
+| `list` | Every actionable task with state, handle, role and last activity, plus another session's live ones marked |
 | `interrupt` | Abort the current turn only — the pane and its session stay, and no report arrives for that turn |
-| `resume` | Revive a finished worker from the ledger (`taskId`) in a new pane and its own session |
-| `role` | Switch a live worker's role profile; the reply reports the tool diff |
-| `close` | Reclaim a worker that already finished: pane and tab go, session and ledger row stay. A running worker is refused (interrupt its turn first) |
-| `help` | The full manual: placement, role profiles, the ledger, every parameter |
+| `retry` | Re-send the stored spawn prompt after a fault outside the task; a closed task starts a new one |
+| `resume` | Revive an unfinished task (`taskId`) in a new generation, reusing a live pane when one exists |
+| `close` | Reclaim a finished worker: pane and tab go, the record keeps the decision — final for every session. A turn in flight is refused (interrupt first) |
+| `help` | The full manual: placement, role profiles, the two documents, every parameter |
 
 A task is addressed by `agentId`: the slug printed by `spawn`/`list`, the bare pane id, or the
 combined `slug@paneId`.
 
 `worktree: "<name>"` makes piher create `~/.herdr/worktrees/<repo>/<slug>` on branch `<name>` from
-the caller's HEAD and record the checkout in the ledger; repeating it reuses the checkout that
+the caller's HEAD and record the checkout in the task record; repeating it reuses the checkout that
 already sits on that branch. The worker then opens in its own app space, the same window the app's
 worktree button makes. `close` ends it: the space closes and the checkout is removed, the branch
 survives, and a dirty checkout is refused naming the files. A **one-shot closes only its space** —
@@ -115,7 +115,6 @@ when to reach for them.
 
 | Command | Purpose |
 |---|---|
-| `/piher-tree` | The delegation tree: every running subagent plus the settled nodes still resumable, with ages. An in-pi overlay (`esc`/`q` closes, live refresh while open); without `ui.custom` it falls back to a notify view |
 | `/piher-role` | Without arguments: the current role and the available names. `/piher-role <name>` switches mid-session (widening beyond the current toolset asks for confirmation) |
 | `/piher-config` | Read-only configuration guide: the plane index, `show [roles\|env\|all]` with effective value and source, `check`, `doc` |
 | `/piher-locks` | Write locks held by this pane and by live panes — the human view of the `piher.lock.<hash>` labels |
@@ -145,15 +144,16 @@ and the body is the standing brief. Regenerating rewrites only the frontmatter a
 hand-written body, and an integration test fails when the two disagree — the drift that once had
 `subagent spawn {role:"reviewer"}` and `hc run reviewer` launching different models.
 
-## The delegation ledger
+## The task documents
 
-Every spawn, settlement, reclaim and close appends one row to `<repo>/.piher/history/history.jsonl`
-in the **main** checkout — a worker in a linked worktree records into the repository, never into the
-worktree. `resume` reads it and refuses a task whose checkout is gone, naming the `git worktree add`
-that brings it back.
+One spawned worker is one task, and a task is two documents: one record per task at
+`<repo>/.piher/tasks/<taskId>.json` in the **main** checkout — a worker in a linked worktree records
+into the repository, never into the worktree — plus this session's view. Liveness is observed, never
+stored: `list` shows `running`, `idle`, `no report` or `no pane` from live probes, not from a saved
+status. `close` is final for every session, so further work always starts a new subagent.
 Outside a git repository nothing is recorded and `resume` says so.
 
-On the parent side, a settled worker's result arrives as a notice that names the worker and marks its
+On the parent side, a finished worker's result arrives as a notice that names the worker and marks its
 text as that worker's output; while the parent is busy, notices are buffered and the batch shows the
 first few plus a tail that says how many were withheld.
 
@@ -222,10 +222,8 @@ noted. `PIHER_*` is the only namespace.
 | `PIHER_GC_TICK_MS` | `30000` | Idle GC sweep cadence |
 | `PIHER_SESSION_TTL_SECONDS` | `600` | Session retention after a worker exits, before GC |
 | `PIHER_GIT_TIMEOUT_MS` | `10000` | git command timeout (worktree creation, status probes) |
-| `PIHER_SUBAGENT_CARDS` | `rows` | Transcript card for the subagent registry: `rows` (count, and one row per worker when expanded), `summary` (one line while workers run), `off` (never) |
 | `PIHER_JOBS_DIR` | system temp `piher-jobs` | Directory receiving one log file per background job |
 | `PIHER_WRITE_LOCK` | – | `1` makes a conflicting `write`/`edit` block instead of warn |
-| `PIHER_TRACE` | – | Write diagnostics (renderers, swallowed errors) to stderr, or to this path |
 | `PIHER_HMR` | – | Dev only: enable the cordis HMR boundary (needs `--expose-internals`) |
 
 `PIHER_SUBAGENT`, `PIHER_DELEGATION`, `PIHER_ROLE_MANIFEST` and `PIHER_ROLE_BASE` are contracts
@@ -251,7 +249,7 @@ extension that owns `subagent` (for example `@tintinweb/pi-subagents`, `@minhduy
 
 ## Design principles
 
-- **The session transcript is the source of truth**: delegations, registries and role switches replay
+- **The session transcript is the source of truth**: delegations and role switches replay
   from session branches, so a restart or a branch switch stays correct.
 - **Event-driven, never poll**: core's `events.subscribe` drives state; polling is a safety net with a
   long interval, not the mechanism.
@@ -264,7 +262,7 @@ extension that owns `subagent` (for example `@tintinweb/pi-subagents`, `@minhduy
 
 ```
 packages/
-  ext/             # the pi package (npm: piher): tools, core client, roles, ledger, skill
+  ext/             # the pi package (npm: piher): tools, core client, roles, skill
 docs/              # install guide, configuration overview, decision index, release process
 ```
 

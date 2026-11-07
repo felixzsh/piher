@@ -23,10 +23,10 @@ loads and both tools answer with that install command instead of running anythin
 
 | Surface | Names |
 |---|---|
-| Tools | `subagent` (`spawn`, `send`, `output`, `list`, `interrupt`, `resume`, `role`, `close`, `help`), `bg_job` (`start`, `status`, `log`, `stop`, `list`) |
-| Commands | `/piher-tree`, `/piher-role`, `/piher-config`, `/piher-locks` |
+| Tools | `subagent` (`spawn`, `send`, `retry`, `output`, `list`, `interrupt`, `resume`, `close`, `help`), `bg_job` (`start`, `status`, `log`, `stop`, `list`) |
+| Commands | `/piher-role`, `/piher-config`, `/piher-locks` |
 | Skill | `piher-tools` — when to delegate, what a prompt must contain, the answer-or-`BLOCKED:` report contract |
-| Session entries | `piher.delegation`, `piher.settlement`, `piher.role-manifest`, `piher.job-exit`, `piher.config-guide` (`piher.subs` only on sessions written by an older build: the registry is now a per-session document) |
+| Session entries | `piher.delegation`, `piher.settlement`, `piher.role-manifest`, `piher.job-exit`, `piher.config-guide` |
 | Terminal labels | `piher.session`, `piher.lock.<hash>` |
 
 ## Package contents
@@ -53,7 +53,7 @@ npm install --ignore-scripts      # from the repository root
 npm test                          # typecheck + node --test
 ```
 
-The repository README covers the architecture, roles, the delegation ledger, configuration and the
+The repository README covers the architecture, roles, the task documents, configuration and the
 plugin-conflict rules.
 
 ## License

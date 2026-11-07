@@ -40,7 +40,6 @@ import { handlePipeRequest, type MachineRequest } from './index-pipe.ts';
 import { installWriteLocks } from './index-locks.ts';
 import { installConfigCommand } from './config-command.ts';
 import { composeMasterRuntime, createRoleRuntime } from './index-roles.ts';
-import { trace, traceRole } from './trace.ts';
 
 /** How often a worker re-checks that its own socket path still exists (see watchPipePath). */
 const PIPE_WATCHDOG_MS = 10_000;
@@ -75,9 +74,6 @@ export default async function (pi: ExtensionAPI) {
   const rendererTypes = installRenderers(pi);
   /** A card is only worth sending when this host could register its renderer. */
   const cardsRendered = rendererTypes.includes(SETTLEMENT_CUSTOM_TYPE);
-  if (process.env.PIHER_TRACE) {
-    console.error(`[piher] transcript renderers: ${rendererTypes.length ? rendererTypes.join(', ') : 'none'}`);
-  }
 
   let agentActive = false;
   let lastStopReason: string | null = null;
@@ -188,7 +184,6 @@ export default async function (pi: ExtensionAPI) {
     if (!paneId) {
       // No address means no channel: every follow-up to this pane is undeliverable, which is worth
       // saying out loud rather than discovering as a 90 s timeout on the other side.
-      trace(traceRole, 'pipe-listen', { ok: false, why: 'no-pane-id', cwd });
       return;
     }
     const name = pipeNameFor(cwd, paneId);
@@ -197,7 +192,6 @@ export default async function (pi: ExtensionAPI) {
     // previous holder first — our own server on a rebind, or a second copy of this extension loaded in
     // the same pane (an installed package plus the spawner's `-e`). Binding before that close would let
     // libuv delete the new entry; leaving the previous holder alive would let a stale ctx answer.
-    const hadServer = pipeServerBox.current !== null;
     const generation = await takeOverPipe(paneId, async () => {
       const mine = pipeServerBox.current;
       pipeServerBox.current = null;
@@ -206,12 +200,10 @@ export default async function (pi: ExtensionAPI) {
       if (mine) await closePipeServer(mine);
     });
     pipeGeneration = generation;
-    if (hadServer) trace(traceRole, 'pipe-rebind', { pane: paneId, path });
     /** A bind failure is silent by construction (net.Server reports it on 'error'), so it is the one
      *  failure that used to leave a live worker unreachable with nothing in any log. */
     const bindFailed = (err: Error): void => {
       const code = (err as NodeJS.ErrnoException)?.code ?? null;
-      trace(traceRole, 'pipe-listen', { ok: false, pane: paneId, path, code, error: err.message });
       void deliverNotice(
         `piher: this pane cannot receive follow-up messages — its pipe ${path} failed to bind`
         + `${code ? ` (${code})` : ''}. A master that sends to it will report the channel as dead.`,
@@ -232,7 +224,6 @@ export default async function (pi: ExtensionAPI) {
       }), bindFailed);
       pipeServerBox.current = server;
       server.once('listening', () => {
-        trace(traceRole, 'pipe-listen', { ok: true, pane: paneId, path, cwd });
         watchPipePath(cwd, path, paneId, generation);
       });
     } catch (err) {
@@ -251,7 +242,6 @@ export default async function (pi: ExtensionAPI) {
       // A channel someone else took over is not ours to heal, and healing it would start a tug of war.
       if (!ownsPipe(paneId, generation)) return;
       if (existsSync(path)) return;
-      trace(traceRole, 'pipe-vanish', { pane: paneId, path });
       void startPipeServerFor(cwd);
     }, PIPE_WATCHDOG_MS);
     pipeWatchdog.unref?.();
@@ -262,14 +252,12 @@ export default async function (pi: ExtensionAPI) {
   async function pushSettleReply(aborted = false): Promise<boolean> {
     const req = pendingMachineRequest;
     if (!req || !req.from) {
-      trace(traceRole, 'push-skip', { why: 'no-request', hasReq: req !== null, from: req?.from ?? null });
       return false;
     }
     // An aborted settle is not a settlement: the closing message is still coming, and answering now
     // would burn the one-shot request + the parent's claim latch on a null-text reply ("left no
     // closing message") — the real closing message then never gets delivered. Keep the request armed.
     if (!shouldPushSettleReply({ aborted, lastStopReason })) {
-      trace(traceRole, 'push-skip', { why: 'aborted-or-error', aborted, lastStopReason });
       return false;
     }
     pendingMachineRequest = null;
@@ -290,14 +278,8 @@ export default async function (pi: ExtensionAPI) {
         }
       }
       if (text === null) {
-        trace(traceRole, 'push-skip', {
-          why: 'no-text', request: req.id, since: req.sinceTs, file: ownFile, hasFile: ownFile !== null,
-        });
         return false;
       }
-      trace(traceRole, 'push-try', {
-        request: req.id, since: req.sinceTs, file: ownFile, textLen: text.length, to: req.from,
-      });
       await pipeRequest(req.from, {
         type: 'reply',
         id: req.id,
@@ -308,11 +290,9 @@ export default async function (pi: ExtensionAPI) {
       }, 5000);
     } catch (err) {
       /* The requester's pollLoop is the fallback; surface the dead letter for triage. */
-      trace(traceRole, 'push-failed', { request: req.id, to: req.from, error: String((err as Error)?.message ?? err) });
       console.error(`piher: settle reply push to ${req.from} failed: ${(err as Error)?.message ?? err}`);
       return false;
     }
-    trace(traceRole, 'push-ok', { request: req.id, to: req.from });
     return true;
   }
 
@@ -435,10 +415,6 @@ export default async function (pi: ExtensionAPI) {
     // S54: a role-declared `one-shot` worker exits once its report is in the master's hands. The
     // ordering is the whole risk — shutting down first loses the report the parent waits for — so the
     // exit hangs off the push, and never off an aborted turn (S52: an interrupted turn reports nothing).
-    trace(traceRole, 'settle', {
-      aborted, lastStopReason, isSubagent, lifecycle: delegation?.lifecycle ?? null,
-      pushed: await Promise.resolve(pushed), hasRequest: pendingMachineRequest !== null,
-    });
     if (isSubagent && !aborted && delegation?.lifecycle === 'one-shot') {
       void pushed.then((sent) => { if (sent) ctx.shutdown(); });
     } else {

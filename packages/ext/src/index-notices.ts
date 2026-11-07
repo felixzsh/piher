@@ -4,7 +4,6 @@
  * while busy; flush at turn_end (steer) / agent_settled (followUp), collapsing large batches. */
 
 import type { SettlementCard } from './settlement-card.ts';
-import { trace, traceRole } from './trace.ts';
 
 export type NoticeSendMode = 'steer' | 'followUp';
 
@@ -17,7 +16,8 @@ export function collapseNotices(contents: readonly string[], max = NOTICE_MAX_SH
   if (contents.length === 0) return null;
   if (contents.length <= max) return contents.join('\n\n');
   const hidden = contents.length - max;
-  const tail = `…${hidden} more settlement(s) not shown individually. See the history ledger for full results (path formula in the subagent resume tool description); use subagent list for running agents.`;
+  const tail = `…${hidden} more settlement(s) not shown individually. Read each worker's own transcript `
+    + 'for the full result; use subagent list for running agents.';
   return [...contents.slice(0, max), tail].join('\n\n');
 }
 
@@ -44,19 +44,14 @@ export function createNoticeBuffer(opts: {
       if (content !== '' && paneId !== undefined) pendingPaneIds.add(paneId);
       if (opts.isBusy()) {
         pending.push({ content, paneId, ...(card ? { card } : {}) });
-        trace(traceRole, 'notice-buffered', { pane: paneId ?? null, queued: pending.length, contentLen: content.length });
         return;
       }
       try {
         await opts.send(content, 'followUp', card ?? undefined);
-        trace(traceRole, 'notice-sent', { pane: paneId ?? null, contentLen: content.length });
       } catch (err) {
         // pi drops prompts while the agent is mid-turn; holding the notice keeps it (and keeps its
         // pane GC-exempt) until a flush can deliver it, instead of losing the settlement here.
         requeue([{ content, paneId, ...(card ? { card } : {}) }]);
-        trace(traceRole, 'notice-requeued', {
-          pane: paneId ?? null, queued: pending.length, error: String((err as Error)?.message ?? err),
-        });
         return;
       }
       if (content !== '' && paneId !== undefined) pendingPaneIds.delete(paneId);
@@ -69,12 +64,8 @@ export function createNoticeBuffer(opts: {
       if (collapsed) {
         try {
           await opts.send(collapsed, mode, flushed.length === 1 ? flushed[0]!.card : undefined);
-          trace(traceRole, 'notice-flushed', { mode, count: flushed.length, contentLen: collapsed.length });
-        } catch (err) {
+        } catch {
           requeue(flushed);
-          trace(traceRole, 'notice-flush-failed', {
-            mode, count: flushed.length, error: String((err as Error)?.message ?? err),
-          });
           return;
         }
       }

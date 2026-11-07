@@ -68,7 +68,7 @@ test('checkEnvKnobs flags only unparsable/out-of-range registered values', () =>
 test('secret-shaped keys are redacted and never rendered verbatim', () => {
   // Deliberately narrower than a bare `token` match, so a key that merely carries token-shaped
   // vocabulary is still shown verbatim.
-  assert.equal(redactValue('PIHER_GC_TICK_MS', 8000), '8000'); assert.equal(redactValue('PIHER_TRACE', '/tmp/x'), '/tmp/x');
+  assert.equal(redactValue('PIHER_GC_TICK_MS', 8000), '8000'); assert.equal(redactValue('PIHER_POLL_INTERVAL_MS', '/tmp/x'), '/tmp/x');
   assert.equal(redactValue('PIHER_API_KEY', 'sk-live-123'), '***'); assert.equal(formatValue(undefined), '(unset)');
 
   const entries = [{ knob: { plane: 'env' as const, key: 'PIHER_API_KEY', kind: 'string' as const, impact: 'api key' }, value: '***', source: 'env' as const }];

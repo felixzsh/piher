@@ -1,8 +1,7 @@
 /**
  * piher's per-session state root: `<sessionDir>/piher/<sessionId>/`, the one place the extension owns
- * beside pi's transcript. The worker marker and the subagent registry live here, both written in place
- * rather than appended to the session, which is an immutable log: `appendEntry` has no replace, and a
- * growing tail of full copies is exactly what made a reload restore a truncated registry (S73).
+ * beside pi's transcript. The worker marker and the session's task view live here, written in place
+ * rather than appended to the session, which is an immutable log with no replace.
  */
 import { dirname, join } from 'node:path';
 import { bareSessionId } from './session-tail.ts';

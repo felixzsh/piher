@@ -226,7 +226,7 @@ test('collapseNotices: empty → null; ≤3 verbatim; >3 → first three + count
   assert.ok(over.startsWith(`${three.join('\n\n')}\n\n`));
   const tail = over.split('\n\n').pop()!;
   assert.match(tail, /2 more settlement\(s\) not shown individually/);
-  assert.match(tail, /history ledger/);
+  assert.match(tail, /worker's own transcript/);
   assert.match(tail, /subagent list for running agents/);
   assert.ok(!over.includes('\n\nn4') && !over.includes('\n\nn5'));
 });
