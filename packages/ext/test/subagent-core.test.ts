@@ -503,7 +503,7 @@ test('subagent plugin: a restored row answers the ref `list` printed, and its cl
       assert.ok(record && record.closedAt !== null, 'the decision lands in the record');
       // The bare pane id is the other form the master reached for.
       const again = await runSubagent(pi, { action: 'close', agentId: 't195' }, repo);
-      assert.match(again.content[0]!.text, /already closed/, 'the restored row now answers by pane id too');
+      assert.match(again.content[0]!.text, /close is final/, 'it answers by pane id too');
     } finally {
       await root.fiber.dispose();
     }
@@ -571,7 +571,8 @@ test('subagent plugin: close records the decision even when the memory row is al
     });
     try {
       const res = await runSubagent(pi, { action: 'close', agentId: 'task-idem' }, repo);
-      assert.match(res.content[0]!.text, /already closed/);
+      assert.match(res.content[0]!.text, /closed by the master/);
+      assert.match(res.content[0]!.text, /close is final/);
       const record = readTaskRecord(repo, 'task-idem');
       assert.ok(record && record.closedAt !== null, 'the record now carries the decision');
     } finally {
@@ -864,8 +865,9 @@ test('subagent plugin: interrupt names the way back for a settled and for a clos
     assert.match(settled, /action "close"/, 'and points at close, not a wait');
     assert.match(settled, /resume[\s\S]*task-settled/, 'the refusal names resume(taskId)');
     const closed = await runSubagentRejects(pi, { action: 'interrupt', agentId: 'p-closed' });
-    assert.match(closed, /closed[\s\S]*resume/, 'a closed worker points at resume');
-    assert.match(closed, /task-closed/, 'with the taskId to revive');
+    assert.match(closed, /closed/, 'a closed worker says it is closed');
+    assert.match(closed, /new subagent/, 'and points at new work, not a revive');
+    assert.match(closed, /task-closed/, 'naming the task that ended');
   } finally {
     await root.fiber.dispose();
   }
@@ -886,13 +888,13 @@ test('subagent plugin: close reclaims a finished worker and keeps its task resum
     const cwd = mkdtempSync(join(tmpdir(), 'piher-close-cwd-'));
     const closed = await runSubagent(pi, { action: 'close', agentId: 'p-done' }, cwd);
     assert.match(closed.content[0]!.text, /p-done.*closed/);
-    assert.match(closed.content[0]!.text, /resume/);
+    assert.match(closed.content[0]!.text, /new subagent/, 'a closed task points at new work');
     assert.deepEqual(retired, ['kill:p-done', 'remove:p-done'], 'the kill+rm pair the GC uses: pane and tab go');
     assert.equal(closed.details?.taskId, 'task-done', 'the record keeps the taskId, so resume answers from it');
 
-    // Closing an already-closed row is a no-op, with the way back spelled out.
+    // Closing an already-closed row is a no-op, with the finality spelled out.
     const again = await runSubagent(pi, { action: 'close', agentId: 'p-done' }, cwd);
-    assert.match(again.content[0]!.text, /already closed/);
+    assert.match(again.content[0]!.text, /close is final/);
     assert.deepEqual(retired, ['kill:p-done', 'remove:p-done']);
   } finally {
     await root.fiber.dispose();

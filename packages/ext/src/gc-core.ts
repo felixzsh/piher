@@ -43,7 +43,9 @@ export function shouldClosePane(opts: {
   /** Only a one-shot spends itself; a persistent worker is the master's to close. */
   lifecycle?: 'one-shot' | 'persistent';
 }): boolean {
-  if (opts.status === undefined) return true; // terminal gone → record settled
+  // A terminal the snapshot does not list is not this planner's to close: there is no pane to
+  // reclaim, and blessing the close would retire a terminal that may simply be unlisted.
+  if (opts.status === undefined) return false;
   // Killing a persistent worker's process buys nothing: it has no pane to reclaim, and the next
   // `send` would pay a cold start and revive a conversation that was never over.
   if (opts.lifecycle !== 'one-shot') return false;

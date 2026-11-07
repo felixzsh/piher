@@ -51,7 +51,8 @@ test('shouldClosePane: only a one-shot pane is reclaimed; a persistent worker is
   assert.equal(pane({ status: 'unknown' }), false);
   assert.equal(pane({ consumedAt: NOW + 500 }), false, 'consumed this turn keeps the notice visible');
   assert.equal(pane({ consumedAt: null }), false);
-  assert.equal(pane({ consumedAt: null, status: undefined }), true, 'a vanished terminal is recorded settled');
+  const unlisted = pane({ consumedAt: null, status: undefined });
+  assert.equal(unlisted, false, 'an unlisted terminal is not ours to close');
 });
 
 /* ── plugin-level GC ────────────────────────────────────────────── */

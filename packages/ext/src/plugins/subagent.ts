@@ -896,7 +896,9 @@ export default function subagentPlugin(ctx: Context): void {
     // pipe attempt itself is the honest test.
     if (isClosed(entry)) {
       return toolError(
-        `Error: subagent ${taskRef(entry.gen)} is closed — its pane and tab are gone, so there is no turn to interrupt. action "resume" with taskId ${entry.taskId} revives its session in a new pane.`,
+        `Error: subagent ${taskRef(entry.gen)} is closed — its pane and tab are gone, so there is `
+        + 'no turn to interrupt. '
+        + `Close is final for task ${entry.taskId} — start a new subagent for further work.`,
       );
     }
     let probe: AliveProbe;
@@ -945,8 +947,10 @@ export default function subagentPlugin(ctx: Context): void {
         entry.closedAt = Date.now();
         writeRecord(entry);
       }
+      const finality = `Error: task ${entry.taskId} was closed by the master; close is final, `
+        + 'so there is nothing to resume or send to. Start a new subagent for further work.';
       return {
-        content: [{ type: 'text', text: `Subagent ${taskRef(entry.gen)} is already closed (pane and tab gone); action resume with taskId ${entry.taskId} revives its session.` }],
+        content: [{ type: 'text', text: finality }],
         details: { paneId: entry.gen.paneId, taskId: entry.taskId, alreadyClosed: true },
       };
     }
@@ -993,8 +997,10 @@ export default function subagentPlugin(ctx: Context): void {
     entry.closedAt = Date.now();
     // The record survives the pane: `resume` answers from it, so the decision is not lost.
     writeTaskRecord(recordCwd, entry);
+    const doneText = `Subagent ${taskRef(entry.gen)} closed — pane and tab gone;${checkoutLine} `
+      + 'close is final — start a new subagent for further work.';
     return {
-      content: [{ type: 'text', text: `Subagent ${taskRef(entry.gen)} closed — pane and tab gone;${checkoutLine} action resume with taskId ${entry.taskId} brings its session back.` }],
+      content: [{ type: 'text', text: doneText }],
       details: { paneId: entry.gen.paneId, taskId: entry.taskId },
     };
   }
