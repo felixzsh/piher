@@ -1,6 +1,6 @@
 {
   "name": "piher",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "piher: registers the subagent and terminal tools in pi and runs them as herdr-core terminals shown by the Herdr app",
   "license": "MIT",
   "type": "module",
