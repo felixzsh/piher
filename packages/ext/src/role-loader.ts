@@ -61,6 +61,8 @@ export interface LoadRoleOptions {
   layerRead?: LayerReader;
   /** Base directory for the workspace layer (defaults to process.cwd()). */
   baseDir?: string;
+  /** The user layer, so a caller can keep the real `~/.pi` out of the search (tests, tooling). */
+  userDir?: string;
   /** Direct built-in lookup (master self-application, WS-D7): reserved names skip user layers and
    *  collision checks and always load the bundled manifest — otherwise a workspace master.json could make
    *  self-application fail open and silently lose master's manifest. */
@@ -114,7 +116,7 @@ export function loadRoleConfig(name: string, opts?: LoadRoleOptions): RoleManife
   }
 
   const layerRead = opts?.layerRead ?? defaultLayerRead;
-  let layers = roleLayers({ baseDir: opts?.baseDir });
+  let layers = roleLayers({ baseDir: opts?.baseDir, userDir: opts?.userDir });
 
   if (opts?.builtinDirect && RESERVED_ROLE_NAMES.includes(name)) {
     layers = [layers[2]];
