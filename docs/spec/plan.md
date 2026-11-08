@@ -109,7 +109,7 @@ resident widget keeps one line per running worker and its overflow hint names `s
 P5 done: `8f68609` (range `b48e3a0..8f68609`, after `d1f215a`), Risk: item 4 (the three shipped texts),
 `npm test` 456/456 green (~7 s, run by the parent on that commit; five consecutive green runs by the
 worker), Route: delegated. `trace.ts`, its two specs and every call site are gone without losing a retry,
-a claim, a park or a notice; `PIHER_TRACE` and `PIHER_SUBAGENT_CARDS` left the code and the docs; the
+a claim, a park or a notice; the trace knob and the subagent-card knob left the code and the docs; the
 description, the `help` manual and the shipped skill now say one model (task/taskId, two documents,
 observed liveness, `running`/`idle`/`no report`/`no pane`, close final, retry starts a new task,
 `[otra sesión]`, send revives a gone pane); README pair, INSTALL and `decisions.md` match it (D113 removed,
