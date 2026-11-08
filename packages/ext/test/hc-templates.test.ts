@@ -1,6 +1,9 @@
 /** hc-templates: the role manifest is the source of truth, the template is the derived artifact. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { hcTemplatesDir, mergeHcTemplate, planHcTemplate, planHcTemplates, templateCommand } from '../src/hc-templates.ts';
 import type { RoleManifest } from '../src/role-manifest.ts';
 
@@ -62,16 +65,42 @@ test('the harness roles and hidden roles are not launched by name', () => {
 });
 
 test('every launchable role of the catalog yields exactly one plan, in name order', () => {
-  const plans = planHcTemplates();
-  assert.ok(plans.length > 0, 'the builtin catalog has at least one launchable role');
-  const names = plans.map((plan) => plan.name);
-  assert.deepEqual(names, [...names].sort((left, right) => left.localeCompare(right)));
-  assert.equal(new Set(names).size, names.length, 'one template per role name');
-  for (const plan of plans) {
-    assert.ok(!['master', 'worker-default'].includes(plan.name));
-    assert.equal(plan.fileName, `${plan.name}.md`);
-    assert.match(plan.markdown, /^---\nname: /);
-    assert.ok(plan.command.startsWith('pi'));
+  // The catalog is the layers under the caller's `baseDir`/`userDir`, never this machine's
+  // `~/.pi/agent/piher/roles/`: a test that reads the home directory is green only where roles were
+  // installed by hand and red on a fresh checkout (CI).
+  const root = mkdtempSync(join(tmpdir(), 'piher-hc-catalog-'));
+  const workspace = join(root, 'repo');
+  const userDir = join(root, 'user');
+  mkdirSync(join(workspace, '.piher', 'roles'), { recursive: true });
+  mkdirSync(userDir, { recursive: true });
+  const write = (dir: string, name: string, overrides: Partial<RoleManifest> = {}): void => {
+    writeFileSync(join(dir, `${name}.json`), JSON.stringify({ ...manifest(), role: name, ...overrides }));
+  };
+  write(join(workspace, '.piher', 'roles'), 'reviewer');
+  write(userDir, 'builder');
+  write(userDir, 'hidden-helper', { modelInvocable: false });
+  try {
+    const plans = planHcTemplates({ baseDir: workspace, userDir });
+    assert.deepEqual(plans.map((plan) => plan.name), ['builder', 'reviewer']);
+    for (const plan of plans) {
+      assert.ok(!['master', 'worker-default'].includes(plan.name));
+      assert.equal(plan.fileName, `${plan.name}.md`);
+      assert.match(plan.markdown, /^---\nname: /);
+      assert.ok(plan.command.startsWith('pi'));
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an empty catalog yields no plans instead of throwing', () => {
+  const root = mkdtempSync(join(tmpdir(), 'piher-hc-empty-'));
+  try {
+    // What a machine with no workspace and no user roles has: only the bundled `master` and
+    // `worker-default`, which are the harness's own and are not launched by name.
+    assert.deepEqual(planHcTemplates({ baseDir: root, userDir: root }), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
