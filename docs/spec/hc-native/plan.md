@@ -357,3 +357,12 @@ none loosened. Residual: the wiring line in `index.ts`
 (`subagentPort.current?.openDeliveryBatch?.() ?? null`) has no test of its own — if the port member were
 renamed, #10 would silently regress to per-notice marking — and the fork case (#6) remains out of scope
 by decision, so it is the only review finding still open.
+L20. **The delivery, proven live**: no code change — a parent-level run after a `/reload` that carried E13,
+the ledger corrections and the row delivery. Eleven spawns in one batch (ten `explorer`s answering one-line
+questions, plus the `inbox` worker) with an 80 s blocking control so the master was busy exactly when they
+settled. Result: **zero false boot failures in eleven spawns**, and the ten settlements arrived as **ten
+rows in one message of 1,046 B**, each naming its pane, its description, its outcome and its size, with
+its body inline and **no collapse and no withheld report**. Compared with the same experiment on
+`73cc5af`, which delivered **3 of 10 in 889 B** with two false failures: ten complete reports now cost
+157 B more than three truncated ones did. The eleventh spawn stayed silent because it had not settled,
+which is the behaviour the channel promises. Measured in the session transcript, not only observed.
