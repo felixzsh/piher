@@ -80,8 +80,48 @@ export function buildSettlementNoticeText(
   return formatSettlementNotice(agentLabel, closing, reportDeliveredAt);
 }
 
-export function formatPaneClosedNotice(paneId: string, description: string): string {
-  return `Background subagent ${paneId} (${description}) stopped before settling (its pane closed).`;
+/** How the core says a terminal ended: its `reason` and the `exit_code` that rode with it. `null`
+ *  as a whole means the core keeps no record of the terminal any more (it was reaped, not ended). */
+export interface TerminalEnding {
+  reason: string | null;
+  exitCode: number | null;
+}
+
+/**
+ * The core's own word for an ending (spec S17): `reason` decides how a terminal ended and `exit_code`
+ * never does — a killed worker's record reads `exit_code: 0, reason: "killed"`, so an exit code alone
+ * would call a kill a clean exit. The fact therefore says the reason first, the exit code only when
+ * the core gave no reason, and that the ending was bare when it gave neither.
+ */
+export function formatTerminalEnding(ending: TerminalEnding | null): string {
+  if (ending === null) return 'the core keeps no record of its terminal any more';
+  const reason = ending.reason?.trim() ?? '';
+  if (reason !== '') {
+    return ending.exitCode === null
+      ? `the core says "${reason}"`
+      : `the core says "${reason}" (exit code ${ending.exitCode})`;
+  }
+  if (ending.exitCode !== null) return `it exited with code ${ending.exitCode}`;
+  return 'it exited with no reason and no exit code (a bare exit)';
+}
+
+/**
+ * A pane that ended before its settlement, said as the fact it is: the core's reason for the ending,
+ * who the worker was (pane, task, description, elapsed), and the one call that reads what it left -
+ * a pane that went never wrote a report document, so `output` (which falls back to the document) is
+ * the only read that can still answer. Announcing silence, or "stopped before settling" with no
+ * reason, makes the master guess what happened (E11).
+ */
+export function formatPaneClosedNotice(input: {
+  paneId: string;
+  description: string;
+  /** The task, not only the pane: a pane id is only borrowed, the task is not (E1). */
+  taskId: string;
+  ending: TerminalEnding | null;
+  elapsedMs: number;
+}): string {
+  const seconds = Math.max(0, Math.round(input.elapsedMs / 1000));
+  return `Background subagent ${input.paneId} (${input.description}, task ${input.taskId}) stopped before settling after ${seconds}s: ${formatTerminalEnding(input.ending)}, so it never wrote a report. Its pane is gone, which is not the task's result: read what it left with subagent(action: "output", agentId ${input.paneId}) before relying on anything it did.`;
 }
 
 export function formatSettleTimeoutNotice(input: {
@@ -373,8 +413,10 @@ export function createPoller(h: PollerHost): Poller {
     turn: number | null;
     /** The core did not answer: this observation establishes nothing, not even that it is working. */
     blind: boolean;
+    /** How the core says the terminal ended; null while it is alive, and when it keeps no record. */
+    ending: TerminalEnding | null;
   }> {
-    if (!watch.connected) return { state: null, alive: true, turn: null, blind: true };
+    if (!watch.connected) return { state: null, alive: true, turn: null, blind: true, ending: null };
     let info: TerminalInfo | null | undefined = watch.get(paneId);
     if (!info) {
       // Not in the snapshot: a fresh spawn racing its `created` event, or a terminal that is gone.
@@ -382,13 +424,16 @@ export function createPoller(h: PollerHost): Poller {
         info = await h.client.getTerminal(paneId);
       } catch {
         // An unreachable socket must not be read as a dead terminal — and it is blindness, not work.
-        return { state: null, alive: true, turn: null, blind: true };
+        return { state: null, alive: true, turn: null, blind: true, ending: null };
       }
     }
     if (!info || info.state === 'finished') {
-      return { state: 'exited', alive: false, turn: info?.turn ?? null, blind: false };
+      // The core's own word for the ending (S17): `reason` decides, `exit_code` rides along. A
+      // terminal the core no longer lists leaves no record, which is a fact too — not silence.
+      const ending = info ? { reason: info.reason, exitCode: info.exitCode } : null;
+      return { state: 'exited', alive: false, turn: info?.turn ?? null, blind: false, ending };
     }
-    return { state: info.status, alive: true, turn: info.turn ?? null, blind: false };
+    return { state: info.status, alive: true, turn: info.turn ?? null, blind: false, ending: null };
   }
 
   /** The row's owner is the request that opened it: a steer registers a new request for this pane
@@ -576,6 +621,10 @@ export function createPoller(h: PollerHost): Poller {
     /** One blindness notice per episode: a watch that stays disconnected must not speak on every
      *  budget tick, and a reconnected one that goes blind again is news again. */
     let blindNotified = false;
+    /** The instant the core's ending was first observed, held across a refused notice so the retry
+     *  repeats the same fact: `(taskId, at)` is the ledger's key, so a retry never forks one ending
+     *  into two pane-gone facts (E11). */
+    let goneAt: number | null = null;
     /** Whether the row was already settled when this watch was armed. Such a watch was armed for
      *  nothing and ends at once. A row settled WHILE the loop runs does not end it: that worker's next
      *  settle (a person typing in its pane, a queued steer) writes a document, and S6 says the master
@@ -605,7 +654,7 @@ export function createPoller(h: PollerHost): Poller {
           const woke = await watch.changed(paneId, seen, Math.max(0, ms));
           return woke;
         };
-        const { state, alive, turn, blind } = await observe(paneId);
+        const { state, alive, turn, blind, ending } = await observe(paneId);
         // Back off only while the worker says nothing new: any change is news and resets the park.
         const stamp = `${state ?? '-'}:${turn ?? '-'}`;
         if (stamp === lastStamp) recheckMs = Math.min(MAX_RECHECK_PARK_MS, recheckMs * 2);
@@ -702,20 +751,36 @@ export function createPoller(h: PollerHost): Poller {
         }
         if (tick.action === 'pane-closed') {
           // The pane going is a native fact, not a guess: it is announced like a settlement and, like
-          // one, is recorded as delivered only when pi accepted it.
-          await announce({
+          // one, is recorded as delivered only when pi accepted it. It is announced the moment it is
+          // OBSERVED — the budget's expiry has nothing to do with it, and a kill observed now must
+          // not wait it out (E11).
+          goneAt ??= now();
+          const how = formatTerminalEnding(ending);
+          const announced = await announce({
             entry,
             request: current,
-            at: now(),
+            at: goneAt,
             kind: 'pane-gone',
             turn,
-            notice: formatPaneClosedNotice(paneId, current.description),
+            notice: formatPaneClosedNotice({
+              paneId,
+              description: current.description,
+              taskId: entry.taskId,
+              ending,
+              elapsedMs: goneAt - entry.createdAt,
+            }),
             card: cardFor(entry, paneId, current.description, 'failed'),
             row: {
               id: paneId, description: current.description, outcome: 'closed', body: null,
-              note: 'stopped before settling: its pane closed',
+              note: `stopped before settling: ${how}`,
             },
           });
+          // A refused notice is retried under the same identity (the ledger dedupes it), never
+          // dropped: a fact the master could not be told yet is not a fact nobody needs to know.
+          if (announced === 'retry') {
+            await park(recheckMs);
+            continue;
+          }
           return;
         }
         if (blind) {

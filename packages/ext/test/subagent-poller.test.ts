@@ -53,7 +53,20 @@ test('notice formatting: settlement text, pane-closed and settle-timeout wording
   assert.match(silent, /It left no closing message\.$/);
   assert.ok(!silent.includes('\n'));
 
-  assert.equal(formatPaneClosedNotice('p1', 'build assets'), 'Background subagent p1 (build assets) stopped before settling (its pane closed).');
+  // An ending is said in the core's own words (S17): the reason decides, the exit code rides along
+  // only when the core gave no reason, and a terminal the core no longer lists is a bare fact too.
+  const ending = (value: { reason: string | null; exitCode: number | null } | null, elapsedMs = 0) =>
+    formatPaneClosedNotice({ paneId: 'p1', description: 'build assets', taskId: 'task-1', ending: value, elapsedMs });
+  assert.match(ending({ reason: 'exit', exitCode: 3 }), /the core says "exit" \(exit code 3\)/);
+  assert.match(ending({ reason: null, exitCode: 7 }), /it exited with code 7/);
+  assert.match(ending({ reason: null, exitCode: null }), /it exited with no reason and no exit code \(a bare exit\)/);
+  assert.match(ending(null), /the core keeps no record of its terminal any more/);
+
+  const closed = ending({ reason: 'killed', exitCode: 0 }, 3_400);
+  assert.match(closed, /^Background subagent p1 \(build assets, task task-1\) stopped before settling after 3s/);
+  assert.match(closed, /the core says "killed" \(exit code 0\)/, 'the core\'s reason, not a guess');
+  assert.match(closed, /subagent\(action: "output", agentId p1\)/, 'and the one call that reads what it left');
+  assert.ok(!closed.includes('\n'), 'one line, like every other notice');
   const timeout = formatSettleTimeoutNotice({
     paneId: 'p1', description: 'build assets', idleSeconds: 120, startedAtIso: '2025-01-01T00:00:00.000Z',
   });
@@ -112,6 +125,8 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
   let waitState: CoreStatus | 'exited' | null = 'idle';
   /** The core's turn counter for the worker: what the watch reports. */
   let turn = 0;
+  /** How the core says this terminal ended: `hc kill` reports `killed` with `exit_code: 0`. */
+  let ending: { reason: string | null; exitCode: number | null } = { reason: null, exitCode: null };
   /** False takes the worker out of the watch snapshot, forcing the getTerminal fallback. */
   let inSnapshot = true;
   const retired: string[] = [];
@@ -128,7 +143,7 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
     connected,
     terminals: () => {
       if (!inSnapshot) return [];
-      if (waitState === 'exited') return [terminalInfo({ id: paneId, state: 'finished', turn, labels: { 'herdr.tab': 't0' } })];
+      if (waitState === 'exited') return [terminalInfo({ id: paneId, state: 'finished', turn, ...ending, labels: { 'herdr.tab': 't0' } })];
       // `null` = no word to act on: the worker is (still) working.
       return [terminalInfo({ id: paneId, status: waitState ?? 'working', turn, labels: { 'herdr.tab': 't0' } })];
     },
@@ -199,6 +214,7 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
     parks: () => watch.parks,
     waitState: (s: CoreStatus | 'exited' | null) => { waitState = s; },
     setTurn: (n: number) => { turn = n; },
+    setEnding: (value: { reason: string | null; exitCode: number | null }) => { ending = value; },
     reattribute: (f: string | null) => { reattributed = f; },
     setInSnapshot: (v: boolean) => { inSnapshot = v; },
     setConnected: (v: boolean) => { connected = v; watch = buildWatch(); },
@@ -544,7 +560,80 @@ test('pollLoop: a vanished pane consumes the row as failed without waiting for t
   await start(f);
   assert.ok(f.entry!.gen.consumedAt !== null);
   assert.equal(f.writes.length, 1, 'one record for the one settlement');
-  assert.match(f.notices[0]!, /stopped before settling \(its pane closed\)/);
+  assert.match(f.notices[0]!, /stopped before settling/);
+  assert.match(f.notices[0]!, /the core keeps no record of its terminal any more/,
+    'a reaped terminal is a fact, not "its pane closed" with no word from the core');
+});
+
+/* ── E11: a terminal ended from outside is a settlement ─────────── */
+
+test('E11: a killed pane is one pane-gone fact carrying the core\'s reason and the identity', async () => {
+  // `hc kill` from outside piher: `state: finished`, `reason: "killed"`, `exit_code: 0`, and the
+  // core keeps the turn counter. The master must hear it as one fact, in the core's own words.
+  const f = fixture(makeEntry('p-kill', { createdAt: 10_000 }));
+  f.host.policy = { subagentTimeoutMs: 3_600_000 }; // an hour: the budget cannot be what ends this
+  f.setTurn(4);
+  f.setEnding({ reason: 'killed', exitCode: 0 });
+  f.waitState('exited');
+  await start(f);
+
+  assert.deepEqual(f.parks(), [], 'the observation ends it: no park, no budget expiry');
+  assert.equal(f.notices.length, 1, 'exactly one fact reaches the master');
+  const notice = f.notices[0]!;
+  assert.match(notice, /Background subagent p-kill \(desc, task task-1\)/,
+    'the identity is the pane AND the task, which a borrowed pane id cannot take away');
+  assert.match(notice, /stopped before settling after 3s/, 'how long it ran is part of who it was');
+  assert.match(notice, /the core says "killed" \(exit code 0\)/, 'the core\'s reason, never "its pane closed"');
+  assert.match(notice, /subagent\(action: "output", agentId p-kill\)/, 'and the exact call that reads what it left');
+
+  const facts = f.host.ledger.events();
+  assert.equal(facts.length, 1, `one ledger fact: ${JSON.stringify(facts)}`);
+  assert.deepEqual(
+    { kind: facts[0]!.kind, taskId: facts[0]!.taskId, pane: facts[0]!.pane, turn: facts[0]!.turn },
+    { kind: 'pane-gone', taskId: 'task-1', pane: 'p-kill', turn: 4 },
+    'the fact is a pane-gone for the task, with the turn the core kept on the finished terminal',
+  );
+  assert.equal(f.entry!.gen.consumedAt, facts[0]!.at, 'the row is delivered at the fact\'s own identity');
+  assert.equal(f.noticeRows[0]?.outcome, 'closed', 'a row, as every settlement has');
+  assert.match(f.noticeRows[0]?.note ?? '', /the core says "killed" \(exit code 0\)/,
+    'the row keeps the core\'s reason for the batch');
+  assert.equal(f.noticeRows[0]?.body, null, 'no document exists, so the row carries no body');
+  assert.equal(f.cards[0]?.outcome, 'failed', 'a worker that never settled is not a success card');
+});
+
+test('E11: a settle and then a reap deliver the settle only, once', async () => {
+  // The worker wrote its report and settled; its pane is reaped afterwards. Two facts about one
+  // ending would make the master act twice on work it already has.
+  const f = fixture(makeEntry('p-settle-reap'));
+  f.setEnding({ reason: 'killed', exitCode: 0 });
+  docSettle(f, 'p-settle-reap', reportDoc('task-1', 'the report, written before the pane went'));
+  await start(f);
+  assert.equal(f.notices.length, 1, `one delivery, the settle: ${JSON.stringify(f.notices)}`);
+  assert.ok(f.notices[0]!.includes('the report, written before the pane went'));
+  assert.doesNotMatch(f.notices[0]!, /stopped before settling/);
+  assert.deepEqual(f.host.ledger.events().map((e) => e.kind), ['settled'], 'and no pane-gone behind it');
+});
+
+test('E11: a refused pane-gone notice is retried as the same fact, not a second one', async () => {
+  const f = fixture(makeEntry('p-kill-busy'));
+  f.setEnding({ reason: 'killed', exitCode: 0 });
+  f.waitState('exited');
+  /** Every injection the master was offered: a refusal is not a delivery. */
+  const attempts: string[] = [];
+  let refusals = 1;
+  f.host.injectNotice = async (content, _paneId, card, onAccepted, row) => {
+    attempts.push(content);
+    if (refusals-- > 0) throw new Error('the master is mid-turn');
+    f.notices.push(content);
+    f.cards.push(card ?? null);
+    f.noticeRows.push(row);
+    onAccepted?.();
+  };
+  await start(f);
+  assert.equal(attempts.length, 2, 'a refused notice is retried, not dropped');
+  assert.equal(f.notices.length, 1, 'and delivered once');
+  assert.deepEqual(f.host.ledger.events().map((e) => e.kind), ['pane-gone'],
+    'the retry repeats the same (taskId, at): one fact, never two ledger lines');
 });
 
 test('pollLoop: a failure card carries the role and elapsed a settle card does', async () => {

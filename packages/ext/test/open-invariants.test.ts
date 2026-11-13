@@ -7,7 +7,9 @@
  * (`settlement-transport.test.ts`) and a read that recovers what the master missed
  * (`subagent-inbox.test.ts`) are their pins now, and the invariants document says so. E6 and E8 left
  * it the same way: `session-budget.test.ts` holds the session ceiling, and `compaction.test.ts` the
- * pause across the cut and the roster re-stated from the records.
+ * pause across the cut and the roster re-stated from the records. E11 left last: `subagent-poller.test.ts`
+ * holds the external kill that reaches the master as one pane-gone fact and the settle-then-reap that
+ * delivers only the settle.
  *
  * Why skipped and not failing: the suite is green at every commit, and a red test would pin
  * nothing. The convention is the opposite of a TODO comment — when the fix lands, the test moves
@@ -26,12 +28,4 @@ test('E10: per-worker cost in the core does not grow with N', OPEN(
   'a worker subscribes to what concerns it, not to every element event of the core',
 ), () => {
   assert.fail('E10 open: subscriptions are unfiltered per worker');
-});
-
-test('E11: a terminal killed from outside reaches the master as a settlement', OPEN(
-  'E11',
-  'a pane killed outside piher keeps its row believing it is alive until liveness corrects',
-  'an externally ended worker settles with an exit fact, not with silence',
-), () => {
-  assert.fail('E11 open: external kills are not settlements');
 });
