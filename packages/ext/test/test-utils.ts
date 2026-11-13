@@ -284,6 +284,7 @@ export function fakeCore(over: Partial<CoreClientLike> = {}): CoreClientLike {
     interrupt: async () => 'unknown',
     read: async () => ({ text: '', complete: true }),
     watchChildren: () => fakeWatch(),
+    watchDocuments: () => ({ connected: false, close: () => {} }),
     waitForOutput: async () => ({ matched: false, reason: 'timeout' }),
     kill: noop,
     remove: noop,

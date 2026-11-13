@@ -3,8 +3,12 @@
  * settle, and the master delivers that document on the core's `turn` event, deduped per
  * settlement.
  *
- * Pure planners decide; adapters do I/O. The master poll loop (subagent-poller.ts) and the worker
- * settle hook (index.ts) both build on this module.
+ * The document rules live here for both piher documents: the names (S9), the value guards and the
+ * compare-and-swap write (S11) that the steering channel in `command-documents.ts` shares, so the
+ * two can never disagree about how a document is spelled or written.
+ *
+ * Pure planners decide; adapters do I/O. The master poll loop (subagent-poller.ts), the worker
+ * settle hook (index.ts) and the worker's command watch both build on this module.
  */
 import type { CoreClientLike } from './core-client.ts';
 
@@ -40,8 +44,8 @@ export function reportDocName(address: string): string | null {
   return name;
 }
 
-/** Command document name for a worker address (spec S9; written by P3, named here so both sides
- *  share one spelling). */
+/** Command document name for a worker address (spec S9): one spelling for both sides — the master
+ *  writes it, the worker's own watch reads it (see `command-documents.ts`). */
 export function commandDocName(address: string): string | null {
   const name = `piher.cmd.${address}`;
   if (name.length > 32) return null;
@@ -159,27 +163,28 @@ function byteLength(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value) ?? '', 'utf8');
 }
 
-export type ReportWriteResult =
+export type DocumentWriteResult =
   | { ok: true; version: number }
   | { ok: false; reason: string };
 
 /**
- * Write a report document with compare-and-swap (spec S11): read the version, write against it,
- * and on `conflict` re-read and retry — never an unconditional overwrite. The value is fitted to
- * the core's ceiling first (S13), and a transport failure is retried once: the document is the
- * authoritative channel, so the one thing this must not do is give up while a second attempt could
- * still deliver the report. A failure names its reason so the caller can say what was lost.
+ * Write a piher document with compare-and-swap (spec S11): read the version, write against it, and
+ * on `conflict` re-read and retry — never an unconditional overwrite. A transport failure is
+ * retried once: a document is the durable channel (a report to the master, a command to a worker),
+ * so the one thing this must not do is give up while a second attempt could still deliver it. A
+ * failure names its reason so the caller can say what was lost.
+ *
+ * `name` is null when the address cannot name a document (S9); `unsupported` is the reason that
+ * caller wants to hear then.
  */
-export async function writeReportDocument(
+export async function writeDocument(
   client: CoreClientLike,
-  address: string,
-  value: ReportDocumentValue,
-  opts: { attempts?: number } = {},
-): Promise<ReportWriteResult> {
-  const name = reportDocName(address);
-  if (!name) return { ok: false, reason: `"${address}" cannot name a document (S9)` };
+  name: string | null,
+  value: unknown,
+  opts: { attempts?: number; unsupported?: string } = {},
+): Promise<DocumentWriteResult> {
+  if (!name) return { ok: false, reason: opts.unsupported ?? 'this address cannot name a document (S9)' };
   if (!client.available) return { ok: false, reason: 'no herdr-core terminal' };
-  const fitted = fitReportDocument(value);
   const transportAttempts = Math.max(1, opts.attempts ?? 2);
   let reason = 'the core refused the document';
   for (let transport = 0; transport < transportAttempts; transport++) {
@@ -193,7 +198,7 @@ export async function writeReportDocument(
       }
       if (current === null) return { ok: false, reason: 'no document store answered' };
       try {
-        return { ok: true, version: await client.docSet(name, fitted, current.version) };
+        return { ok: true, version: await client.docSet(name, value, current.version) };
       } catch (err) {
         const kind = (err as { kind?: unknown })?.kind;
         if (kind !== 'conflict') {
@@ -205,6 +210,19 @@ export async function writeReportDocument(
     }
   }
   return { ok: false, reason };
+}
+
+/** A report document, fitted to the core's ceiling (S13) and written with the CAS discipline above. */
+export async function writeReportDocument(
+  client: CoreClientLike,
+  address: string,
+  value: ReportDocumentValue,
+  opts: { attempts?: number } = {},
+): Promise<DocumentWriteResult> {
+  return writeDocument(client, reportDocName(address), fitReportDocument(value), {
+    ...opts,
+    unsupported: `"${address}" cannot name a document (S9)`,
+  });
 }
 
 function errorText(err: unknown): string {

@@ -173,6 +173,10 @@ export interface CoreClientLike {
   read(id: string, opts?: { lines?: number }): Promise<ReadBuffer>;
   /** This terminal's children (workers, shells it started), kept live by one event subscription. */
   watchChildren(): WorkerWatch;
+  /** `doc` notifications for the whole core. A document is core-global and `events.subscribe` takes
+   *  over the connection it is sent on (spec S23, S24), so this is a second, unfiltered
+   *  subscription: a `children_of` or `terminal`-scoped one never sees a `doc` event. */
+  watchDocuments(onDoc: (name: string | null) => void): DocWatch;
   waitForOutput(id: string, text: string, timeoutMs: number): Promise<WaitForOutputResult>;
   kill(id: string): Promise<void>;
   /** Remove a finished terminal; a missing one is not an error. */
@@ -204,6 +208,16 @@ export interface WorkerWatch {
   version(id: string): number;
   /** Resolves true once `version(id)` passes `since`, false after `timeoutMs` (or on close). */
   changed(id: string, since: number, timeoutMs: number): Promise<boolean>;
+  close(): void;
+}
+
+/**
+ * A live `doc` subscription (spec S23, S24). `onDoc` receives the document name of every `doc`
+ * notification, and `null` once per (re)subscription — the notification carries no value, and while
+ * disconnected the caller may have missed one, so `null` means "read what you care about now".
+ */
+export interface DocWatch {
+  readonly connected: boolean;
   close(): void;
 }
 
@@ -278,6 +292,7 @@ export class NoopCoreClient implements CoreClientLike {
   async interrupt(): Promise<InterruptOutcome> { return 'unknown'; }
   async read(): Promise<ReadBuffer> { return { text: '', complete: false }; }
   watchChildren(): WorkerWatch { return NOOP_WATCH; }
+  watchDocuments(): DocWatch { return NOOP_DOC_WATCH; }
   async waitForOutput(): Promise<WaitForOutputResult> { return { matched: false, reason: 'unavailable' }; }
   async kill(): Promise<void> {}
   async remove(): Promise<void> {}
@@ -299,6 +314,8 @@ const NOOP_WATCH: WorkerWatch = {
   },
   close: () => {},
 };
+
+const NOOP_DOC_WATCH: DocWatch = { connected: false, close: () => {} };
 
 /** core heartbeats an idle subscription every 15 s; three missed beats means the line is dead. */
 const WATCH_IDLE_MS = 45_000;
@@ -536,6 +553,114 @@ export class CoreWatch implements WorkerWatch {
 
 /* ── Implementation ──────────────────────────────────────────────────── */
 
+/**
+ * The `doc` half of `events.subscribe` (spec S23, S24). Unfiltered on purpose: a document is
+ * core-global, and a subscription scoped by `children_of`, `labels` or `terminal` receives no `doc`
+ * event at all (measured). It therefore owns a connection of its own — the subscription carries only
+ * notifications — and re-reads after every (re)subscription, because a command written during a
+ * disconnect is still in the core and would otherwise be lost.
+ */
+export class CoreDocWatch implements DocWatch {
+  connected = false;
+  private readonly socketPath: string;
+  private readonly onDoc: (name: string | null) => void;
+  private sock: net.Socket | null = null;
+  private closed = false;
+  private attempt = 0;
+  private idleTimer: NodeJS.Timeout | undefined;
+  private retryTimer: NodeJS.Timeout | undefined;
+
+  constructor(env: CoreEnv, onDoc: (name: string | null) => void) {
+    this.socketPath = env.socketPath;
+    this.onDoc = onDoc;
+    this.connect();
+  }
+
+  close(): void {
+    this.closed = true;
+    this.connected = false;
+    clearTimeout(this.idleTimer);
+    clearTimeout(this.retryTimer);
+    this.sock?.destroy();
+    this.sock = null;
+  }
+
+  private armIdle(sock: net.Socket): void {
+    clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => sock.destroy(new Error('hc events: heartbeat lost')), WATCH_IDLE_MS);
+    this.idleTimer.unref?.();
+  }
+
+  private connect(): void {
+    if (this.closed) return;
+    const sock = net.createConnection(this.socketPath);
+    this.sock = sock;
+    sock.setEncoding('utf8');
+    let buf = '';
+    sock.on('connect', () => {
+      this.armIdle(sock);
+      // No filters: `doc` events are core-global, and only an unfiltered subscription carries them.
+      sock.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'events.subscribe', params: {} }) + '\n');
+    });
+    sock.on('data', (chunk) => {
+      this.armIdle(sock);
+      buf += chunk;
+      let idx: number;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (line) this.handle(sock, line);
+      }
+    });
+    const drop = (): void => {
+      if (this.sock !== sock) return;
+      this.sock = null;
+      this.connected = false;
+      clearTimeout(this.idleTimer);
+      if (this.closed) return;
+      const delay = WATCH_BACKOFF_MS[Math.min(this.attempt, WATCH_BACKOFF_MS.length - 1)];
+      this.attempt += 1;
+      this.retryTimer = setTimeout(() => this.connect(), delay);
+      this.retryTimer.unref?.();
+    };
+    sock.on('error', drop);
+    sock.on('close', drop);
+  }
+
+  private handle(sock: net.Socket, line: string): void {
+    let msg: { id?: unknown; method?: string; params?: Record<string, unknown>; error?: unknown };
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      sock.destroy();
+      return;
+    }
+    if (msg.id === 1) {
+      if (msg.error) {
+        sock.destroy();
+        return;
+      }
+      this.connected = true;
+      this.attempt = 0;
+      // What happened while we were away is still in the core: read it now.
+      this.onDoc(null);
+      return;
+    }
+    // `missed` means this subscriber fell behind and lost notifications; its snapshot is about
+    // terminals, so for documents the honest answer is the same re-read a reconnect does.
+    if (msg.method === 'missed') {
+      this.onDoc(null);
+      return;
+    }
+    if (msg.method !== 'event') return;
+    const p = msg.params ?? {};
+    if (p.type !== 'doc') return;
+    const data = (p.data ?? null) as Record<string, unknown> | null;
+    const name = data !== null && typeof data.name === 'string' ? data.name : null;
+    if (name !== null) this.onDoc(name);
+  }
+}
+
 /** Slack over a server-side wait before the client gives up on the socket. */
 const WAIT_SLACK_MS = 10_000;
 
@@ -693,6 +818,10 @@ export class CoreClient implements CoreClientLike {
   watchChildren(): WorkerWatch {
     this.watch ??= new CoreWatch(this.env);
     return this.watch;
+  }
+
+  watchDocuments(onDoc: (name: string | null) => void): DocWatch {
+    return new CoreDocWatch(this.env, onDoc);
   }
 
   async waitForOutput(id: string, text: string, timeoutMs: number): Promise<WaitForOutputResult> {
