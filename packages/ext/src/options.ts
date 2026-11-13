@@ -39,6 +39,7 @@ export const OPTION_SPECS: readonly OptionSpec[] = [
   { name: 'PIHER_GC_TICK_MS', fallback: '30000', min: 1000, policy: 'gcTickMs', description: 'idle GC sweep cadence (panes)' },
   { name: 'PIHER_SESSION_TTL_SECONDS', fallback: '600', min: 0, policy: 'sessionTtlSeconds', description: 'session retention after a subagent exits, before GC' },
   { name: 'PIHER_NOTICE_BODY_BUDGET_BYTES', fallback: '4096', min: 0, description: 'report bytes one settlement delivery carries inline; every report over it arrives as a row with a pointer, and one call to action reports reads them all' },
+  { name: 'PIHER_SESSION_REPORT_BUDGET_BYTES', fallback: '32768', min: 0, description: 'report bytes one SESSION carries inline across every delivery; once it is spent, further reports arrive as rows with pointers, and the delivery says which budget withheld them' },
   { name: 'PIHER_WRITE_LOCK', fallback: '', description: '1 makes a conflicting write/edit block instead of warn (read by the lock layer)' },
   { name: 'PIHER_JOBS_DIR', fallback: '(system temp)/piher-jobs', description: 'directory receiving one log file per background job' },
   { name: 'PIHER_HMR', fallback: '', description: 'dev: enable the cordis HMR boundary (requires --expose-internals)' },

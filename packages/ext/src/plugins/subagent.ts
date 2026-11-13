@@ -74,6 +74,8 @@ import {
 } from '../worktree.ts';
 import { createPoller, replaySettlements, type PollerHost } from '../subagent-poller.ts';
 import { openSettlementLedger, settlementLedgerPath, type SettlementLedger } from '../settlement-ledger.ts';
+import { openSessionReportBytes, sessionReportBytesPath } from '../session-budget.ts';
+import { collectRosterTasks, planCompactRoster } from '../compact-roster.ts';
 import { awaitCommandPickup, commandDocumentOverflow, steerCommand, writeCommandDocument, type CommandPickup } from '../command-documents.ts';
 import { MAX_DOCUMENT_BYTES, commandDocName, readReportDocument, type ReportDocumentRead } from '../report-documents.ts';
 import { createGcController, restoreTasks, retirePane, seedForkView } from '../subagent-gc.ts';
@@ -354,10 +356,21 @@ export default function subagentPlugin(ctx: Context): void {
   const ledger = openSettlementLedger({
     file: settlementLedgerPath(d.getCwd?.() ?? process.cwd(), d.getSessionId()),
   });
-  /** Point the ledger at the repository the session actually restored in (a checkpoint may have
-   *  moved it). No file means no repository: the facts then live in this process only. */
+  /**
+   * E6: the report text this session has already carried, in a sidecar beside the ledger
+   * (`<ledger>.bytes`). Durable on purpose: a restart, a `/reload` or a compaction must not hand the
+   * same conversation a fresh ceiling, and RAM would.
+   */
+  const reportBytes = openSessionReportBytes({
+    file: sessionReportBytesPath(settlementLedgerPath(d.getCwd?.() ?? process.cwd(), d.getSessionId())),
+  });
+  /** Point the ledger — and the counter that rides beside it — at the repository the session actually
+   *  restored in (a checkpoint may have moved it). No file means no repository: the facts and the
+   *  count then live in this process only. */
   function ledgerFor(cwd: string): SettlementLedger {
-    ledger.repoint(settlementLedgerPath(cwd, d.getSessionId()));
+    const file = settlementLedgerPath(cwd, d.getSessionId());
+    ledger.repoint(file);
+    reportBytes.repoint(sessionReportBytesPath(file));
     return ledger;
   }
 
@@ -461,6 +474,29 @@ export default function subagentPlugin(ctx: Context): void {
     })();
   }
 
+  /**
+   * E8b: who is still alive and unsettled, as the two durable sources say it — the session's task
+   *  records and the ledger's unread settlements. Reading them here is the whole point: a compaction
+   *  has just replaced the conversation, so nothing may be reconstructed from what the master
+   *  remembers.
+   */
+  function buildCompactRoster(): string {
+    const live = [...tasks.values()]
+      .filter((entry) => isActionable(entry) && entry.gen.consumedAt === null)
+      .map((entry) => ({
+        taskId: entry.taskId,
+        paneId: entry.gen.paneId,
+        description: entry.description,
+        startedAt: entry.gen.startedAt,
+      }));
+    return planCompactRoster(collectRosterTasks({
+      live,
+      events: ledger.events(),
+      deliveredSeq: ledger.deliveredSeq(),
+      now: Date.now(),
+    }));
+  }
+
   const boundPort: SubagentPort = {
     listRunningSubs() {
       // The widget shows the tasks still awaiting a report. The state text comes from the last
@@ -479,6 +515,13 @@ export default function subagentPlugin(ctx: Context): void {
     // The notice buffer lives in index.ts, this session's ledger lives here: one delivery that pi
     // took as a single message is recorded as one cursor step through this seam (E1).
     openDeliveryBatch: () => ledger.openBatch(),
+    // E6: the session's report-text accounting rides with the ledger, so a restart resumes the same
+    // ceiling instead of starting from zero.
+    sessionReportBytes: () => reportBytes.delivered(),
+    recordReportBytes: (bytes) => reportBytes.record(bytes),
+    // E8b: the state a compaction re-states, from the ledger and the records — never from what the
+    // conversation said before the summary replaced it.
+    compactRoster: () => buildCompactRoster(),
   };
   port.current = boundPort;
   ctx.effect(() => () => {

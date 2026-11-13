@@ -38,6 +38,8 @@ import {
 } from './delegation-core.ts';
 import { widgetLines } from './tree-view.ts';
 import { createNoticeBuffer } from './index-notices.ts';
+import { createCompactionGate } from './compaction-gate.ts';
+import { portSessionBudget, sessionReportBudgetBytes } from './session-budget.ts';
 import { installWriteLocks } from './index-locks.ts';
 import { installConfigCommand } from './config-command.ts';
 import { composeMasterRuntime, createRoleRuntime } from './index-roles.ts';
@@ -159,11 +161,18 @@ export default async function (pi: ExtensionAPI) {
     }
   };
 
+  /** True while the agent is in a turn, or after an abort that must not wake a new run. */
+  const agentIsBusy = (): boolean => agentActive || lastStopReason === ABORT_STOP_REASON;
+
+  /** E6: the ceiling this process reads, captured at mount like the body budget, so one delivery's
+   *  decision cannot straddle a changed environment. */
+  const sessionCeilingBytes = sessionReportBudgetBytes();
+
   const notices = createNoticeBuffer({
     // pi core rejects prompts while the agent is mid-turn (and drops fire-and-forget sends), so a
     // settlement landing in that window must stay buffered until the run settles — otherwise the
     // result is lost with nobody left to retry it.
-    isBusy: () => agentActive || lastStopReason === ABORT_STOP_REASON,
+    isBusy: agentIsBusy,
     send: (content, mode, card) => sendSettlementNotice(pi, {
       content,
       mode,
@@ -174,6 +183,12 @@ export default async function (pi: ExtensionAPI) {
     // buffer only knows the batch boundary. While no plugin is mounted there is no cursor to move,
     // so a batch without a ledger is one step per notice — which is the case with no delivery either.
     openBatch: () => subagentPort.current?.openDeliveryBatch?.() ?? null,
+    // E6: the session ceiling. Both halves live with the plugin's ledger — the count is durable there
+    // (a sidecar, so a restart resumes it) and the record happens only when pi took the message. No
+    // port (a worker, a bare pi) means no session accounting, and the delivery is judged per delivery
+    // as it always was.
+    sessionBudget: () => portSessionBudget(subagentPort.current, sessionCeilingBytes),
+    recordDeliveryBytes: (bytes) => subagentPort.current?.recordReportBytes?.(bytes),
   });
   const deliverNotice = notices.deliverNotice;
 
@@ -498,6 +513,28 @@ export default async function (pi: ExtensionAPI) {
   });
 
   installConfigCommand({ pi });
+
+  /* ── E8: a compaction cuts a prefix, so piher's state has to survive it ──
+   *  pi's compaction replaces everything before `firstKeptEntryId` with a summary, and the hooks
+   *  bracket it (`docs/compaction.md`): nothing piher says may land inside the span being summarized,
+   *  and after the cut the master is told the state from the records. `compaction-gate.ts` holds the
+   *  order; these three lines are the whole adapter. */
+  const compaction = createCompactionGate({
+    buffer: notices,
+    // A worker holds no delegation records, so it re-states nothing: the port is bound by the master
+    // mount only, and its absence is the honest answer rather than an empty roster.
+    roster: () => (isSubagent ? null : subagentPort.current?.compactRoster?.() ?? null),
+    isBusy: agentIsBusy,
+  });
+  pi.on('session_before_compact', async () => {
+    compaction.before();
+  });
+  pi.on('session_compact', async () => {
+    await compaction.after();
+  });
+  pi.on('session_compact_failed', async () => {
+    compaction.failed();
+  });
 
   pi.on('session_shutdown', async () => {
     // Nothing outlives the session it serves: the command subscription is a connection of its own.

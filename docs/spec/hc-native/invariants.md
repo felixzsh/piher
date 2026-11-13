@@ -15,9 +15,9 @@ test se muda al fichero que posee ese comportamiento y este documento cambia de 
 | E3 | el estado que ves es el del core, nunca una conjetura | **cerrado** | settle = `turn` + documento; `test/subagent-poller.test.ts` |
 | E4 | el informe íntegro es alcanzable sin el pane | **cerrado** | `test/subagent-session.test.ts`; probado en vivo tras `/reload` (L9) |
 | E5 | un informe perdido es recuperable sin adivinar | **cerrado** | `test/subagent-inbox.test.ts`: un registro barrido sigue dando su hecho y su cuerpo desde `piher.rep.<pane>`; si el documento falta o es de otra tarea, la fila dice qué se estableció |
-| E6 | el coste por evento en el master está acotado | **abierto** | cap de 16 KB por aviso existe; no hay presupuesto de sesión |
+| E6 | el coste por evento en el master está acotado | **cerrado** | `test/session-budget.test.ts`: el techo de sesión (32 KiB, `PIHER_SESSION_REPORT_BUDGET_BYTES`) se suma al de 4 KB por entrega — bajo el techo nada cambia, encima los cuerpos son punteros y la entrega lo dice con sus números; el contador es durable (`<ledger>.bytes`), así que un reinicio no regala techo |
 | E7 | el master no necesita preguntar para enterarse | **cerrado** | `triggerTurn` en cada settlement; `test/index-parts.test.ts` |
-| E8 | el estado de piher sobrevive a la compactación del master | **abierto** | el buffer no se pausa; el roster no se re-inyecta |
+| E8 | el estado de piher sobrevive a la compactación del master | **cerrado** | `test/compaction.test.ts`: el buffer se pausa entre `session_before_compact` y `session_compact`/`..._failed` y un settlement anunciado en la ventana se entrega tras el corte, nunca dentro del prefijo; y el roster se re-inyecta desde los registros (en vivo / settled-unread / fallido), acotado a 1.200 B con treinta tareas |
 | E9 | una ráfaga de N spawns no produce falsos fallos | **cerrado** | `test/integration/subagent-spawn.test.ts`: diez spawns en una tanda, diez settlements, cero fallos de arranque |
 | E10 | el coste por worker no crece con N en el core | **abierto** | una suscripción `events.subscribe` sin filtro por worker |
 | E11 | el roster refleja la realidad, incluido un pane matado por fuera | **abierto** | un pane muerto por fuera no es un settle |

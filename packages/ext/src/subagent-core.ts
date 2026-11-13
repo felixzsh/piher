@@ -532,6 +532,14 @@ export interface SubagentPort {
    *  to pi, and the ledger that records the delivery lives in the plugin, so the batch's single cursor
    *  step is opened through here. `end` closes it and writes the cursor once. */
   openDeliveryBatch?(): { end(): void } | null;
+  /** E6: report text this session has already carried, from the durable counter the plugin keeps
+   *  beside the settlement ledger. Absent (a host with no records) means no session ceiling. */
+  sessionReportBytes?(): number;
+  /** E6: add what pi accepted, once it took the message — the same moment the cursor moves. */
+  recordReportBytes?(bytes: number): void;
+  /** E8b: what a compaction re-states, from the records: who is running, what settled and is unread,
+   *  what failed. Null when this host holds no records to state. */
+  compactRoster?(): string | null;
 }
 
 export interface SubagentPortBox {

@@ -5,7 +5,9 @@
  *
  * E1 and E5 left this file when they closed: a row per settlement in every delivery
  * (`settlement-transport.test.ts`) and a read that recovers what the master missed
- * (`subagent-inbox.test.ts`) are their pins now, and the invariants document says so.
+ * (`subagent-inbox.test.ts`) are their pins now, and the invariants document says so. E6 and E8 left
+ * it the same way: `session-budget.test.ts` holds the session ceiling, and `compaction.test.ts` the
+ * pause across the cut and the roster re-stated from the records.
  *
  * Why skipped and not failing: the suite is green at every commit, and a red test would pin
  * nothing. The convention is the opposite of a TODO comment — when the fix lands, the test moves
@@ -17,22 +19,6 @@ import assert from 'node:assert/strict';
 
 const OPEN = (id: string, evidence: string, property: string) =>
   ({ skip: `${id} open — ${evidence}. Property: ${property}` });
-
-test('E6: report bytes delivered to the master are bounded per session', OPEN(
-  'E6',
-  'a 16 KB cap exists per notice; measured 191 KB of settlements in one session',
-  'a session-level budget decides what is inlined, not only a per-notice cap',
-), () => {
-  assert.fail('E6 open: no session-wide accounting of delivered report bytes');
-});
-
-test('E8: piher state survives the master compacting its conversation', OPEN(
-  'E8',
-  'the notice buffer is not paused across a compaction and the roster is not re-injected',
-  'pending settlements are flushed after the cut, and the live roster is re-stated from the records',
-), () => {
-  assert.fail('E8 open: no session_before_compact/session_compact handling');
-});
 
 test('E10: per-worker cost in the core does not grow with N', OPEN(
   'E10',
