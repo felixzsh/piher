@@ -64,3 +64,14 @@ herramienta subagent y bg_job".
 L2. Policy and route, before P1: base `master` @ `d41583914ea8bf51d2232336c984f3261b5d6071`, no push, no
 parallel phases, red-at-end not allowed. `Route: delegated` (P1 spans four or more files of the spawn and
 settlement path and its acceptance needs the full suite plus a real spawn).
+L3. **P1 done**: `659d04c` (two correction commits over `522810b`), Risk: item 4 (delivery dedupe, claim
+latch and CAS writes across two writers), `tsc` clean + `npm test` **487/487** on that SHA, Route:
+delegated. Two reviews, both REJECT: the first raised 8 findings (7 corrected, 1 discarded as
+pre-existing double-mount shape), the second found 4 still open on the same paths plus a question about a
+stale `turn` read — all five corrected, with settlement identity moved from (`taskId`, `turn`) to the
+document instance (`address`, `at`). No third review: the phase's budget is two. Residuals recorded, not
+hidden: a settle whose document write fails on an already-consumed row reaches the master only on the
+next request; the consumed-row reader does not survive a master restart (P4's event-driven re-arm owns
+it); a `522810b`-era document with `text: null` still renders "Reason: stop"; a document-write failure is
+logged worker-side only. The suite failure the P1 worker called pre-existing was mine: the role switch to
+deepseek left `~/.config/herdr-core/templates/*.md` stale, regenerated outside the repo.
