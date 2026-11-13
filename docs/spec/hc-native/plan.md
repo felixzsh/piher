@@ -229,3 +229,21 @@ the fixture's late submit is a 20 ms timer against the core's real Enter cost (t
 child fits, but no live burst has been re-run since the fix); a child that ran a turn and left **no**
 document is still judged a boot failure, which is literally true but would read better as the
 `settled-without-report` ending at boot — a follow-up, not this unit.
+L13. **External review (README-level) and what it changed**: no SHA of its own — this line records a
+review of the architecture by another model that read the README, not the source, and the triage that
+kept it honest. Adopted as written: (a) a **cursor with ack and a snapshot revision** as the design of
+E5 — delivery stays a notice, the guarantee becomes a durable cursor a restarted master resumes from;
+(b) a **load simulator** as the closing harness — thirty stub workers that die, lag, duplicate and
+block, asserting one `reported` event per task, no `send` without a terminal state, and a snapshot that
+never contradicts the journal. Folded into decisions already taken: structured results with `verdict`
+and `artifacts`/`details_path` belong to the role-output contract, and its "groups per phase" is E1's
+aggregate delivery under another name. Recorded as a scale gap: **provider rate limits (429)** are
+handled nowhere, which matters at 30 and not at 10. Rejected with reasons, so nobody re-litigates them:
+a scheduler with a queue (the premise is false — `SUBAGENT_CONCURRENCY` admits pane creation through a
+semaphore that already queues, and ten spawns in one batch all started), nine states with leases (a
+second source of truth that can contradict the core's), a single-writer storage rewrite (one file per
+task is already one file per task; the contention is git, not JSON), and putting the journal before any
+measurement (its own simulator section argues the opposite). One correction of ours it earned: the
+first task still enters by `terminal.send`, so the boot race was fixed at the symptom (ask the document
+before calling a boot a failure, L12); routing the brief through the mailbox is the structural fix to
+return to if the race reappears.
