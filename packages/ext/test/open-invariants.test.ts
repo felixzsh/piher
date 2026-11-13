@@ -3,6 +3,10 @@
  * the evidence that made it open and the property that closes it. See
  * docs/spec/hc-native/invariants.md for the closed ones and for why these twelve exist.
  *
+ * E1 and E5 left this file when they closed: a row per settlement in every delivery
+ * (`settlement-transport.test.ts`) and a read that recovers what the master missed
+ * (`subagent-inbox.test.ts`) are their pins now, and the invariants document says so.
+ *
  * Why skipped and not failing: the suite is green at every commit, and a red test would pin
  * nothing. The convention is the opposite of a TODO comment — when the fix lands, the test moves
  * to the file that owns that behaviour, and this entry disappears. `node --test` prints it as
@@ -13,22 +17,6 @@ import assert from 'node:assert/strict';
 
 const OPEN = (id: string, evidence: string, property: string) =>
   ({ skip: `${id} open — ${evidence}. Property: ${property}` });
-
-test('E1: every settlement in a delivery, with its identity', OPEN(
-  'E1',
-  'measured: one delivery carries 3 of 10 settlements for N>3 (plan L10/L11)',
-  'every settled workerId appears in the delivery, and a withheld report is a pointer, not silence',
-), () => {
-  assert.fail('E1 open: byte-budgeted delivery (row per settlement) is not implemented');
-});
-
-test('E5: a report stays reachable when its record was swept', OPEN(
-  'E5',
-  'G10 closed the pane case; a swept record leaves no path from an address to its document',
-  'the report document survives, or is addressable, after the task record is gone',
-), () => {
-  assert.fail('E5 open: output needs the record to find the document');
-});
 
 test('E6: report bytes delivered to the master are bounded per session', OPEN(
   'E6',
