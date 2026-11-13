@@ -39,9 +39,10 @@ its own rules.
 - **Status comes only from pi's native OSC 7501 report**, which core stores and the app renders.
   piher never writes terminal status.
 - Metadata lives in **terminal labels**, and only ones with a reader inside piher: `piher.lock.<hash>`
-  (write-lock beacons). `hc get <terminal> --json` shows them. A worker's **session identity** comes
-  from the core's own `hresume` label, written by the worker's Herdr extension — piher writes no
-  session label of its own.
+  (write-lock beacons) and `piher.task` (the task a worker terminal was made for, written at spawn —
+  what tells this task's worker from whatever a reused address holds now; spec S26). `hc get
+  <terminal> --json` shows them. A worker's **session identity** comes from the core's own `hresume`
+  label, written by the worker's Herdr extension — piher writes no session label of its own.
 - Machine-to-machine messages use **the core's documents** (`piher.rep.<address>`,
   `piher.cmd.<address>`), never a socket of piher's, and the extension opens no listener: a report, a
   steer and a replacement request all travel as document values. Two keystrokes are piher's and only

@@ -57,7 +57,7 @@ import type { Lifecycle } from '../role-manifest.ts';
 import { toolError, ToolError } from '../tool-error.ts';
 import { readTaskPrompt } from '../prompt-store.ts';
 import type { PaneStateSlot } from './bg-job.ts';
-import { bareSessionId } from '../session-tail.ts';
+import { bareSessionId, resolveSessionFileValue } from '../session-tail.ts';
 import { mainWorktreeRoot } from '../storage-layout.ts';
 import type { SettlementCard } from '../settlement-card.ts';
 import { DELEGATION_ENV, type DelegationContext } from '../delegation-core.ts';
@@ -214,47 +214,60 @@ function unreadCommandText(paneId: string, taskId: string, command: string, budg
     + `action "resume" with taskId ${taskId} restarts it in a new pane; action "close" retires the row.`;
 }
 
-/** The `resume` refusal, in the words the tool contract fixes (docs/spec/contracts.md): it names the
- *  three places the session could still be and says only what each read established. A clause is
- *  never asserted on a read that did not happen — a label read that the core never answered, or a
- *  document that was never written, say so in their own words, and "no session to resume" is only
- *  claimed when the core actually answered. */
+/** The `resume` refusal for a task with no session anywhere: it names the three places the session
+ *  could still be and says only what each read established. A clause is never asserted on a read that
+ *  did not happen — when the core never answered, the whole refusal says that instead (the second
+ *  shape below), and every other clause is the fact one read returned. */
 function noSessionText(input: {
   taskId: string;
   paneId: string;
   address: ReportDocumentRead;
-  /** Null when the address was not read at all: it holds another task's report document. */
-  report: SessionReport | null;
-  foreignAddress: boolean;
+  report: SessionReport;
 }): string {
-  const tail = 'reviving it would start a fresh conversation. Use action "spawn" for new work, or '
-    + '"retry" to start a new task from the same brief.';
-  if (input.report?.kind === 'unavailable' || input.address.kind === 'unavailable') {
+  if (input.report.kind === 'unavailable' || input.address.kind === 'unavailable') {
     return `Error: task ${input.taskId} cannot be checked for a session right now: the core did not `
       + `answer for its terminal ${input.paneId || '(none)'} or its settlement document, so no session `
       + 'could be read. Try action "resume" again once the core answers.';
   }
-  // The address holds another task's report: this task's session was never established there, so
-  // this is not the "no session anywhere" refusal — it is "this address is not yours".
-  if (input.foreignAddress) {
-    return `Error: task ${input.taskId} cannot be resumed at its address ${input.paneId}: that address `
-      + "now holds another task's settlement document, so the terminal there and its `hresume` label are "
-      + "that worker's conversation, not this task's, and its record carries no session either — reviving "
-      + `it would start a fresh conversation. Use action "spawn" for new work, or "retry" to start a new `
-      + 'task from the same brief.';
-  }
   const terminal = input.paneId === ''
     ? 'it has no terminal left'
-    : input.report?.kind === 'gone'
+    : input.report.kind === 'gone'
       ? 'its core terminal is gone'
-      : input.report?.kind === 'not-ours'
+      : input.report.kind === 'not-ours'
         ? `its core terminal ${input.paneId} is not its own (${input.report.why})`
         : 'its core terminal reports no session';
   const document = input.address.kind === 'read'
-    ? 'its settlement document reported no session'
-    : 'it has no settlement document';
+    ? (input.address.value.taskId === input.taskId
+      ? 'its settlement document reported no session'
+      : 'the settlement document at its address belongs to another task')
+    : input.address.kind === 'not-a-report'
+      ? 'the document at its address is not a report piher can read'
+      : 'it has no settlement document';
   return `Error: task ${input.taskId} has no session to resume: ${terminal}, ${document}, and its `
-    + `record carries none — ${tail}`;
+    + 'record carries none — reviving it would start a fresh conversation. Use action "spawn" for new '
+    + 'work, or "retry" to start a new task from the same brief.';
+}
+
+/** The `resume` refusal for a session that was named but cannot be opened: the value the document or the
+ *  label reported, resolved to the path it should be, and `retry` as the way out (tool contract). */
+function goneTranscriptText(taskId: string, path: string): string {
+  return `Error: task ${taskId} cannot be resumed: its transcript ${path} is gone, and reviving it would `
+    + 'start a fresh conversation that knows nothing of the task. Use action "retry" to start a new task '
+    + 'from the same brief, or action "spawn" for new work.';
+}
+
+/** The transcript a reported session names, when this machine can read it: a bare session id is resolved
+ *  through pi's own session directories, and only an existing `.jsonl` counts — the same rule the record
+ *  guard applies (`applyReportedSessionFile`), so a resume never claims a restore it cannot perform. */
+function usableTranscript(value: string, cwd: string): string | null {
+  const file = resolveSessionFileValue(cwd, defaultAgentSessionsDir(), value) ?? value;
+  return /\.jsonl$/i.test(file) && existsSync(file) ? file : null;
+}
+
+/** Where the transcript for a reported session should be: the resolved path when pi's directories know
+ *  the id, else the value itself (what the refusal names). */
+function expectedTranscript(value: string, cwd: string): string {
+  return resolveSessionFileValue(cwd, defaultAgentSessionsDir(), value) ?? value;
 }
 
 export default function subagentPlugin(ctx: Context): void {
@@ -446,7 +459,7 @@ export default function subagentPlugin(ctx: Context): void {
     client,
     getSessionId: d.getSessionId,
     sessionsDir: defaultAgentSessionsDir,
-    getTerminalId: () => env?.terminalId ?? null,
+    getTaskIdForPane: (paneId: string) => panes.get(paneId) ?? null,
   });
   const spawn = createSpawner({ client, env, runtime, git, readinessTimeoutMs: d.policy?.readinessTimeoutMs });
   const poller = createPoller({
@@ -603,6 +616,7 @@ export default function subagentPlugin(ctx: Context): void {
         // worker reappears in a different workspace than the one its checkout lives in.
         zone: entry.worktree ? { zone: 'worktree', tabName: basename(entry.worktree.path) } : undefined,
         spaceId: entry.worktree ? checkoutSpaceId(entry.worktree.path) : null,
+        taskId: entry.taskId,
       },
       entry.cwd,
       {
@@ -848,28 +862,31 @@ export default function subagentPlugin(ctx: Context): void {
       const verdict = spentText(latest);
       if (verdict !== null) return toolError(verdict);
     }
-    // S18/S26: this task's session can be in three places — its record, the settlement document its
-    // worker wrote at its address (S12 keeps it across a core restart), and the core's `hresume` label
-    // on that address. An address is not an identity: a core restart reuses terminal ids, so the label
-    // is read only from a terminal this task's master made, and only when the document does not show
-    // the address already belongs to another task. With none of the three, a resume would start a
-    // fresh conversation under the old task's name — refuse instead of pretending, saying only what
-    // was actually read.
+    // S18/S26: this task's session can be in three places — its record, the core's `hresume` label on
+    // its address, and the settlement document its worker wrote there (S12 keeps that across a core
+    // restart). An address is not an identity, so the label is read only from a terminal that carries
+    // this task's own `piher.task` label (written at spawn: the one fact there that names the task and
+    // survives a restart); the document is read always, so the refusal can say what it holds. The live
+    // label wins when it belongs to this task: it is the terminal's current identity, while the document
+    // is a past settle's report — a person who resumed the worker's pi in place is what the task
+    // continues from, and picking the older conversation would spawn a second pi beside it (D94).
     let restoredFrom: 'document' | 'label' | null = null;
     if (!latest.gen.sessionFile) {
+      const report = await session.readSessionReport(latest.gen.paneId);
       const address = await readAddressReport(latest.gen.paneId);
-      // The document names the task that wrote it: another task's document means the address was
-      // reused, and whatever `hresume` sits there now is that other worker's conversation.
-      const foreignAddress = address.kind === 'read' && address.value.taskId !== taskId;
-      const report = foreignAddress ? null : await session.readSessionReport(latest.gen.paneId);
-      const fromDocument = address.kind === 'read' && address.value.taskId === taskId ? address.value.session : null;
-      const fromLabel = report?.kind === 'reported' ? report.file : null;
-      const adopted = fromDocument ?? fromLabel;
-      if (!adopted) {
-        return toolError(noSessionText({ taskId, paneId: latest.gen.paneId, address, report, foreignAddress }));
-      }
-      latest.gen.sessionFile = adopted;
-      restoredFrom = fromDocument ? 'document' : 'label';
+      const fromLabel = report.kind === 'reported' ? report.file : null;
+      // Only this task's own document may lend its session: another task's means the address was reused.
+      const fromDocument = address.kind === 'read' && address.value.taskId === taskId
+        ? address.value.session : null;
+      const named = fromLabel ?? fromDocument;
+      if (!named) return toolError(noSessionText({ taskId, paneId: latest.gen.paneId, address, report }));
+      // A reported session is not yet a transcript: a bare id is resolved through pi's directories, and
+      // a value that names nothing readable is refused by its path instead of "restoring" a fresh
+      // conversation under the old task's name (`reviveEntry` would silently drop it).
+      const usable = usableTranscript(named, latest.cwd);
+      if (usable === null) return toolError(goneTranscriptText(taskId, expectedTranscript(named, latest.cwd)));
+      latest.gen.sessionFile = usable;
+      restoredFrom = fromLabel ? 'label' : 'document';
       // The record is what a later resume reads, so the report is written down the moment it is used.
       writeTaskRecord(latest.cwd, latest);
     }
@@ -1275,9 +1292,9 @@ export default function subagentPlugin(ctx: Context): void {
       return next;
     },
     // Transcript fallback: small worker panes show only the opaque status overlay, so the pane delta can never
-    // carry the final report. The row's own session is the first candidate, so a reused address can never
-    // hand the task another conversation's last words; behind it the worker's own `hresume` report decides
-    // (spec S18).
+    // carry the final report. The resolver tries the terminal's live `hresume` report first (S18) and the
+    // session this row already carries second; the report only counts when the terminal carries this task's
+    // `piher.task` label, so a reused address contributes no candidate at all.
     readFinalReport: async (paneId: string, entryCwd: string, preferred: string | null) =>
       (await session.readTurnClosing(paneId, entryCwd, 0, preferred)).text,
     writeRecord,

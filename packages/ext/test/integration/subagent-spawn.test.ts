@@ -15,7 +15,7 @@ import {
   readTaskRecord, repoTasksDir, taskRecordPath, TASK_VIEW_NAME,
 } from '../../src/task-store.ts';
 import { sessionStatePath } from '../../src/session-state.ts';
-import { HRESUME_LABEL } from '../../src/subagent-session.ts';
+import { HRESUME_LABEL, TASK_LABEL } from '../../src/subagent-session.ts';
 import { planSettleWrite, writeReportDocument } from '../../src/report-documents.ts';
 import type { SubagentPortBox } from '../../src/subagent-core.ts';
 import type { TaskRow } from '../../src/task-row.ts';
@@ -330,6 +330,9 @@ interface WorkerEnv {
   spawnEnvs: Array<Record<string, string>>;
   /** `herdr.*` label blocks handed to `terminal.run` in spawn order. */
   spawnLabels: Array<Record<string, string>>;
+  /** The labels each pane was created with, what `terminal.get` reports back: a spawned worker carries
+   *  its `hresume` (scripted) and the `piher.task` label piher wrote (spec S18/S26). */
+  paneLabels: Map<string, Record<string, string>>;
   /** Report the worker's terminal as gone, as housekeeping would have reclaimed it. */
   paneGone: boolean;
   /** Report a pane as finished the moment it is created: a child that died before it was ready. */
@@ -406,6 +409,7 @@ async function withWorkerEnv(
   let wake = false;
   const env: WorkerEnv = {
     cwd, home, pi: undefined as never, port: undefined as never, frames: [], retired: [], spawnEnvs: [], spawnLabels: [],
+    paneLabels: new Map(),
     parkPollers: () => { parked = true; }, rejectSend: false, sendError: null, sendDelayMs: 0, paneGone: false, paneFinished: false,
     sendResults: [], notReady: new Set<string>(), statuses: {},
     pastes: [], composer: {}, statusMismatches: 0, refuseSend: 0,
@@ -476,7 +480,10 @@ async function withWorkerEnv(
       status: env.notReady.has(id) ? 'unknown' : env.statuses[id] ?? 'idle',
       state: env.paneFinished ? 'finished' : 'live',
       turn: env.turns[id] ?? 0,
-      labels: ['p2', 'p3', 'p4', 'p5', 'p6'].includes(id) ? { [HRESUME_LABEL]: hresumeLabel(sessionFile) } : {},
+      labels: {
+        ...(env.paneLabels.get(id) ?? {}),
+        ...(['p2', 'p3', 'p4', 'p5', 'p6'].includes(id) ? { [HRESUME_LABEL]: hresumeLabel(sessionFile) } : {}),
+      },
     }),
     // S14/S22: the first task rides the core's own `send`, and its result is the only delivery proof.
     // The paste lands in the composer; the core's own Enter submits it unless the scripted result says
@@ -548,7 +555,9 @@ async function withWorkerEnv(
       env.spawnLabels.push(o.labels ?? {});
       // A new pane exists, so the old pane's disappearance no longer describes this worker.
       env.paneGone = false;
-      return terminalInfo({ id: nextPaneId(), cwd: o.cwd, labels: o.labels });
+      const id = nextPaneId();
+      env.paneLabels.set(id, o.labels ?? {});
+      return terminalInfo({ id, cwd: o.cwd, labels: o.labels });
     },
     kill: async (id) => { env.retired.push(id); },
   };
@@ -695,6 +704,9 @@ test('spawn env: the worker gets the spawn contract on top of the caller environ
     // this terminal, which is what makes the agents view nest it under the master.
     assert.equal('herdr.space' in env.spawnLabels[0]!, false);
     assert.equal('herdr.tab' in env.spawnLabels[0]!, false);
+    // The one label piher writes carries the task: it is what tells this task's worker from whatever a
+    // core restart later puts at the same address (spec S18/S26).
+    assert.equal(env.spawnLabels[0]![TASK_LABEL], delegation.taskId);
   });
 });
 

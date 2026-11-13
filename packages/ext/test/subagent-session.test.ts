@@ -6,12 +6,12 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { CoreClientLike } from '../src/core-client.ts';
+import type { CoreClientLike, TerminalInfo } from '../src/core-client.ts';
 import type { TaskSeed } from './test-utils.ts';
 import { sessionDirName, bareSessionId } from '../src/session-tail.ts';
 import {
   cleanPaneChrome, computeSubagentOutputDelta, createSessionIo, cutPaneReportCopy, formatSubagentOutput, HRESUME_LABEL,
-  hresumeSessionFile, resolveSubagentStatus, tailOfPaneRead,
+  hresumeSessionFile, resolveSubagentStatus, tailOfPaneRead, TASK_LABEL,
   type SubagentOutputCursor,
 } from '../src/subagent-session.ts';
 import { readTaskRecord } from '../src/task-store.ts';
@@ -28,23 +28,40 @@ const NO_CLOSING = { text: null, why: null };
 /** Terminal id used by the single-worker session fixtures. */
 const PANE = 'tW';
 
+/** The task the fixtures' panes belong to: the label piher writes at spawn is the ownership fact
+ *  (spec S18/S26), so every fixture terminal carries it and every SessionIo knows the index. */
+const TASK = 'task-1';
+
 /** CoreClientLike whose terminals carry the core's `hresume` label — the worker's own session
- *  report (spec S18), written by its Herdr extension. The label value is the documented object; the
- *  tests below pass the file or the bare id they care about. */
+ *  report (spec S18), written by its Herdr extension — and piher's own `piher.task` label. The label
+ *  value is the documented object; the tests below pass the file or the bare id they care about. */
 const hresumeLabel = (fileOrId: string): string => JSON.stringify({
   agent: 'pi', session: bareSessionId(fileOrId), file: fileOrId, cwd: '/w', pid: 1, boot: 'b',
 });
 
+const workerLabels = (fileOrId: string, taskId = TASK): Record<string, string> => ({
+  [HRESUME_LABEL]: hresumeLabel(fileOrId),
+  [TASK_LABEL]: taskId,
+});
+
+/** SessionIo host defaults: this master's pane index assigns every fixture pane to `TASK`. */
+const sessionHost = (over: Partial<Parameters<typeof createSessionIo>[0]>) => createSessionIo({
+  getSessionId: () => '',
+  sessionsDir: () => sessions(),
+  getTaskIdForPane: () => TASK,
+  ...over,
+} as Parameters<typeof createSessionIo>[0]);
+
 const sessionClient = (sessionsByPane: Record<string, string>): CoreClientLike => fakeCore({
   listTerminals: async () => Object.entries(sessionsByPane)
-    .map(([id, file]) => terminalInfo({ id, labels: { [HRESUME_LABEL]: hresumeLabel(file) } })),
+    .map(([id, file]) => terminalInfo({ id, labels: workerLabels(file) })),
   getTerminal: async (id) => (sessionsByPane[id]
-    ? terminalInfo({ id, labels: { [HRESUME_LABEL]: hresumeLabel(sessionsByPane[id]!) } })
+    ? terminalInfo({ id, labels: workerLabels(sessionsByPane[id]!) })
     : null),
 });
 
 /** SessionIo over a scripted `hresume` label; `sessionsDir` is where candidate files are scanned. */
-const io = (reported: string | null, sessionsDir: string, ownSession = '') => createSessionIo({
+const io = (reported: string | null, sessionsDir: string, ownSession = '') => sessionHost({
   client: sessionClient(reported ? { [PANE]: reported } : {}),
   getSessionId: () => ownSession,
   sessionsDir: () => sessionsDir,
@@ -90,7 +107,10 @@ test('readTurnClosing: cache invalidates on append (a stale hit would hide the f
 
 test('probeAlive: the terminal record decides liveness; a finished terminal is gone', async () => {
   const dir = sessions();
-  const ioFor = (over: Partial<CoreClientLike>) => createSessionIo({ client: fakeCore(over), getSessionId: () => '', sessionsDir: () => dir });
+  const ioFor = (over: Partial<CoreClientLike>) => sessionHost({
+    client: fakeCore(over),
+    sessionsDir: () => dir,
+  });
   const probe = await ioFor({
     getTerminal: async (id) => terminalInfo({ id, status: 'unknown' }),
   }).probeAlive('tH3', dir);
@@ -131,7 +151,7 @@ test('resolveSessionFile: the master transcript and sessions claimed by other te
   utimesSync(stale, 2_000, 2_000);
   utimesSync(master, 3_000, 3_000);
 
-  const ioFor = (labels: Record<string, string> = {}) => createSessionIo({
+  const ioFor = (labels: Record<string, string> = {}) => sessionHost({
     client: sessionClient(labels), getSessionId: () => MASTER_ID, sessionsDir: () => sessionsDir,
   });
   assert.equal(await ioFor().resolveSessionFile('tW', cwd), stale);
@@ -157,7 +177,7 @@ test('resolveSessionFile: the own label wins over the mtime order; a pipe self-r
   const reported = file('2026-09-20T05-05-04-206Z_01a0bd34-1ccd-73e1-a93f-e57e7f124d49.jsonl');
   utimesSync(preferred, 1_000, 1_000);
   utimesSync(reported, 2_000, 2_000);
-  const ioFor = (labels: Record<string, string> = {}) => createSessionIo({
+  const ioFor = (labels: Record<string, string> = {}) => sessionHost({
     client: sessionClient(labels),
     getSessionId: () => '22222222-2222-3333-4444-555555555555',
     sessionsDir: () => sessionsDir,
@@ -177,7 +197,7 @@ test('resolveSessionFile: the worker\'s own report outranks the value the row ca
   const reported = file('2026-09-20T05-21-01-111Z_11111111-2222-3333-4444-555555555555.jsonl');
   const preferred = file('2026-09-20T05-14-07-064Z_01a0bd3c-6557-746b-adf6-5128f2326c57.jsonl');
   // The row's value is the older file: S18 makes the worker's own report the authority, not the row.
-  const ioFor = () => createSessionIo({
+  const ioFor = () => sessionHost({
     client: sessionClient({ tW: reported }),
     getSessionId: () => '22222222-2222-3333-4444-555555555555',
     sessionsDir: () => sessionsDir,
@@ -198,7 +218,7 @@ test('resolveSessionFile: a session a second pane also reports does not displace
   // A person attached to the worker's own session in a second pane (S21): that label claims the same
   // session, so the session is "taken" — and the worker's own report must still win for its pane,
   // or a resume/output read would fall through to an unrelated newer file.
-  const io = createSessionIo({
+  const io = sessionHost({
     client: sessionClient({ tW: sub, tHuman: sub }),
     getSessionId: () => '22222222-2222-3333-4444-555555555555',
     sessionsDir: () => sessionsDir,
@@ -207,27 +227,34 @@ test('resolveSessionFile: a session a second pane also reports does not displace
   home.dispose();
 });
 
-test('resolveSessionFile: a terminal this master did not make is not this task\'s conversation', async () => {
+test('resolveSessionFile: a pi report without this task\'s own label is not this task\'s conversation', async () => {
   const { home, cwd, file, sessionsDir } = projectSessions('piher-session-reused-');
   const other = file('2026-09-20T05-21-01-111Z_11111111-2222-3333-4444-555555555555.jsonl');
   const preferred = file('2026-09-20T05-14-07-064Z_01a0bd3c-6557-746b-adf6-5128f2326c57.jsonl');
-  const terminal = (): ReturnType<typeof terminalInfo> => terminalInfo({
-    id: 't9', parent: 'tOTHER', labels: { [HRESUME_LABEL]: hresumeLabel(other) },
-  });
-  // A core restart reopened the address under another master (S26's premise): its `hresume` label is
-  // that worker's conversation, so neither it nor an mtime guess over the checkout may be adopted.
-  const io = createSessionIo({
-    client: fakeCore({ listTerminals: async () => [terminal()], getTerminal: async () => terminal() }),
+  const terminal = (labels: Record<string, string>) => () => terminalInfo({ id: 't9', labels });
+  const ioFor = (labels: Record<string, string>) => sessionHost({
+    client: fakeCore({ listTerminals: async () => [terminal(labels)()], getTerminal: async () => terminal(labels)() }),
     getSessionId: () => '22222222-2222-3333-4444-555555555555',
     sessionsDir: () => sessionsDir,
-    getTerminalId: () => 't0',
   });
-  assert.equal(await io.resolveSessionFile('t9', cwd), null, 'no candidate at all: the address is not ours');
-  assert.equal(
-    await io.resolveSessionFile('t9', cwd, preferred),
-    preferred,
-    'the record\'s own value still reads; only the foreign address is dropped',
-  );
+  // A core restart reopened the address (S26's premise). A pi report with no `piher.task` label, and one
+  // labelled with another task, are both somebody else's conversation — a null parent proves nothing, so
+  // the label is the whole test.
+  for (const labels of [
+    { [HRESUME_LABEL]: hresumeLabel(other) },
+    workerLabels(other, 'task-other'),
+  ]) {
+    const io = ioFor(labels);
+    assert.equal(await io.resolveSessionFile('t9', cwd), null, 'no candidate at all: the address is not ours');
+    assert.equal(
+      await io.resolveSessionFile('t9', cwd, preferred),
+      preferred,
+      'the record\'s own value still reads; only the foreign address is dropped',
+    );
+  }
+  // The same report with this task's label — and no parent at all — IS the worker: the label is the
+  // ownership fact, and a terminal the core reports without a parent is not evidence against it.
+  assert.equal(await ioFor(workerLabels(other)).resolveSessionFile('t9', cwd), other);
   home.dispose();
 });
 
@@ -244,7 +271,7 @@ test('reattributeStaleSessionFile: repairs a stale or poisoned value from the wo
   const stalePreferred = file('2026-09-16T07-15-46-751Z_44444444-4444-4444-8444-444444444444.jsonl');
   utimesSync(stalePreferred, new Date(Date.now() - 3_600_000), new Date(Date.now() - 3_600_000));
 
-  const ioFor = (reported: string) => createSessionIo({
+  const ioFor = (reported: string) => sessionHost({
     client: sessionClient({ 'tStale': reported, 'tOther': takenFile }),
     getSessionId: () => ownFile,
     sessionsDir: () => agentDir,
@@ -275,7 +302,7 @@ test('reattributeStaleSessionFile: a fresh report repairs a fresh row value, bec
   const reported = file('2026-09-21T06-00-00-000Z_11111111-1111-4111-8111-111111111111.jsonl');
   // Both were written after the request, so freshness cannot separate them; S18 does.
   const wrongPreferred = file('2026-09-21T06-00-00-000Z_22222222-2222-4222-8222-222222222222.jsonl');
-  const io = createSessionIo({
+  const io = sessionHost({
     client: sessionClient({ tStale: reported }),
     getSessionId: () => '33333333-3333-4333-8333-333333333333',
     sessionsDir: () => agentDir,
@@ -407,8 +434,21 @@ async function withWorker(
   client: Partial<CoreClientLike> = {},
   seed: TaskSeed = {},
 ): Promise<void> {
+  // The worker's own terminal carries this task's `piher.task` label, as a spawn writes it: without it
+  // the transcript resolver refuses the address (spec S18/S26) and `output` has no live report.
+  const seedTaskId = `task-pWorker`;
+  const asOwn = (terminal: TerminalInfo | null): TerminalInfo | null => (terminal && terminal.id === 'pWorker'
+    ? { ...terminal, labels: { ...terminal.labels, [TASK_LABEL]: seedTaskId } }
+    : terminal);
   const { root, pi } = await mountSubagent({
-    client: { ...NO_TERMINALS, ...client }, tasks: [worker('pWorker', seed)],
+    client: {
+      ...NO_TERMINALS,
+      ...client,
+      ...(client.getTerminal
+        ? { getTerminal: async (id: string) => asOwn(await client.getTerminal!(id)) }
+        : {}),
+    },
+    tasks: [worker('pWorker', seed)],
   });
   try {
     await body(pi);
@@ -558,7 +598,10 @@ test('output action: the transcript report replaces the pane copy and the delive
   const { root, pi } = await mountSubagent({
     client: {
       ...NO_TERMINALS,
-      ...outputPane(() => RENDERED_PANE, { status: 'idle', labels: { [HRESUME_LABEL]: hresumeLabel(session) } }),
+      ...outputPane(() => RENDERED_PANE, {
+        status: 'idle',
+        labels: { [HRESUME_LABEL]: hresumeLabel(session), [TASK_LABEL]: taskId },
+      }),
     },
     tasks: [taskRow({ paneId: 'pWorker', taskId, cwd: repo })],
   });
@@ -674,8 +717,8 @@ test('resume: a task with no session anywhere is refused, and the refusal names 
   }]);
   const { root, pi } = await mountSubagent({
     client: {
-      listTerminals: async () => [terminalInfo({ id: 'pGone', status: 'idle', labels: {} })],
-      getTerminal: async (id) => terminalInfo({ id, status: 'idle', labels: {} }),
+      listTerminals: async () => [terminalInfo({ id: 'pGone', status: 'idle', labels: { [TASK_LABEL]: taskId } })],
+      getTerminal: async (id) => terminalInfo({ id, status: 'idle', labels: { [TASK_LABEL]: taskId } }),
     },
     deps: {
       getSessionId: () => '77777777-7777-4777-8777-777777777777',
@@ -796,7 +839,12 @@ test('resume: a document naming another task means the address was reused, so it
     client: {
       // Not listed, so session recovery arms no watch: the pane is read only through `getTerminal`.
       listTerminals: async () => [],
-      getTerminal: async (id) => terminalInfo({ id, status: 'idle', labels: { [HRESUME_LABEL]: hresumeLabel(otherSession) } }),
+      getTerminal: async (id) => terminalInfo({
+        id,
+        status: 'idle',
+        // The reused address now runs another task's worker: its own task label says so.
+        labels: { [HRESUME_LABEL]: hresumeLabel(otherSession), [TASK_LABEL]: 'cccc3333-4444-4555-8666-777777777777' },
+      }),
       // A core restart reopened the same address for a different task (S26's own premise).
       docGet: async (name) => (name === 'piher.rep.t9'
         ? { value: { taskId: 'cccc3333-4444-4555-8666-777777777777', turn: 2, stopReason: 'stop', session: otherSession, text: 'someone else', at: 3_000 }, version: 1 }
@@ -811,10 +859,93 @@ test('resume: a document naming another task means the address was reused, so it
   try {
     await fire(pi, 'session_start', { reason: 'reload' }, {});
     const refused = await runSubagentRejects(pi, { action: 'resume', taskId }, cwd);
-    assert.match(refused, /cannot be resumed at its address t9/);
-    assert.match(refused, /another task's settlement document/, 'the established fact is named');
-    assert.doesNotMatch(refused, /has no session to resume/, 'nothing about this task\'s session was established');
+    // Both reads are named, and neither is the other one: the terminal carries another task's label,
+    // and the document says another task wrote it. Nothing here claims this task has no session — only
+    // that this address is not its own.
+    assert.match(refused, /its core terminal t9 is not its own \(its `piher\.task` label names task cccc3333/);
+    assert.match(refused, /the settlement document at its address belongs to another task/);
     assert.equal(readTaskRecord(cwd, taskId)?.gen.sessionFile, null, 'the other conversation is never adopted');
+  } finally {
+    await root.fiber.dispose();
+    home.dispose();
+  }
+});
+
+test('resume: the live report of this task outranks an older settlement document', async () => {
+  const home = new TempHome('piher-resume-live-');
+  const cwd = mkdtempSync(join(tmpdir(), 'piher-resume-live-cwd-'));
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const live = join(home.dir('sessions'), '2026-09-20T07-55-00-000Z_11111111-2222-4222-8222-333333333333.jsonl');
+  const older = join(home.dir('sessions'), '2026-09-20T06-00-00-000Z_11111111-2222-4222-8222-333333333334.jsonl');
+  writeFileSync(live, '{}\n');
+  writeFileSync(older, '{}\n');
+  const viewFile = join(home.dir('views'), '2026-09-20T07-55-00-000Z_11111111-2222-4222-8222-333333333335.jsonl');
+  const taskId = 'ffff6666-7777-4888-8999-aaaaaaaaaaaa';
+  seedTaskDocuments(viewFile, [{
+    taskId, paneId: 'plive', tabId: 't0', tabName: 'main',
+    cwd, description: 'resumed in place', sessionFile: null, createdAt: Date.now() - 60_000,
+  }]);
+  const { root, pi } = await mountSubagent({
+    client: {
+      // Not listed, so session recovery arms no watch: the address is read through `getTerminal` only.
+      listTerminals: async () => [],
+      getTerminal: async (id) => terminalInfo({
+        id, status: 'idle', labels: { [HRESUME_LABEL]: hresumeLabel(live), [TASK_LABEL]: taskId },
+      }),
+      // A past settle of this task at the same address, from before a person resumed its pi in place.
+      docGet: async (name) => (name === 'piher.rep.plive'
+        ? { value: { taskId, turn: 1, stopReason: 'stop', session: older, text: 'the older turn', at: 1_000 }, version: 2 }
+        : { value: null, version: 0 }),
+    },
+    deps: {
+      getSessionId: () => '11111111-2222-4222-8222-333333333335',
+      getSessionFile: () => viewFile,
+      getCwd: () => cwd,
+    },
+  });
+  try {
+    await fire(pi, 'session_start', { reason: 'reload' }, {});
+    const resumed = await runSubagent(pi, { action: 'resume', taskId }, cwd);
+    assert.match(resumed.content[0]!.text, /session restored from its core `hresume` report/);
+    assert.equal(readTaskRecord(cwd, taskId)?.gen.sessionFile, live, 'the live conversation, not the stale one');
+  } finally {
+    await root.fiber.dispose();
+    home.dispose();
+  }
+});
+
+test('resume: a session that names no readable transcript is refused by its path, not "restored"', async () => {
+  const home = new TempHome('piher-resume-gone-');
+  const cwd = mkdtempSync(join(tmpdir(), 'piher-resume-gone-cwd-'));
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const viewFile = join(home.dir('views'), '2026-09-20T07-58-00-000Z_99999999-8888-4777-8666-555555555555.jsonl');
+  const taskId = 'bbbb7777-8888-4999-8aaa-bbbbbbbbbbbb';
+  seedTaskDocuments(viewFile, [{
+    taskId, paneId: 'pdoc', tabId: 't0', tabName: 'main',
+    cwd, description: 'pruned transcript', sessionFile: null, createdAt: Date.now() - 60_000,
+  }]);
+  // The worker could not resolve a transcript path when it settled, so its document carries a bare id;
+  // pi's session directories do not know it either — there is nothing to resume.
+  const { root, pi } = await mountSubagent({
+    client: {
+      listTerminals: async () => [],
+      getTerminal: async () => null,
+      docGet: async (name) => (name === 'piher.rep.pdoc'
+        ? { value: { taskId, turn: 1, stopReason: 'stop', session: 'no-such-session-id', text: 'did work', at: 1_000 }, version: 1 }
+        : { value: null, version: 0 }),
+    },
+    deps: {
+      getSessionId: () => '99999999-8888-4777-8666-555555555555',
+      getSessionFile: () => viewFile,
+      getCwd: () => cwd,
+    },
+  });
+  try {
+    await fire(pi, 'session_start', { reason: 'reload' }, {});
+    const refused = await runSubagentRejects(pi, { action: 'resume', taskId }, cwd);
+    assert.match(refused, /cannot be resumed: its transcript no-such-session-id is gone/);
+    assert.doesNotMatch(refused, /restored/, 'nothing was restored');
+    assert.equal(readTaskRecord(cwd, taskId)?.gen.sessionFile, null, 'an unusable value never enters the record');
   } finally {
     await root.fiber.dispose();
     home.dispose();
@@ -855,6 +986,40 @@ test('resume: a core that does not answer is not reported as a task with no sess
   }
 });
 
+test('resume: a stored value that is not a report is named as such, not as a missing document', async () => {
+  const home = new TempHome('piher-resume-malformed-');
+  const cwd = mkdtempSync(join(tmpdir(), 'piher-resume-malformed-cwd-'));
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const viewFile = join(home.dir('views'), '2026-09-20T07-59-00-000Z_12121212-3434-4565-8787-909090909090.jsonl');
+  const taskId = 'eeee8888-9999-4aaa-8bbb-cccccccccccc';
+  seedTaskDocuments(viewFile, [{
+    taskId, paneId: 'pdoc', tabId: 't0', tabName: 'main',
+    cwd, description: 'malformed document', sessionFile: null, createdAt: Date.now() - 60_000,
+  }]);
+  const { root, pi } = await mountSubagent({
+    client: {
+      listTerminals: async () => [],
+      getTerminal: async () => null,
+      // Something is stored at that name and it is not a report: a different fact from "nothing there".
+      docGet: async (name) => (name === 'piher.rep.pdoc' ? { value: { text: 'not a report' }, version: 1 } : { value: null, version: 0 }),
+    },
+    deps: {
+      getSessionId: () => '12121212-3434-4565-8787-909090909090',
+      getSessionFile: () => viewFile,
+      getCwd: () => cwd,
+    },
+  });
+  try {
+    await fire(pi, 'session_start', { reason: 'reload' }, {});
+    const refused = await runSubagentRejects(pi, { action: 'resume', taskId }, cwd);
+    assert.match(refused, /the document at its address is not a report piher can read/);
+    assert.doesNotMatch(refused, /it has no settlement document/, 'a stored value is not a missing one');
+  } finally {
+    await root.fiber.dispose();
+    home.dispose();
+  }
+});
+
 test('resume: a label that is not a pi report is not this task\'s session', async () => {
   const home = new TempHome('piher-resume-agent-');
   const cwd = mkdtempSync(join(tmpdir(), 'piher-resume-agent-cwd-'));
@@ -871,7 +1036,12 @@ test('resume: a label that is not a pi report is not this task\'s session', asyn
   const { root, pi } = await mountSubagent({
     client: {
       listTerminals: async () => [],
-      getTerminal: async (id) => terminalInfo({ id, status: 'idle', labels: { [HRESUME_LABEL]: label } }),
+      getTerminal: async (id) => terminalInfo({
+        id,
+        status: 'idle',
+        // The task label is this task's: the refusal must be about the writer of the session report.
+        labels: { [HRESUME_LABEL]: label, [TASK_LABEL]: taskId },
+      }),
     },
     deps: {
       getSessionId: () => '33333333-3333-4333-8333-333333333334',

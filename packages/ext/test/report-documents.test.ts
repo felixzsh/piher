@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   MAX_DOCUMENT_BYTES, fitReportDocument, isReportDocumentValue, planReportDelivery, planSettleWrite,
-  reportDeliveryKey, reportDocName, writeReportDocument, type ReportDocumentValue,
+  readReportDocument, reportDeliveryKey, reportDocName, writeReportDocument, type ReportDocumentValue,
 } from '../src/report-documents.ts';
 import { CoreError, type CoreClientLike } from '../src/core-client.ts';
 import { fakeCore } from './test-utils.ts';
@@ -157,6 +157,26 @@ test('the document store follows the measured version rule: a delete bumps it', 
   await assert.rejects(
     () => client.docSet('probe.doc', { a: 4 }, 2),
     (err: unknown) => (err as { kind?: string }).kind === 'conflict',
+  );
+});
+
+test('readReportDocument: an absent, a deleted, a malformed and an unread document are different facts', async () => {
+  const value = { taskId: 't9', turn: 1, stopReason: 'stop', session: null, text: 'done', at: 5_000 };
+  const storing = async (stored: unknown) => readReportDocument(fakeCore({
+    docGet: async (name: string) => (name === 'piher.rep.t9' ? { value: stored, version: 2 } : null),
+  }), 't9');
+  assert.deepEqual(await storing(value), { kind: 'read', value });
+  // The core's own "nothing is stored": a missing name and a deleted value (a delete leaves `null`).
+  assert.deepEqual(await readReportDocument(fakeCore({ docGet: async () => null }), 't9'), { kind: 'absent' });
+  assert.deepEqual(await storing(null), { kind: 'absent' });
+  // Stored but not a report is its own fact: a refusal must not call that "no document".
+  assert.deepEqual(await storing({ text: 'not a report' }), { kind: 'not-a-report' });
+  // An address that cannot name a document (spec S9) has nothing to read either.
+  assert.deepEqual(await readReportDocument(fakeCore(), 'Not An Address'), { kind: 'absent' });
+  // The core did not answer: nothing was established.
+  assert.deepEqual(
+    await readReportDocument(fakeCore({ docGet: async () => { throw new Error('connect ECONNREFUSED'); } }), 't9'),
+    { kind: 'unavailable' },
   );
 });
 

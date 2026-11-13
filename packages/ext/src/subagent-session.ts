@@ -27,6 +27,12 @@ import { toolError } from './tool-error.ts';
  *  boot}` view of the pi session running in that terminal. piher writes no session label of its own. */
 export const HRESUME_LABEL = 'hresume';
 
+/** The label piher writes on a worker's terminal at spawn: the task that terminal was made for. It is
+ *  the one fact at an address that names the task rather than the conversation, so it is what makes an
+ *  address identifiable at all — and unlike the address or the terminal's parent, it survives a core
+ *  restart (spec S26). */
+export const TASK_LABEL = 'piher.task';
+
 /** What the `hresume` label reports that piher reads: the agent that wrote it and the transcript it
  *  names. Null when the label is absent, is not the documented object, or names no session — a report
  *  piher cannot read is not a session report, and treating it as one would point a resume at the wrong
@@ -67,25 +73,35 @@ export function hresumeSessionFile(label: string | null | undefined): string | n
  *
  *  A terminal address is not an identity: a core restart reuses terminal ids (spec S26 says so for
  *  command documents, and the same premise applies here), so the label at an address may describe
- *  somebody else's conversation. The label is therefore read only from a terminal this task's master
- *  made, written by pi — and only the positive facts refuse, because a field the core has not filled
- *  in yet must not turn a resume into a refusal. */
+ *  somebody else's conversation. Ownership is therefore read from a fact piher itself wrote there — the
+ *  terminal's `piher.task` label, set at spawn — plus the pi `hresume` report. A terminal with no such
+ *  label, or one naming another task, is not this task's worker: a missing parent is not evidence of
+ *  ownership, and neither is an address the record remembers. */
 export type SessionReport =
   | { kind: 'reported'; file: string }
   /** The core answered: the terminal carries no readable pi `hresume` label. */
   | { kind: 'absent' }
-  /** The address now holds a terminal that is not this task's own worker. */
+  /** The address holds a terminal that is not this task's own worker. */
   | { kind: 'not-ours'; why: string }
   /** The core answered: no such terminal. */
   | { kind: 'gone' }
   /** The core did not answer, so nothing was established either way. */
   | { kind: 'unavailable' };
 
-/** Read one terminal's `hresume` report as this task's own (spec S18/S26). */
-function sessionReportOf(terminal: TerminalInfo | null, masterTerminalId: string | null): SessionReport {
+/** Read one terminal's `hresume` report as this task's own (spec S18/S26).
+ *
+ *  `taskId` is the task this master's pane index assigns to the address: the terminal's own label must
+ *  name it, and the report must come from pi. Both are required, because either one alone can be
+ *  somebody else's — and neither the address nor the terminal's parent is evidence of ownership. */
+function sessionReportOf(terminal: TerminalInfo | null, taskId: string | null): SessionReport {
   if (!terminal) return { kind: 'gone' };
-  if (masterTerminalId && terminal.parent && terminal.parent !== masterTerminalId) {
-    return { kind: 'not-ours', why: `its parent is ${terminal.parent}, not this master (${masterTerminalId})` };
+  if (!taskId) return { kind: 'not-ours', why: 'this session holds no task at that address' };
+  const labelled = terminal.labels[TASK_LABEL] ?? null;
+  if (labelled !== taskId) {
+    return {
+      kind: 'not-ours',
+      why: labelled ? `its \`${TASK_LABEL}\` label names task ${labelled}` : `it carries no \`${TASK_LABEL}\` label`,
+    };
   }
   const report = hresumeReport(terminal.labels[HRESUME_LABEL]);
   if (!report) return { kind: 'absent' };
@@ -286,9 +302,10 @@ export interface SessionIoHost {
   client: CoreClientLike;
   getSessionId: () => string;
   sessionsDir: () => string;
-  /** This master's own terminal id, for the `hresume` identity gate (spec S26): a worker terminal's
-   *  parent is the master that made it. Unknown means "cannot establish", never "not ours". */
-  getTerminalId?: () => string | null;
+  /** The task this master's pane index assigns to an address, or null when it knows none. It is the
+   *  task the terminal's `piher.task` label must name for its report to count (spec S18/S26): an
+   *  address alone identifies nothing. */
+  getTaskIdForPane?: (paneId: string) => string | null;
 }
 
 export interface ResolveSessionFileOpts {
@@ -300,17 +317,18 @@ export interface ResolveSessionFileOpts {
 export interface SessionIo {
   resolveSessionFile(paneId: string, cwd: string, preferred?: string | null, opts?: ResolveSessionFileOpts): Promise<string | null>;
   /** What the terminal at this address reports about the conversation now (spec S18, S26): a pi
-   *  `hresume` report from a terminal this task's master made, or the reason there is none. */
+   *  `hresume` report from a terminal labelled with this task, or the reason there is none. */
   readSessionReport(paneId: string): Promise<SessionReport>;
   readAskFlag(paneId: string): Promise<string | null>;
   probeAlive(paneId: string, cwd: string): Promise<AliveProbe>;
   /** The worker's own closing words, for its report and for `output`. Never a settlement decision. */
   readTurnClosing(paneId: string, cwd: string, sinceTs: number, preferred?: string | null): Promise<TurnClosing>;
-  /** Re-attribute a generation's sessionFile with no writes since `sinceTs`: keep `preferred` when
-   *  fresh, else accept herdr's per-pane report when fresh. An existing value is only replaced by the
-   *  authoritative report; null means "keep the old one" (never an mtime guess). Spawn's mtime
-   *  fallback can adopt a PRE-EXISTING session file, and this is the only repair of that value — the
-   *  one `resume` restores and an existing pane is matched by. */
+  /** Re-attribute a generation's sessionFile with no writes since `sinceTs`: accept herdr's per-pane
+   *  report when it is fresh, else keep `preferred` when that is fresh. The live report is the
+   *  authority (spec S18), so a fresh report repairs a row value that is fresh but wrong; null means
+   *  "keep the old one" (never an mtime guess). Spawn's mtime fallback can adopt a PRE-EXISTING
+   *  session file, and this is the only repair of that value — the one `resume` restores and an
+   *  existing pane is matched by. */
   reattributeStaleSessionFile(paneId: string, cwd: string, sinceTs: number, preferred: string | null): Promise<string | null>;
 }
 
@@ -363,7 +381,7 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
   async function readSessionReport(paneId: string): Promise<SessionReport> {
     if (!paneId) return { kind: 'gone' };
     try {
-      return sessionReportOf(await h.client.getTerminal(paneId), h.getTerminalId?.() ?? null);
+      return sessionReportOf(await h.client.getTerminal(paneId), h.getTaskIdForPane?.(paneId) ?? null);
     } catch {
       return { kind: 'unavailable' };
     }
@@ -374,15 +392,16 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
   async function reportedAndTaken(paneId: string): Promise<{
     reported: string | null;
     taken: Set<string>;
-    /** 'other' when the address now holds a terminal this task's master did not make. */
+    /** 'other' when the address holds no terminal carrying this task's label. */
     identity: 'ours' | 'other';
   }> {
     const taken = new Set<string>();
     let paneReport: SessionReport | null = null;
+    const taskId = h.getTaskIdForPane?.(paneId) ?? null;
     try {
       for (const terminal of await h.client.listTerminals({ all: true })) {
         if (terminal.id === paneId) {
-          paneReport = sessionReportOf(terminal, h.getTerminalId?.() ?? null);
+          paneReport = sessionReportOf(terminal, taskId);
           continue;
         }
         const sessionFile = hresumeSessionFile(terminal.labels[HRESUME_LABEL]);
@@ -407,8 +426,9 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
    *  A session another terminal reports is never adopted — it is a conversation already claimed. The
    *  pane's own report is the exception: a person attaching to the same session in a second pane makes
    *  the session "taken", and filtering the worker's own report through that set would throw away the
-   *  only authoritative candidate. And when the address holds a terminal that is not this task's own,
-   *  nothing about the pane is a candidate at all: an address identifies no conversation (S26). */
+   *  only authoritative candidate. And when the address holds a terminal that does not carry this
+   *  task's label, nothing about the pane is a candidate at all: an address identifies no conversation
+   *  (S26). */
   async function resolveSessionFileCandidates(paneId: string, cwd: string, preferred?: string | null): Promise<string[]> {
     // A sub's sessionFile must never resolve to the master's own transcript (compare via
     // bareSessionId: herdr reports ids and paths interchangeably).
@@ -557,7 +577,7 @@ export async function executeSubagentOutput(
     nextRevision: (paneId: string) => number;
     /** Last finalized assistant text from the worker's transcript: the pane read alone cannot
      * recover it when the fullscreen TUI shows only the status overlay. Optional for tests. The third
-     * argument is the session the row already carries, which is tried before the live label. */
+     * argument is the session the row already carries, which is tried AFTER the live label (spec S18). */
     readFinalReport?: (paneId: string, entryCwd: string, preferred: string | null) => Promise<string | null>;
     /** Persists the generation's `reportDelivered` so the settlement notice can skip a report already shown. */
     writeRecord?: (entry: TaskEntry) => void;

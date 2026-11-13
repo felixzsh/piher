@@ -171,12 +171,16 @@ export type DocumentWriteResult =
 /** What one read of a worker's report document established (spec S12 keeps the document across a
  *  core restart, so it outlives both the record and the pane).
  *
- *  The three cases are kept apart on purpose: "nothing was written", "what is there is not a
- *  report" and "the core did not answer" are different facts, and a caller that merges them tells a
- *  person the document reported no session when it was never read. */
+ *  The four cases are separate facts, and a caller that merges them tells a person something the read
+ *  did not establish: nothing is stored there (or the address cannot name a document at all), a value
+ *  is stored but is not a report, the core did not answer, or here is the report. */
 export type ReportDocumentRead =
   | { kind: 'read'; value: ReportDocumentValue }
+  /** Nothing readable is stored: no document, or an address that cannot name one (S9). */
   | { kind: 'absent' }
+  /** A value is stored at that name, but it is not a report piher can read. */
+  | { kind: 'not-a-report' }
+  /** The core did not answer, so nothing was established either way. */
   | { kind: 'unavailable' };
 
 /** The report document at a worker address, as the core holds it. */
@@ -185,7 +189,10 @@ export async function readReportDocument(client: CoreClientLike, address: string
   if (!name) return { kind: 'absent' };
   try {
     const got = await client.docGet(name);
-    return got && isReportDocumentValue(got.value) ? { kind: 'read', value: got.value } : { kind: 'absent' };
+    // A null value is the core's own "nothing is stored" (a delete bumps the version and leaves
+    // `null`): that is absent, not a malformed report.
+    if (!got || got.value === null) return { kind: 'absent' };
+    return isReportDocumentValue(got.value) ? { kind: 'read', value: got.value } : { kind: 'not-a-report' };
   } catch {
     return { kind: 'unavailable' };
   }

@@ -36,7 +36,7 @@ import {
 import { allocateTaskSlug, taskRef, type TaskEntry } from './task-row.ts';
 import type { Poller } from './subagent-poller.ts';
 import type { SessionIo } from './subagent-session.ts';
-import { HRESUME_LABEL, hresumeSessionFile, hresumeReport } from './subagent-session.ts';
+import { HRESUME_LABEL, TASK_LABEL, hresumeSessionFile, hresumeReport } from './subagent-session.ts';
 
 const statAsync = promisify(statCb);
 
@@ -355,6 +355,9 @@ export interface Spawner {
       zone?: WorktreeZone;
       spaceId?: string | null;
       visible: boolean;
+      /** The task the terminal is made for: written as its `piher.task` label, which is what makes the
+       *  address identifiable later (spec S18/S26). */
+      taskId: string;
     },
     cwd: string,
     envOver: Record<string, string>,
@@ -559,6 +562,8 @@ export function createSpawner(h: SpawnerHost): Spawner {
       spaceId?: string | null;
       /** Only an explicit `tab` puts the worker in this master's space. */
       visible: boolean;
+      /** The task this terminal is made for, written as its `piher.task` label (spec S18/S26). */
+      taskId: string;
     },
     cwd: string,
     envOver: Record<string, string>,
@@ -586,7 +591,9 @@ export function createSpawner(h: SpawnerHost): Spawner {
       argv: [...argv],
       cwd,
       env: childEnvironment(process.env, envOver),
-      labels,
+      // The task label travels with the terminal: `resume` and the transcript resolver read it to tell
+      // this task's worker from whatever a reused address holds now (spec S18/S26).
+      labels: { ...labels, [TASK_LABEL]: placement.taskId },
       noNotify: true,
     });
     return placement.spaceId
@@ -793,6 +800,7 @@ export function createSpawnAction(h: SpawnActionHost) {
           spaceId,
           // An explicit `tab` is the only reason to give a worker a pane in this master's space.
           visible: tab != null && String(tab).trim() !== '',
+          taskId,
         },
         cwd,
         // Status comes ONLY from pi's native OSC 7501 reporter; piher never writes it.
