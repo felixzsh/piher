@@ -141,6 +141,37 @@ test('createNoticeBuffer: a host with no send method records no delivery', async
   assert.deepEqual([...buf.noticePending()], ['p1'], 'and the pane stays exempt for the retry');
 });
 
+test('createNoticeBuffer: a flush records its batch as one step, and closes it even when a handler throws', async () => {
+  // Review #10: pi takes the collapsed message once, so the acceptances it carries are one cursor
+  // step. Recording them one handler at a time would leave the rest of a message the master already
+  // read above the cursor, and the next start would show it again.
+  let busy = true;
+  const accepted: string[] = [];
+  let opened = 0;
+  let closed = 0;
+  const buf = createNoticeBuffer({
+    isBusy: () => busy,
+    send: async () => true,
+    openBatch: () => {
+      opened += 1;
+      return { end: () => { closed += 1; } };
+    },
+  });
+  await buf.deliverNotice('a', 'p1', null, () => { accepted.push('a'); throw new Error('boom'); });
+  await buf.deliverNotice('b', 'p2', null, () => { accepted.push('b'); });
+  busy = false;
+  await buf.flush('steer');
+  assert.deepEqual(accepted, ['a', 'b'], 'a throwing handler costs the batch nothing else');
+  assert.equal(opened, 1, 'the whole batch is one acceptance group');
+  assert.equal(closed, 1, 'and it is closed after the last handler, so the cursor is one step');
+
+  // A lone notice is already one step: no group is opened for it.
+  await buf.deliverNotice('c', 'p3', null, () => { accepted.push('c'); });
+  assert.equal(opened, 1, 'a single notice needs no group');
+  assert.deepEqual(accepted, ['a', 'b', 'c'], 'and it is accepted as before');
+  assert.equal(buf.noticePending().size, 0);
+});
+
 test('planNoticeBatch: empty → null; a lone notice keeps its own text, byte for byte', () => {
   assert.equal(planNoticeBatch([]), null, 'an empty batch is not injected');
   // One settlement is not a batch: the notice the master has always read is the delivery.

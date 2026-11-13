@@ -528,6 +528,10 @@ export interface SubagentPort {
   /** The (paneId, slug, state, elapsed) rows the master's widget shows: one per worker still awaiting
    *  a report. */
   listRunningSubs(): WorkerWidgetRow[];
+  /** Open one settlement-delivery batch: the notice buffer (index.ts) hands a whole collapsed message
+   *  to pi, and the ledger that records the delivery lives in the plugin, so the batch's single cursor
+   *  step is opened through here. `end` closes it and writes the cursor once. */
+  openDeliveryBatch?(): { end(): void } | null;
 }
 
 export interface SubagentPortBox {

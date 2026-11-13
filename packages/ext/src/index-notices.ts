@@ -150,6 +150,11 @@ export function createNoticeBuffer(opts: {
   /** One collapsed body; the card describes a single settlement and is omitted for a batch. False
    *  means pi was not given the message (a host with no send method), so nothing may be recorded. */
   send: (content: string, mode: NoticeSendMode, card?: SettlementCard) => Promise<boolean | void>;
+  /** Open one acceptance batch for a multi-notice delivery: the arguments are what the batch records
+   *  on the acceptance side, and `end` closes it. A batch pi took as a single message must be one
+   *  cursor step, or a crash between two handlers would re-deliver the rest of a message the master
+   *  already read. Absent (a buffer with no ledger behind it) keeps one step per notice. */
+  openBatch?: () => { end(): void } | null;
 }): NoticeBuffer {
   const bodyBudget = opts.bodyBudgetBytes ?? noticeBodyBudgetBytes();
   type PendingNotice = {
@@ -228,9 +233,17 @@ export function createNoticeBuffer(opts: {
       for (const { paneId } of flushed) {
         if (paneId !== undefined && !pending.some((n) => n.paneId === paneId)) pendingPaneIds.delete(paneId);
       }
-      // One collapsed message carries every notice in the batch: pi accepted them together. An empty
-      // batch carried nothing, so nobody's delivery is recorded.
-      if (plan && plan.text !== '') acceptAll(flushed);
+      // One collapsed message carries every notice in the batch: pi accepted them together, so they
+      // are recorded together — one cursor step for the batch, not one per handler. An empty batch
+      // carried nothing, so nobody's delivery is recorded.
+      if (plan && plan.text !== '') {
+        const batch = opts.openBatch?.() ?? null;
+        try {
+          acceptAll(flushed);
+        } finally {
+          batch?.end();
+        }
+      }
     },
   };
 }

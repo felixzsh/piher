@@ -3,11 +3,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DisposeLedger } from '../src/ledger.ts';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  TempHome, fire, mountSubagent, runSubagent, runSubagentRejects, seedTaskDocuments, readTaskRecord,
+  TempHome, fakePi, fire, mountSubagent, runSubagent, runSubagentRejects, seedTaskDocuments, readTaskRecord,
   repoTasksDir, taskRow, terminalInfo,
 } from './test-utils.ts';
 import { forgetTaskPrompt, readTaskPrompt, saveTaskPrompt } from '../src/prompt-store.ts';
@@ -21,6 +21,7 @@ import {
   allocateTaskSlug, parseTaskDocument, slugifyTask, taskRef, type TaskEntry,
 } from '../src/task-row.ts';
 import { CoreError } from '../src/core-client.ts';
+import { formatSettlementEvent, parseSettlementCursor } from '../src/settlement-ledger.ts';
 import { writeTaskRecord } from '../src/task-store.ts';
 import {
   formatBootFailureNotice, keepsPane, keepsPaneForCoreError, planReadyAttempt, readyBackoffMs, readyFailureText,
@@ -486,6 +487,12 @@ test('subagent plugin: one tool, lifecycle hooks, port binding and unbinding', a
   assert.match((await runSubagent(pi, { action: 'list' }, mkdtempSync(join(tmpdir(), 'piher-no-ledger-')))).content[0]!.text, /No subagents started/);
   await assert.rejects(runSubagent(pi, { action: 'explode' }), /unknown action "explode"/);
 
+  // The notice buffer lives in index.ts and the ledger lives here, so a delivery's single cursor
+  // step crosses this seam: without it a collapsed batch would be recorded notice by notice.
+  assert.equal(typeof port.current.openDeliveryBatch, 'function', 'the batch seam is bound');
+  const batch = port.current.openDeliveryBatch!();
+  assert.ok(batch, "a batch opens against this session's ledger");
+  batch!.end();
   await root.fiber.dispose();
   assert.equal(port.current, null, 'port unbound on dispose');
 });
@@ -544,6 +551,81 @@ test('subagent plugin: a reload restores the session view from the records and d
   } finally {
     home.dispose();
     rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('subagent plugin: a host with no way to take a message records no delivery (review #11)', async () => {
+  // The fallback is a mount with no notice buffer: pi's own send IS the delivery, and `onAccepted` is
+  // what writes the row's `consumedAt` and the ledger cursor. Claiming it without a message method
+  // would hide the settlement from every later replay, which is the one thing the ledger exists for.
+  const build = () => {
+    const repo = mkdtempSync(join(tmpdir(), 'piher-no-send-'));
+    mkdirSync(join(repo, '.git'), { recursive: true });
+    const home = new TempHome('piher-no-send-');
+    const sessionFile = join(home.dir('sessions'), '2026-01-05T00-00-00-000Z_eeeeeeee-0000-4000-8000-000000000000.jsonl');
+    const taskId = 'e5f6a7b8-0000-4000-8000-000000000005';
+    seedTaskDocuments(sessionFile, [{ taskId, paneId: 'w1:p6', cwd: repo, description: 'replayed worker', createdAt: 1_000 }]);
+    const ledgerFile = join(repoTasksDir(repo)!, 'settlement-sess-send.jsonl');
+    writeFileSync(
+      ledgerFile,
+      `${formatSettlementEvent({ seq: 1, at: 2_000, taskId, pane: 'w1:p6', turn: 1, kind: 'settled' })}\n`,
+    );
+    return { repo, home, sessionFile, taskId, ledgerFile };
+  };
+  const cursorOf = (file: string): number => {
+    try {
+      return parseSettlementCursor(readFileSync(`${file}.seq`, 'utf8'));
+    } catch {
+      return 0;
+    }
+  };
+  const deps = (w: ReturnType<typeof build>) => ({
+    getSessionFile: () => w.sessionFile,
+    getCwd: () => w.repo,
+    getSessionId: () => 'sess-send',
+  });
+  const client = { available: false, listTerminals: async () => [] };
+
+  // ── a host with no send method: pi was given nothing, so nothing is recorded ──
+  const silent = build();
+  try {
+    const pi = fakePi();
+    delete (pi as { sendUserMessage?: unknown }).sendUserMessage;
+    const { root } = await mountSubagent({ pi, client, deps: deps(silent) });
+    try {
+      await fire(pi, 'session_start', { reason: 'reload' }, {});
+      assert.deepEqual(pi.userSent, [], 'there is no method to send with');
+      assert.equal(
+        readTaskRecord(silent.repo, silent.taskId)?.gen.consumedAt ?? null,
+        null,
+        'so the record does not claim a delivery',
+      );
+      assert.equal(cursorOf(silent.ledgerFile), 0, 'and the cursor stays below the fact, for the next start');
+    } finally {
+      await root.fiber.dispose();
+    }
+  } finally {
+    silent.home.dispose();
+    rmSync(silent.repo, { recursive: true, force: true });
+  }
+
+  // ── the same re-delivery through a host that does take it: recorded, once ──
+  const heard = build();
+  try {
+    const pi = fakePi();
+    const { root } = await mountSubagent({ pi, client, deps: deps(heard) });
+    try {
+      await fire(pi, 'session_start', { reason: 'reload' }, {});
+      assert.equal(pi.userSent.length, 1, 'pi took the notice');
+      assert.match(pi.userSent[0]!.content, /Re-delivered settlement \(piher ledger, seq 1, task e5f6a7b8/);
+      assert.equal(readTaskRecord(heard.repo, heard.taskId)?.gen.consumedAt, 2_000, 'the delivery is recorded');
+      assert.equal(cursorOf(heard.ledgerFile), 1);
+    } finally {
+      await root.fiber.dispose();
+    }
+  } finally {
+    heard.home.dispose();
+    rmSync(heard.repo, { recursive: true, force: true });
   }
 });
 

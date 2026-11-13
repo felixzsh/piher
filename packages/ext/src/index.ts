@@ -170,6 +170,10 @@ export default async function (pi: ExtensionAPI) {
       ...(card ? { card } : {}),
       cardsRendered,
     }),
+    // The ledger that records what pi accepted is the subagent plugin's (it writes the facts); the
+    // buffer only knows the batch boundary. While no plugin is mounted there is no cursor to move,
+    // so a batch without a ledger is one step per notice — which is the case with no delivery either.
+    openBatch: () => subagentPort.current?.openDeliveryBatch?.() ?? null,
   });
   const deliverNotice = notices.deliverNotice;
 

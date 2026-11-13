@@ -12,7 +12,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
 import {
   formatSettlementEvent, openSettlementLedger, parseSettlementCursor, parseSettlementLedger,
@@ -385,7 +385,7 @@ test('E1 (a): a settlement the master never read is re-delivered exactly once af
     assert.equal(second.ledger.events().length, 1, 'the ledger survived the restart');
     assert.equal(await replaySettlements(second.host), 1, 'exactly one re-delivery');
     assert.equal(second.accepted.length, 1, 'the master reads it exactly once');
-    assert.match(second.accepted[0]!, /Re-delivered settlement \(piher ledger, seq 1\)/);
+    assert.match(second.accepted[0]!, /Re-delivered settlement \(piher ledger, seq 1, task task-settle\)/);
     assert.ok(second.accepted[0]!.includes(REPORT_TEXT), 'the body is read from the report document, not a copy');
     assert.match(second.accepted[0]!, /its notice never reached you/);
     assert.match(second.accepted[0]!, /this is the first delivery, not a new settlement/);
@@ -500,6 +500,96 @@ test('E1 (d): a settlement whose report document is gone is re-delivered as a po
   }
 });
 
+/* ── the fact's own kind survives the replay (review #8) ──────── */
+
+test('E1 (a): a replayed fact says what it was — a pane that went is not a document that was lost', async () => {
+  // The silence budget and a pane that closed announce with no `payloadRef`: there is no document to
+  // read, by construction. Saying "its report document is no longer readable" would invent one, and
+  // would read as a settle that was merely lost instead of a worker that never settled.
+  const world = createWorld();
+  try {
+    const out = boot(world, { busy: () => false });
+    out.ledger.append({ at: 5_000, taskId: 'task-gone', pane: 'p-gone', turn: 1, kind: 'pane-gone' });
+    out.ledger.append({ at: 6_000, taskId: 'task-quiet', pane: 'p-quiet', turn: 3, kind: 'failed' });
+
+    const second = boot(world, { busy: () => false });
+    assert.equal(await replaySettlements(second.host), 2);
+    const text = second.accepted[0]!;
+    assert.doesNotMatch(text, /report document is no longer readable/, 'neither fact ever had a document');
+    assert.match(text, /p-gone · .* · closed · no report/, 'a pane that went is closed, not a failure');
+    assert.match(text, /p-quiet · .* · failed · no report/);
+    // The lone-notice text is the batch of one; here both ride in one batch, so the diagnosis is what
+    // the row's own wording has to keep — the replay must not claim a settle it cannot stand behind.
+    assert.equal(second.ledger.deliveredSeq(), 2);
+  } finally {
+    world.dispose();
+  }
+
+  // And the text of a lone re-delivery: one fact, its own sentence.
+  const loneWorld = createWorld();
+  try {
+    const out = boot(loneWorld, { busy: () => false });
+    out.ledger.append({ at: 7_000, taskId: 'task-ghost', pane: 'p-ghost', turn: 2, kind: 'pane-gone' });
+    const second = boot(loneWorld, { busy: () => false });
+    assert.equal(await replaySettlements(second.host), 1);
+    const text = second.accepted[0]!;
+    assert.match(text, /Its pane was gone before it settled, so it never wrote a report/);
+    assert.match(text, /ended at 1970-01-01T00:00:07.000Z/, 'a pane that went did not "settle"');
+
+    const quiet = boot(loneWorld, { busy: () => false });
+    assert.equal(await replaySettlements(quiet.host), 0, 'what the first restart recorded stays recorded');
+    quiet.ledger.append({ at: 8_000, taskId: 'task-mute', pane: 'p-mute', turn: 1, kind: 'failed' });
+    const third = boot(loneWorld, { busy: () => false });
+    assert.equal(await replaySettlements(third.host), 1);
+    assert.match(third.accepted[0]!, /Its wait ended with no report document at all/);
+    assert.match(third.accepted[0]!, /this is NOT the task's result/);
+  } finally {
+    loneWorld.dispose();
+  }
+});
+
+/* ── an identity that survives the roster (review #7) ─────────── */
+
+test('E1 (a): a replay names the task, and says when the pane id belongs to another one', async () => {
+  // The replay keys on `(taskId, at)`, but the notice named only the pane. A swept record plus a
+  // reused pane id makes `agentId <pane>` resolve to the new task, so the read the notice prints
+  // would return someone else's work as this settlement's.
+  const world = createWorld();
+  try {
+    const out = boot(world, { busy: () => false });
+    out.ledger.append({ at: 4_000, taskId: 'task-swept', pane: 'p-swept', turn: 1, kind: 'settled' });
+
+    const second = boot(world, { busy: () => false });
+    // What the roster says now: the swept task's pane id was reused by a task started since.
+    second.host.panes.set('p-swept', 'task-new');
+    assert.equal(await replaySettlements(second.host), 1);
+    const text = second.accepted[0]!;
+    assert.match(text, /Re-delivered settlement \(piher ledger, seq 1, task task-swept\)/);
+    assert.match(text, /p-swept now belongs to another task/, 'the address is flagged, not trusted');
+    assert.match(text, /returns that task's work, not this settlement \(task task-swept\)/);
+  } finally {
+    world.dispose();
+  }
+
+  // In a batch the replay's own wording rides in the row, so the task and the reuse have to be there.
+  const batchWorld = createWorld();
+  try {
+    const out = boot(batchWorld, { busy: () => false });
+    out.ledger.append({ at: 4_000, taskId: 'task-swept', pane: 'p-swept', turn: 1, kind: 'settled' });
+    out.ledger.append({ at: 5_000, taskId: 'task-kept', pane: 'p-kept', turn: 1, kind: 'settled' });
+    const second = boot(batchWorld, { busy: () => false });
+    second.host.panes.set('p-swept', 'task-new');
+    assert.equal(await replaySettlements(second.host), 2);
+    const text = second.accepted[0]!;
+    assert.match(text, /re-delivered from the piher ledger \(seq 1, task task-swept\); its pane p-swept/);
+    assert.match(text, /now belongs to another task/);
+    assert.match(text, /re-delivered from the piher ledger \(seq 2, task task-kept\): this is its first delivery/);
+    assert.doesNotMatch(text, /task-kept; its pane/, 'a pane the task still owns is not warned about');
+  } finally {
+    batchWorld.dispose();
+  }
+});
+
 /* ── the cursor as a prefix, and one batch per restart ─────────── */
 
 test('E1 (a): an acceptance out of order does not hide the settlement below it', () => {
@@ -545,6 +635,115 @@ test('E1 (a): an acceptance out of order does not hide the settlement below it',
   }
 });
 
+test('E1 (a): one delivery is one cursor step — a batch is written whole or not at all', () => {
+  // The duplicate bound the ledger documents ("at most one each") is only true if a message pi took
+  // as one message is recorded as one step. Recording it notice by notice would leave the rest of a
+  // batch pi already read above the cursor, and the next start would show it again.
+  const dir = mkdtempSync(join(tmpdir(), 'piher-batch-'));
+  const file = join(dir, 'settlement-batch.jsonl');
+  const cursorAt = (path: string): number => {
+    try {
+      return parseSettlementCursor(readFileSync(path, 'utf8'));
+    } catch {
+      return 0;
+    }
+  };
+  try {
+    const ledger = openSettlementLedger({ file });
+    const one = ledger.append({ at: 1_000, taskId: 'task-one', pane: 'p-one', turn: 1, kind: 'settled' });
+    const two = ledger.append({ at: 2_000, taskId: 'task-two', pane: 'p-two', turn: 1, kind: 'settled' });
+    const batch = ledger.openBatch();
+    ledger.markDelivered(one.seq);
+    ledger.markDelivered(two.seq);
+    assert.equal(ledger.deliveredSeq(), two.seq, 'both acceptances are in memory');
+    assert.equal(cursorAt(`${file}.seq`), 0, 'and none of them is on disk yet: the window is the step');
+    batch.end();
+    assert.equal(cursorAt(`${file}.seq`), two.seq, 'the whole batch lands in one write');
+    batch.end();
+    assert.equal(cursorAt(`${file}.seq`), two.seq, 'ending a batch twice is not a second step');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('E1 (a): an acceptance captured against the previous file moves no cursor (repoint)', () => {
+  // `repoint` relaunches the ledger on another repository (a checkpoint moved the checkout) and
+  // re-reads it. A notice buffered against the old file can still be accepted afterwards, and its
+  // seq is the old file's — the new one's seq 1 may be another task's settlement.
+  const dir = mkdtempSync(join(tmpdir(), 'piher-repoint-'));
+  const from = join(dir, 'settlement-from.jsonl');
+  const to = join(dir, 'settlement-to.jsonl');
+  const cursorAt = (path: string): number => {
+    try {
+      return parseSettlementCursor(readFileSync(path, 'utf8'));
+    } catch {
+      return 0;
+    }
+  };
+  try {
+    const ledger = openSettlementLedger({ file: from });
+    const stale = ledger.append({ at: 1_000, taskId: 'task-old', pane: 'p-old', turn: 1, kind: 'settled' });
+    const epochBefore = ledger.epoch();
+    ledger.repoint(to);
+    assert.notEqual(ledger.epoch(), epochBefore, 'another file is another epoch');
+    const fresh = ledger.append({ at: 2_000, taskId: 'task-new', pane: 'p-new', turn: 1, kind: 'settled' });
+    assert.equal(fresh.seq, stale.seq, 'the two files number their facts independently: this is the trap');
+
+    ledger.markDelivered(stale.seq, epochBefore);
+    assert.equal(ledger.deliveredSeq(), 0, 'a seq minted for another file is not a fact about this one');
+    assert.equal(cursorAt(`${to}.seq`), 0);
+
+    // What the epoch prevents, said out loud: the same call without it is indistinguishable from
+    // this file's own seq 1 — the base defect — and steps over a fact it never delivered.
+    ledger.markDelivered(stale.seq);
+    assert.equal(ledger.deliveredSeq(), fresh.seq, 'unguarded, the stale seq marks the new file delivered');
+    ledger.markDelivered(fresh.seq, ledger.epoch());
+    assert.equal(ledger.deliveredSeq(), fresh.seq, 'and the cursor stays monotonic');
+    assert.equal(cursorAt(`${to}.seq`), fresh.seq);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('E1 (a): an acceptance that lands after a repoint records no cursor in the new file', async () => {
+  // The buffered notice is the real case: a steer reaches the master only while it is busy, so the
+  // acceptance can arrive after the session's checkout moved and the ledger re-pointed. Its seq is
+  // the old file's fact; recording it would mark the new file's seq accepted without delivering it.
+  const world = createWorld();
+  const cursorAt = (file: string): number => {
+    try {
+      return parseSettlementCursor(readFileSync(`${file}.seq`, 'utf8'));
+    } catch {
+      return 0;
+    }
+  };
+  try {
+    const held: Array<() => void> = [];
+    const first = boot(world, { busy: () => false });
+    const deliver = first.host.injectNotice;
+    first.host.injectNotice = (content, paneId, card, onAccepted, row) => {
+      // pi took the message; whether the acceptance is recorded is what this test withholds.
+      if (onAccepted) held.push(onAccepted);
+      return deliver(content, paneId, card, undefined, row);
+    };
+    await runLoop(first, world);
+    assert.equal(first.ledger.events().length, 1, 'the fact is in the file the notice was announced for');
+    assert.equal(held.length, 1, 'pi has the notice, its acceptance is still in flight');
+
+    const moved = join(dirname(world.ledgerFile), 'settlement-moved.jsonl');
+    first.ledger.repoint(moved);
+    const other = first.ledger.append({ at: 9_000, taskId: 'task-other', pane: 'p-other', turn: 1, kind: 'settled' });
+
+    held[0]!();
+    assert.equal(first.ledger.deliveredSeq(), 0, 'the stale acceptance moved no cursor');
+    assert.equal(cursorAt(moved), 0, 'and nothing was written for the new file');
+    // The moved file's own fact is still above the cursor, so this process (and the next) replays it.
+    assert.ok(other.seq > first.ledger.deliveredSeq());
+  } finally {
+    world.dispose();
+  }
+});
+
 test('E1 (a): a restart carries every undelivered settlement in one delivery, and the cursor follows it', async () => {
   // At a start the master is idle, so a notice injected per event goes out alone with its own turn:
   // N settlements for N turns. The replay plans the same batch the live path plans — a row per
@@ -570,8 +769,8 @@ test('E1 (a): a restart carries every undelivered settlement in one delivery, an
       assert.ok(text.includes(`${id} · `), `every settlement is named in the batch: ${id}`);
     }
     assert.ok(text.includes('ONE: the first conclusion'), 'a body whose document still matches travels inline');
-    assert.match(text, /re-delivered from the piher ledger \(seq 1\): this is its first delivery/);
-    assert.match(text, /re-delivered from the piher ledger \(seq 3\)/, 'the replay wording rides in the row');
+    assert.match(text, /re-delivered from the piher ledger \(seq 1, task task-one\): this is its first delivery/);
+    assert.match(text, /re-delivered from the piher ledger \(seq 3, task task-three\)/, 'the replay wording rides in the row');
     assert.ok(text.includes('subagent(action:"output", agentId:"p-two")'), 'the absent body names its own read');
     assert.equal(second.ledger.deliveredSeq(), 3, 'the cursor follows what the delivery carried');
 

@@ -21,6 +21,12 @@
  * mark**: acceptances arrive out of order (a refused notice is requeued while a later fact goes
  * out), so a cursor that jumped to the highest accepted seq would skip the gap below it forever.
  *
+ * The duplicate bound is "at most one duplicate each", and it only holds because **one delivery is
+ * one step**: a batch pi took as a single message is recorded with a single cursor write
+ * (`openBatch`), so a crash can never record part of it and re-deliver the rest on the next start.
+ * Recording a batch notice by notice would leave the unrecorded tail to be re-delivered although pi
+ * already read it, and the documented bound would be false.
+ *
  * File format — one JSON object per line, terminated by `\n`, fields in this order:
  * `{seq, at, taskId, pane, turn, kind, group?, payloadRef?}`. Line-delimited rather than one JSON
  * document because the file only ever grows from its end: an append is one `write`, a torn tail
@@ -159,7 +165,9 @@ export function parseSettlementLedger(text: string): LedgerParse {
 }
 
 /** The cursor document: `{version: 1, deliveredSeq: n}`. Absent, torn or foreign reads as 0 — a
- *  lost cursor re-delivers (at most one duplicate each) instead of dropping a settlement. */
+ *  lost cursor re-delivers the facts above it instead of dropping a settlement, and a whole batch
+ *  that was accepted but never recorded comes back at most once each, because a batch is one
+ *  cursor step and not a run of them. */
 export function parseSettlementCursor(text: string): number {
   try {
     const parsed: unknown = JSON.parse(text);
@@ -220,8 +228,19 @@ export interface SettlementLedger {
    *  retried with the same identity, so a retry never forks one settlement into two ledger lines. */
   append(input: Omit<SettlementEvent, 'seq'>): SettlementEvent;
   /** Record one accepted seq and move the cursor over the prefix that is now whole. Call it only
-   *  after pi accepted the message — never before. */
-  markDelivered(seq: number): void;
+   *  after pi accepted the message — never before. `epoch` is the {@link epoch} the acceptance was
+   *  judged under: a seq minted for a previous file is not a fact about this one (the pane id, and
+   *  the seq with it, may already belong to another task), so a stale acceptance is ignored. */
+  markDelivered(seq: number, epoch?: number): void;
+  /** Which file this object currently reads and writes: it changes on every {@link repoint}. An
+   *  acceptance captures it when the fact is announced and hands it back to `markDelivered`, so a
+   *  notice buffered against the previous file cannot mark a seq of the new one delivered. */
+  epoch(): number;
+  /** Advance the cursor for a whole delivery in one step: every acceptance until `end` is recorded
+   *  with a single cursor write, so a crash between two of them cannot leave half a batch that pi
+   *  read as one message recorded and re-deliver the rest. `end` is idempotent and must be called
+   *  in a `finally`, or the cursor would never reach the disk. */
+  openBatch(): { end(): void };
   /** Point this same ledger at another file and re-read it. One object serves the whole process, so
    *  the poller that captured it at mount keeps writing to whatever the session's checkout became. */
   repoint(file: string | null): void;
@@ -258,8 +277,23 @@ export function openSettlementLedger(opts: { file: string | null }): SettlementL
    *  crosses them only once every fact below is accepted too — and it never has to remember them
    *  across a restart, because what it wrote was already a prefix. */
   const accepted = new Set<number>();
+  /** Which file the state above describes. Bumped by every load, so an acceptance captured before a
+   *  `repoint` can be recognised as belonging to a file this ledger no longer answers for. */
+  let epochValue = 0;
+  /** Open delivery batches: while one is open the cursor write waits, so a batch's acceptances land
+   *  in one step instead of one write each. */
+  let batches = 0;
+  /** The in-memory cursor is ahead of the file (an acceptance inside a batch): `end` writes it. */
+  let cursorDirty = false;
+
+  function flushCursor(): void {
+    if (batches > 0 || !cursorDirty || cursorFile === null) return;
+    cursorDirty = false;
+    writeCursor(cursorFile, delivered);
+  }
 
   function load(next: string | null): void {
+    epochValue += 1;
     file = next;
     cursorFile = next === null ? null : `${next}.seq`;
     let text = '';
@@ -286,6 +320,7 @@ export function openSettlementLedger(opts: { file: string | null }): SettlementL
     // so trust the events that are actually there.
     delivered = Math.min(delivered, lastSeq);
     accepted.clear();
+    cursorDirty = false;
     facts.clear();
     for (const event of events) {
       if (isSettlementFact(event.kind)) facts.set(settlementKey(event.taskId, event.at), event);
@@ -325,8 +360,9 @@ export function openSettlementLedger(opts: { file: string | null }): SettlementL
       if (isSettlementFact(event.kind)) facts.set(settlementKey(event.taskId, event.at), event);
       return event;
     },
-    markDelivered(seq) {
+    markDelivered(seq, epoch) {
       if (!Number.isInteger(seq) || seq < 1) return;
+      if (epoch !== undefined && epoch !== epochValue) return;
       accepted.add(seq);
       // Walk the file forward: a fact kind still waiting ends the prefix. A seq with no line behind
       // it (a torn tail that lost one) is skipped, not waited for — nothing can ever deliver it.
@@ -338,7 +374,21 @@ export function openSettlementLedger(opts: { file: string | null }): SettlementL
       }
       if (next <= delivered) return;
       delivered = next;
-      if (cursorFile !== null) writeCursor(cursorFile, next);
+      if (batches > 0) cursorDirty = true;
+      else if (cursorFile !== null) writeCursor(cursorFile, next);
+    },
+    epoch: () => epochValue,
+    openBatch() {
+      batches += 1;
+      let ended = false;
+      return {
+        end() {
+          if (ended) return;
+          ended = true;
+          batches -= 1;
+          flushCursor();
+        },
+      };
     },
     repoint(next) {
       if (next === file) return;

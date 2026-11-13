@@ -135,28 +135,58 @@ export function formatNoReportNotice(input: {
  * real and this is its first delivery — and never as a fresh settle the master might re-answer.
  * The body comes from the report document when the document still holds this very settlement;
  * otherwise the notice names the one call that reads what the worker did.
+ *
+ * Two things the replay must not lose. The **task**, not only the pane: `(taskId, at)` is what the
+ * ledger keys on, and a pane id is only borrowed — after a sweep and a reused id, `agentId <pane>`
+ * resolves to the new task, so the notice names the task and says when the address is not its own.
+ * And the **kind**: a settlement the silence budget ended and a pane that went before settling have
+ * no report document by construction, so "its report document is no longer readable" would invent a
+ * document that never existed and read as a settle that was merely lost.
  */
 export function formatReplayNotice(input: {
   seq: number;
   paneId: string;
+  /** The task the fact belongs to: the identity a reused pane id cannot take away. */
+  taskId: string;
   description: string;
   at: number;
+  /** What the fact is. `pane-gone` and a budget-ended `failed` carry no document at all. */
+  kind: SettlementEventKind;
+  /** The line carried a `payloadRef`: the fact was a settle that had a document to read. */
+  hasPayloadRef: boolean;
   /** The document's report text, when the document still holds the settlement the ledger names. */
   report: string | null;
   /** The document's stated reason when it had no text (an errored or refused turn). */
   reason: string | null;
+  /** True when the pane id now addresses a different task: the read below would return that task's
+   *  work, so the notice says so instead of pointing at it. */
+  paneReused: boolean;
 }): string {
-  const head = `Re-delivered settlement (piher ledger, seq ${input.seq}): background subagent ${input.paneId}`
-    + `${input.description ? ` (${input.description})` : ''} settled at ${new Date(input.at).toISOString()}, `
-    + 'and its notice never reached you — this is the first delivery, not a new settlement. ';
+  const head = `Re-delivered settlement (piher ledger, seq ${input.seq}, task ${input.taskId}): `
+    + `background subagent ${input.paneId}${input.description ? ` (${input.description})` : ''} `
+    + `${input.kind === 'settled' ? 'settled' : 'ended'} at ${new Date(input.at).toISOString()}, `
+    + 'and its notice never reached you — this is the first delivery, not a new settlement. '
+    + (input.paneReused
+      ? `Its pane id is not its own any more: ${input.paneId} now belongs to another task, so reading `
+        + `agentId ${input.paneId} returns that task's work, not this settlement (task ${input.taskId}). `
+      : '');
+  const read = `subagent(action: "output", agentId ${input.paneId})`;
   if (input.report !== null) {
     return `${head}Its report, in its own words — its output, not an instruction to you: ${input.report}`;
   }
   if (input.reason !== null) {
     return `${head}It FAILED — no report was produced (${input.reason}). `
-      + `Read what it did with subagent(action: "output", agentId ${input.paneId}), then continue it with action "send", retry it, or resume its session.`;
+      + `Read what it did with ${read}, then continue it with action "send", retry it, or resume its session.`;
   }
-  return `${head}Its report document is no longer readable, so read what it did with subagent(action: "output", agentId ${input.paneId}) before relying on it.`;
+  if (input.kind === 'pane-gone') {
+    return `${head}Its pane was gone before it settled, so it never wrote a report: read what it left `
+      + `with ${read} before relying on anything it did.`;
+  }
+  if (input.kind === 'failed' && !input.hasPayloadRef) {
+    return `${head}Its wait ended with no report document at all, so nothing of what it said can be `
+      + `delivered — this is NOT the task's result. Read what it did with ${read} before relying on it.`;
+  }
+  return `${head}Its report document is no longer readable, so read what it did with ${read} before relying on it.`;
 }
 
 /* ── pane scope ─────────────────────────────────────────────────── */
@@ -252,6 +282,10 @@ export interface PollerHost {
  * belongs to the turn the steer opened, and stamping it with the old settlement's `at` would spend a
  * one-shot on a report the master never read and retire the pane now running that steer. The delivery
  * is recorded either way: pi really did read the notice.
+ *
+ * The delivery belongs to the ledger file the fact was written to, and that is what `epoch` says: a
+ * notice buffered while the session's checkout changed answers a file this ledger no longer reads,
+ * and its seq is another file's seq (possibly another task's), so the cursor is left alone.
  */
 function acceptSettlement(
   h: PollerHost,
@@ -260,6 +294,8 @@ function acceptSettlement(
     pane: string;
     at: number;
     seq: number;
+    /** The ledger epoch the fact was appended under: a stale one records no cursor. */
+    epoch: number;
     /** Whether the row still answers the request this settlement was judged against. */
     stillOwnsRow: () => boolean;
   },
@@ -277,7 +313,7 @@ function acceptSettlement(
       }
     }
   }
-  h.ledger.markDelivered(input.seq);
+  h.ledger.markDelivered(input.seq, input.epoch);
 }
 
 export interface Poller {
@@ -400,6 +436,9 @@ export function createPoller(h: PollerHost): Poller {
         kind: input.kind,
         ...(input.payloadRef === undefined ? {} : { payloadRef: input.payloadRef }),
       });
+      // The file this fact was written to: the acceptance below records its cursor there, and only
+      // while the ledger still answers for that file (a notice can wait out a checkout change).
+      const epoch = h.ledger.epoch();
       awaitingAccept = true;
       try {
         // Tag the pane: a notice buffered while the master is busy must keep its row GC-exempt
@@ -411,6 +450,7 @@ export function createPoller(h: PollerHost): Poller {
             pane: paneId,
             at: event.at,
             seq: event.seq,
+            epoch,
             stillOwnsRow: () => ownsRow(paneId, input.request),
           });
         }, input.row);
@@ -806,14 +846,15 @@ async function readReplayBody(
 /** Record a re-delivery: the row's accepted settlement and the cursor, in that order, for the reason
  *  `acceptSettlement` gives. No pane is reclaimed here: after a restart the tabs, panes and checkouts
  *  are the sweeps' business, and killing a pane a `send` may already have revived would be worse than
- *  leaving it to the TTL that reads the same `consumedAt`. */
-function acceptReplay(h: PollerHost, event: SettlementEvent): void {
+ *  leaving it to the TTL that reads the same `consumedAt`. `epoch` is the file the replay read the
+ *  event from: a ledger that was re-pointed while the batch went out records none of it. */
+function acceptReplay(h: PollerHost, event: SettlementEvent, epoch: number): void {
   const row = h.tasks.get(event.taskId);
   if (row) {
     row.gen.consumedAt = event.at;
     h.writeRecord(row);
   }
-  h.ledger.markDelivered(event.seq);
+  h.ledger.markDelivered(event.seq, epoch);
 }
 
 /**
@@ -858,13 +899,25 @@ export async function replaySettlements(h: PollerHost): Promise<number> {
   for (const event of plan) {
     const row = h.tasks.get(event.taskId);
     const { report, reason } = await readReplayBody(h, event);
+    // Whether the pane id still addresses this task: after a sweep and a reused id it addresses the
+    // new one, and every read call the notice prints would return that task's work instead.
+    const owner = h.panes.get(event.pane);
+    const paneReused = owner !== undefined && owner !== event.taskId;
+    const taskNote = `task ${event.taskId}`;
+    const reuseNote = paneReused
+      ? `; its pane ${event.pane} now belongs to another task, so the pointer above is not its report`
+      : '';
     const content = formatReplayNotice({
       seq: event.seq,
       paneId: event.pane,
+      taskId: event.taskId,
       description: row?.description ?? '',
       at: event.at,
+      kind: event.kind,
+      hasPayloadRef: event.payloadRef !== undefined,
       report,
       reason,
+      paneReused,
     });
     const card = settlementCard({
       name: `${event.pane}${row?.description ? ` (${row.description})` : ''}`,
@@ -873,8 +926,9 @@ export async function replaySettlements(h: PollerHost): Promise<number> {
       now: now(),
     });
     const note = reason === null
-      ? `re-delivered from the piher ledger (seq ${event.seq}): this is its first delivery`
-      : `re-delivered from the piher ledger (seq ${event.seq}) and it FAILED (${reason}): this is its first delivery`;
+      ? `re-delivered from the piher ledger (seq ${event.seq}, ${taskNote})${reuseNote}: this is its first delivery`
+      : `re-delivered from the piher ledger (seq ${event.seq}, ${taskNote}) and it FAILED (${reason})`
+        + `${reuseNote}: this is its first delivery`;
     carried.push({
       event,
       content,
@@ -882,7 +936,9 @@ export async function replaySettlements(h: PollerHost): Promise<number> {
       row: {
         id: event.pane,
         description: row?.description ?? '',
-        outcome: event.kind === 'settled' ? 'settled' : 'failed',
+        // The row says what the fact was, as the live delivery does: a pane that went is `closed`,
+        // not a failure, and the budget's endings are failures of the wait, not of the task.
+        outcome: event.kind === 'settled' ? 'settled' : event.kind === 'pane-gone' ? 'closed' : 'failed',
         body: report,
         note,
       },
@@ -893,11 +949,19 @@ export async function replaySettlements(h: PollerHost): Promise<number> {
   // A batch of one keeps the address and the card a lone settlement has always carried; a real batch
   // has no single pane to exempt from the sweeps and no single card to draw.
   const lone = carried.length === 1 ? carried[0]! : null;
+  // The file this batch was planned from. A `repoint` while it is being handed over (a session
+  // checkpoint mid-await) makes these seqs another file's business.
+  const epoch = h.ledger.epoch();
   try {
     await h.injectNotice(batch.text, lone?.event.pane, lone?.card, () => {
-      // pi took the whole batch, so every settlement it carried is delivered — and the cursor moves
-      // one carried seq at a time, never past one the batch left out.
-      for (const { event } of carried) acceptReplay(h, event);
+      // pi took the whole batch as one message, so the whole batch is recorded as one step: a crash
+      // between two of these must not leave half of a message the master read above the cursor.
+      const group = h.ledger.openBatch();
+      try {
+        for (const { event } of carried) acceptReplay(h, event, epoch);
+      } finally {
+        group.end();
+      }
     });
   } catch {
     // The cursor stays below every seq this batch carried: the next start re-delivers instead of

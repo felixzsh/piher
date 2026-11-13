@@ -474,6 +474,9 @@ export default function subagentPlugin(ctx: Context): void {
           description: s.description,
         }));
     },
+    // The notice buffer lives in index.ts, this session's ledger lives here: one delivery that pi
+    // took as a single message is recorded as one cursor step through this seam (E1).
+    openDeliveryBatch: () => ledger.openBatch(),
   };
   port.current = boundPort;
   ctx.effect(() => () => {
@@ -488,7 +491,12 @@ export default function subagentPlugin(ctx: Context): void {
     row?: NoticeRow,
   ): Promise<void> => {
     if (d.deliverNotice) return d.deliverNotice(content, paneId, card, onAccepted, row);
-    pi.sendUserMessage?.(content, { deliverAs: 'followUp' });
+    // No notice buffer in this host: hand the notice to pi directly. The delivery is claimed only
+    // when a message method actually took it — the same answer `sendSettlementNotice` gives, and for
+    // the same reason: `onAccepted` writes the row's `consumedAt` and the ledger cursor, so claiming
+    // one where nothing was sent would hide the settlement from every later replay for good.
+    if (typeof pi.sendUserMessage !== 'function') return Promise.resolve();
+    pi.sendUserMessage(content, { deliverAs: 'followUp' });
     onAccepted?.();
     return Promise.resolve();
   };
