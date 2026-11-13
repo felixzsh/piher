@@ -952,6 +952,128 @@ test('resume: a session that names no readable transcript is refused by its path
   }
 });
 
+test('resume: a record carrying an unvalidated session is refused by its path, not "restored"', async () => {
+  const home = new TempHome('piher-resume-record-raw-');
+  const cwd = mkdtempSync(join(tmpdir(), 'piher-resume-record-raw-cwd-'));
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const viewFile = join(home.dir('views'), '2026-09-20T08-05-00-000Z_10101010-2020-4020-8020-303030303030.jsonl');
+  // The record can receive an unvalidated value through the settlement document (`index.ts` records
+  // `report.file ?? sessionId`, a bare id when the worker could not resolve its transcript) and through
+  // the poller's raw write of `session`. `reviveEntry` drops a value that is not an existing `.jsonl`, so
+  // a resume that trusted the record answered "session restored" over a fresh conversation.
+  const bareTask = 'dddd1111-2222-4333-8444-555555555555';
+  const goneTask = 'dddd6666-7777-4888-8999-aaaaaaaaaaaa';
+  const gonePath = join(home.dir('sessions'), '2026-09-20T08-05-00-000Z_11111111-1111-4111-8111-111111111111.jsonl');
+  seedTaskDocuments(viewFile, [
+    {
+      taskId: bareTask, paneId: 'praw', tabId: 't0', tabName: 'main', cwd,
+      description: 'bare id in the record', sessionFile: 'no-such-session-id', createdAt: Date.now() - 60_000,
+    },
+    {
+      taskId: goneTask, paneId: 'pgone', tabId: 't0', tabName: 'main', cwd,
+      description: 'pruned transcript in the record', sessionFile: gonePath, createdAt: Date.now() - 59_000,
+    },
+  ]);
+  const { root, pi } = await mountSubagent({
+    client: {
+      listTerminals: async () => [],
+      // Each terminal is its own task's, and reports no `hresume`: nothing but the record names a session.
+      getTerminal: async (id) => terminalInfo({
+        id, status: 'idle', labels: { [TASK_LABEL]: id === 'praw' ? bareTask : goneTask },
+      }),
+    },
+    deps: {
+      getSessionId: () => '10101010-2020-4020-8020-303030303030',
+      getSessionFile: () => viewFile,
+      getCwd: () => cwd,
+    },
+  });
+  try {
+    await fire(pi, 'session_start', { reason: 'reload' }, {});
+    const bareRefusal = await runSubagentRejects(pi, { action: 'resume', taskId: bareTask }, cwd);
+    assert.match(bareRefusal, /cannot be resumed: its transcript no-such-session-id is gone/);
+    assert.doesNotMatch(bareRefusal, /restored/, 'nothing was restored');
+    assert.equal(
+      readTaskRecord(cwd, bareTask)?.gen.sessionFile,
+      'no-such-session-id',
+      'the record is not rewritten with a claim the resume refused',
+    );
+    const goneRefusal = await runSubagentRejects(pi, { action: 'resume', taskId: goneTask }, cwd);
+    assert.ok(
+      goneRefusal.includes(`cannot be resumed: its transcript ${gonePath} is gone`),
+      `the refusal names the record's own path, got: ${goneRefusal}`,
+    );
+    assert.doesNotMatch(goneRefusal, /restored/, 'nothing was restored');
+  } finally {
+    await root.fiber.dispose();
+    home.dispose();
+  }
+});
+
+test('resume: a label naming a pruned transcript falls back to a document that can be opened', async () => {
+  const home = new TempHome('piher-resume-label-fallback-');
+  const cwd = mkdtempSync(join(tmpdir(), 'piher-resume-label-fallback-cwd-'));
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const live = join(home.dir('sessions'), '2026-09-20T08-10-00-000Z_55555555-1111-4111-8111-222222222222.jsonl');
+  writeFileSync(live, '{}\n');
+  // The terminal still reports the session it had before its transcript was pruned; the settlement
+  // document names one that can still be opened. One unreadable label is not the task's last word.
+  const pruned = join(home.dir('sessions'), '2026-09-20T08-10-00-000Z_55555555-1111-4111-8111-333333333333.jsonl');
+  const viewFile = join(home.dir('views'), '2026-09-20T08-10-00-000Z_55555555-1111-4111-8111-444444444444.jsonl');
+  const taskId = 'eeee1111-2222-4333-8444-555555555555';
+  seedTaskDocuments(viewFile, [{
+    taskId, paneId: 'pfb', tabId: 't0', tabName: 'main',
+    cwd, description: 'pruned label', sessionFile: null, createdAt: Date.now() - 60_000,
+  }]);
+  const { root, pi } = await mountSubagent({
+    client: {
+      listTerminals: async () => [],
+      getTerminal: async (id) => terminalInfo({
+        id, status: 'idle', labels: { [HRESUME_LABEL]: hresumeLabel(pruned), [TASK_LABEL]: taskId },
+      }),
+      docGet: async (name) => (name === 'piher.rep.pfb'
+        ? { value: { taskId, turn: 1, stopReason: 'stop', session: live, text: 'carried on', at: 2_000 }, version: 5 }
+        : { value: null, version: 0 }),
+    },
+    deps: {
+      getSessionId: () => '55555555-1111-4111-8111-444444444444',
+      getSessionFile: () => viewFile,
+      getCwd: () => cwd,
+    },
+  });
+  try {
+    await fire(pi, 'session_start', { reason: 'reload' }, {});
+    const resumed = await runSubagent(pi, { action: 'resume', taskId }, cwd);
+    assert.match(resumed.content[0]!.text, /session restored from its settlement document/);
+    assert.doesNotMatch(resumed.content[0]!.text, /is gone/);
+    assert.equal(readTaskRecord(cwd, taskId)?.gen.sessionFile, live, 'the openable transcript, not the pruned label');
+  } finally {
+    await root.fiber.dispose();
+    home.dispose();
+  }
+});
+
+test('readSessionReport: a host with no pane index says ownership is undecided, not another task\'s', async () => {
+  const dir = sessions();
+  const file = join(dir, '2026-09-20T08-20-00-000Z_66666666-1111-4111-8111-222222222222.jsonl');
+  writeFileSync(file, '{}\n');
+  const client = sessionClient({ [PANE]: file });
+  // Without the pane index nothing attributes an address to a task. `not-ours` would assert a fact the
+  // host never established, and every report would be lost silently (`identity: 'other'`); the honest
+  // answer is that ownership could not be decided.
+  const blind = await sessionHost({ client, getTaskIdForPane: undefined }).readSessionReport(PANE);
+  assert.equal(blind.kind, 'unestablished');
+  assert.match((blind as { why: string }).why, /no pane-to-task index/);
+  // The same terminal with the index wired is a report: the difference is the wiring, not the terminal.
+  assert.deepEqual(await sessionHost({ client }).readSessionReport(PANE), { kind: 'reported', file });
+  // Undecided ownership also means the newest session files cannot stand in for a missing report.
+  assert.equal(
+    await sessionHost({ client, getTaskIdForPane: undefined }).resolveSessionFile(PANE, dir),
+    null,
+    'no address proves a conversation when none can be attributed',
+  );
+});
+
 test('resume: a core that does not answer is not reported as a task with no session', async () => {
   const home = new TempHome('piher-resume-unreadable-');
   const cwd = mkdtempSync(join(tmpdir(), 'piher-resume-unreadable-cwd-'));

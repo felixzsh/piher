@@ -83,6 +83,10 @@ export type SessionReport =
   | { kind: 'absent' }
   /** The address holds a terminal that is not this task's own worker. */
   | { kind: 'not-ours'; why: string }
+  /** Ownership could not be established: the host cannot attribute an address to a task at all, so
+   *  nothing was decided either way. Not `not-ours`: a host that wires no pane index would then deny
+   *  every terminal silently (`identity: 'other'`), a fact it never established. */
+  | { kind: 'unestablished'; why: string }
   /** The core answered: no such terminal. */
   | { kind: 'gone' }
   /** The core did not answer, so nothing was established either way. */
@@ -92,9 +96,15 @@ export type SessionReport =
  *
  *  `taskId` is the task this master's pane index assigns to the address: the terminal's own label must
  *  name it, and the report must come from pi. Both are required, because either one alone can be
- *  somebody else's — and neither the address nor the terminal's parent is evidence of ownership. */
-function sessionReportOf(terminal: TerminalInfo | null, taskId: string | null): SessionReport {
+ *  somebody else's — and neither the address nor the terminal's parent is evidence of ownership.
+ *  `undefined` is "this host has no pane index", which establishes no ownership either way; `null`
+ *  is an index that answered and knows no task at that address. */
+function sessionReportOf(
+  terminal: TerminalInfo | null,
+  taskId: string | null | undefined,
+): SessionReport {
   if (!terminal) return { kind: 'gone' };
+  if (taskId === undefined) return { kind: 'unestablished', why: 'it wires no pane-to-task index' };
   if (!taskId) return { kind: 'not-ours', why: 'this session holds no task at that address' };
   const labelled = terminal.labels[TASK_LABEL] ?? null;
   if (labelled !== taskId) {
@@ -304,7 +314,8 @@ export interface SessionIoHost {
   sessionsDir: () => string;
   /** The task this master's pane index assigns to an address, or null when it knows none. It is the
    *  task the terminal's `piher.task` label must name for its report to count (spec S18/S26): an
-   *  address alone identifies nothing. */
+   *  address alone identifies nothing. Left out on a host with no such index: ownership is then
+   *  reported as unestablished, never as another task's. */
   getTaskIdForPane?: (paneId: string) => string | null;
 }
 
@@ -381,7 +392,7 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
   async function readSessionReport(paneId: string): Promise<SessionReport> {
     if (!paneId) return { kind: 'gone' };
     try {
-      return sessionReportOf(await h.client.getTerminal(paneId), h.getTaskIdForPane?.(paneId) ?? null);
+      return sessionReportOf(await h.client.getTerminal(paneId), h.getTaskIdForPane?.(paneId));
     } catch {
       return { kind: 'unavailable' };
     }
@@ -392,12 +403,14 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
   async function reportedAndTaken(paneId: string): Promise<{
     reported: string | null;
     taken: Set<string>;
-    /** 'other' when the address holds no terminal carrying this task's label. */
-    identity: 'ours' | 'other';
+    /** 'ours' | 'other' when this task's label decides it, 'unknown' when the host cannot attribute an
+     *  address to a task at all (no pane index wired). */
+    identity: 'ours' | 'other' | 'unknown';
   }> {
     const taken = new Set<string>();
     let paneReport: SessionReport | null = null;
-    const taskId = h.getTaskIdForPane?.(paneId) ?? null;
+    // `undefined` when the host wires no index: ownership stays undecided instead of becoming 'other'.
+    const taskId = h.getTaskIdForPane?.(paneId);
     try {
       for (const terminal of await h.client.listTerminals({ all: true })) {
         if (terminal.id === paneId) {
@@ -415,7 +428,9 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     return {
       reported: paneReport.kind === 'reported' ? paneReport.file : null,
       taken,
-      identity: paneReport.kind === 'not-ours' ? 'other' : 'ours',
+      identity: paneReport.kind === 'not-ours'
+        ? 'other'
+        : paneReport.kind === 'unestablished' ? 'unknown' : 'ours',
     };
   }
 
@@ -444,7 +459,9 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     };
     push(reported, false);
     push(resolveSessionFileValue(cwd, h.sessionsDir(), preferred), true);
-    if (identity === 'other') return out;
+    // Only a decided ownership lets the newest session files stand in for a missing report: an address
+    // nobody can attribute proves nothing about which conversation is this task's.
+    if (identity !== 'ours') return out;
     for (const f of listSessionFiles(cwd, h.sessionsDir(), 4)) push(f, true);
     return out;
   }

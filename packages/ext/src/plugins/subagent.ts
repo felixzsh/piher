@@ -235,7 +235,10 @@ function noSessionText(input: {
       ? 'its core terminal is gone'
       : input.report.kind === 'not-ours'
         ? `its core terminal ${input.paneId} is not its own (${input.report.why})`
-        : 'its core terminal reports no session';
+        : input.report.kind === 'unestablished'
+          ? `its core terminal ${input.paneId} cannot be attributed (${input.report.why}); `
+            + 'its own report was never read'
+          : 'its core terminal reports no session';
   const document = input.address.kind === 'read'
     ? (input.address.value.taskId === input.taskId
       ? 'its settlement document reported no session'
@@ -870,24 +873,55 @@ export default function subagentPlugin(ctx: Context): void {
     // label wins when it belongs to this task: it is the terminal's current identity, while the document
     // is a past settle's report — a person who resumed the worker's pi in place is what the task
     // continues from, and picking the older conversation would spawn a second pi beside it (D94).
-    let restoredFrom: 'document' | 'label' | null = null;
-    if (!latest.gen.sessionFile) {
+    //
+    // No value is taken on the record's word. A `session` reaches the record unvalidated through the
+    // settlement document (`index.ts` records `report.file ?? sessionId`, a bare id when the worker
+    // could not resolve its transcript) and through the poller's raw write, while `reviveEntry` drops
+    // any value that is not an existing `.jsonl` — so a resume that trusted the record would answer
+    // "session restored" over a fresh conversation. Every value is therefore resolved to a transcript
+    // this machine can open, in trust order: the record's own, the live label, the document.
+    let restoredFrom: 'record' | 'document' | 'label' | null = null;
+    let usable = latest.gen.sessionFile
+      ? usableTranscript(latest.gen.sessionFile, latest.cwd) : null;
+    if (usable !== null) {
+      restoredFrom = 'record';
+    } else {
+      // The record cannot answer on its own, so the core is asked: the label first (this terminal's
+      // current identity) and the document always, so a refusal can say what each one holds.
       const report = await session.readSessionReport(latest.gen.paneId);
       const address = await readAddressReport(latest.gen.paneId);
       const fromLabel = report.kind === 'reported' ? report.file : null;
       // Only this task's own document may lend its session: another task's means the address was reused.
       const fromDocument = address.kind === 'read' && address.value.taskId === taskId
         ? address.value.session : null;
-      const named = fromLabel ?? fromDocument;
-      if (!named) return toolError(noSessionText({ taskId, paneId: latest.gen.paneId, address, report }));
-      // A reported session is not yet a transcript: a bare id is resolved through pi's directories, and
-      // a value that names nothing readable is refused by its path instead of "restoring" a fresh
-      // conversation under the old task's name (`reviveEntry` would silently drop it).
-      const usable = usableTranscript(named, latest.cwd);
-      if (usable === null) return toolError(goneTranscriptText(taskId, expectedTranscript(named, latest.cwd)));
+      // A reported session is not yet a transcript: a bare id is resolved through pi's directories,
+      // and a value that names nothing readable is not a candidate — a label naming a pruned transcript
+      // must not hide a document that can still be opened.
+      const labelUsable = fromLabel ? usableTranscript(fromLabel, latest.cwd) : null;
+      const documentUsable = fromDocument ? usableTranscript(fromDocument, latest.cwd) : null;
+      if (labelUsable !== null) {
+        usable = labelUsable;
+        restoredFrom = 'label';
+      } else if (documentUsable !== null) {
+        usable = documentUsable;
+        restoredFrom = 'document';
+      } else {
+        const named = [latest.gen.sessionFile, fromLabel, fromDocument]
+          .find((v): v is string => typeof v === 'string' && v !== '') ?? null;
+        // An unanswered read establishes nothing: when the core could have named a better session,
+        // say the check could not be made instead of calling the record's value the final word.
+        if (named === null || report.kind === 'unavailable' || address.kind === 'unavailable') {
+          return toolError(noSessionText({ taskId, paneId: latest.gen.paneId, address, report }));
+        }
+        // A value that names nothing readable is refused by its path instead of "restoring" a fresh
+        // conversation under the old task's name (`reviveEntry` would silently drop it).
+        return toolError(goneTranscriptText(taskId, expectedTranscript(named, latest.cwd)));
+      }
+    }
+    // The record is what a later resume reads, so what was established is written down now — including
+    // a record value the resolver normalized from a bare id to its transcript path.
+    if (latest.gen.sessionFile !== usable) {
       latest.gen.sessionFile = usable;
-      restoredFrom = fromLabel ? 'label' : 'document';
-      // The record is what a later resume reads, so the report is written down the moment it is used.
       writeTaskRecord(latest.cwd, latest);
     }
     // D94: reuse an existing pane for the same session to avoid competing pi processes. This
