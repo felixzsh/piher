@@ -84,3 +84,16 @@ edited. The spec gained **S25** (delivery believed by `started: true` **or** a t
 had), with S22 kept visible as superseded. Residuals: the gate, the reclaim and the retire/keep split are
 proven against the fake core at the plugin seam, not against a live `hc`; a kept failure on a `blocked`
 pane waits for a person by design (its silence budget does not consume it).
+L5. **P3 done**: `a839500` (+ `25abcef`) with `4286801` carrying the docs-only S26 commit, Risk: item 4
+(concurrency and delivery claims on a control channel; `CoreClientLike` also gained `watchDocuments`, item
+3), `tsc` clean + `npm test` **540/540** on `4286801`, Route: delegated. Two reviews, both REJECT (9 items,
+then 8); 15 items corrected across three rounds, none triaged out. The ack of a steer is now the *version
+the absence landed at*: a delete bumps the version, **measured** on `hc 0.1.20` (`set(v2, null) → 3`,
+`get → {null, 3}`) after the reviewer read the schema prose the other way — the measurement is quoted in
+the code and pinned by a test. `replaced` was deleted rather than reworded: no read can prove a steer was
+*not* applied, so the ambiguous interleaving is `unsettled` and never invites a second delivery. The spec
+gained **S26** (the command value carries the task id; an identity-less worker refuses every command; an
+empty or oversized message is refused before any write). Residuals: the steer ordering rests on pi's
+`deliverAs:'steer'` contract, not on a live `hc` run; `unsettled` does not re-arm, deliberately. The P3
+worker rewrote the branch so my uncommitted S26 edit fell out of history; I re-committed it as `4286801`
+and the text is byte-identical.
