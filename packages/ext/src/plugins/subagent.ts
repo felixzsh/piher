@@ -75,8 +75,8 @@ import {
   type CheckoutSpace,
 } from '../worktree.ts';
 import { createPoller } from '../subagent-poller.ts';
-import { awaitCommandPickup, steerCommand, writeCommandDocument, type CommandPickup } from '../command-documents.ts';
-import { commandDocName } from '../report-documents.ts';
+import { awaitCommandPickup, commandDocumentOverflow, steerCommand, writeCommandDocument, type CommandPickup } from '../command-documents.ts';
+import { MAX_DOCUMENT_BYTES, commandDocName } from '../report-documents.ts';
 import { createGcController, restoreTasks, retirePane, seedForkView } from '../subagent-gc.ts';
 import { createSessionIo, executeSubagentOutput, type SubagentOutputCursor } from '../subagent-session.ts';
 import type { WorkerWidgetRow } from '../tree-view.ts';
@@ -137,7 +137,7 @@ const SUBAGENT_MANUAL = [
   '',
   'output — `agentId`; the state plus the finalized report or, while it runs, the latest lines (`max_chars`, 100-16000; whole pane only with `full: true`). Normally unneeded: the settlement notice carries the words.',
   '',
-  'send — `agentId` + `message`: steered into a working worker at its next tool gap. A task whose pane is gone revives a new generation first, then takes the text. A closed or spent task is refused. `Message sent` means applied; `Message written` means still unread in the core.',
+  'send — `agentId` + `message`: steered into a working worker at its next tool gap. A task whose pane is gone revives a new generation first, then takes the text. A closed or spent task is refused. `Message sent` means the worker applied it; anything less says what is known.',
   '',
   'close — `agentId`; reclaims a finished worker: pane and tab go, and the record keeps the decision — close is final for every session, so later calls are refused and a new subagent is the only next step. A turn in flight is refused — interrupt first. One-shots reclaim automatically; a `worktree` checkout goes too (never forced; dirty refused, branch survives). Another session\'s live task closes the same way, no adoption step.',
   '',
@@ -164,22 +164,57 @@ function defaultAgentSessionsDir(): string {
   return join(base, 'sessions');
 }
 
+/** The outcomes a `send` reports in its result: `unread` is a refusal, never a message. */
+type ReportedPickup = Exclude<CommandPickup, { kind: 'unread' }>;
+
 /**
  * What a `send` says it achieved (spec S15). `Message sent to subagent <ref>.` is the contract's
- * wording for a delivered steer, so it is used only when the worker read the command; every other
- * outcome says what is actually known, because a steer that was written and never read must not
- * read as delivered.
+ * wording for a delivered steer, so it is used only when the worker cleared the document one version
+ * after the write; every other outcome says what is actually known. Nothing here claims a steer was
+ * *not* applied — no read of the document can establish that (spec S7 forbids delivering the same
+ * steer twice, so an unprovable claim must not invite a resend). `unread` never gets here: it is a
+ * refusal (`unreadCommandText`).
  */
-function steerResultText(ref: string, paneId: string, commandId: string, pickup: CommandPickup): string {
+function steerResultText(ref: string, paneId: string, commandId: string, pickup: ReportedPickup): string {
   if (pickup.kind === 'applied') return `Message sent to subagent ${ref}.`;
   const document = `piher.cmd.${paneId}`;
-  if (pickup.kind === 'replaced') {
-    return `Message written for subagent ${ref}, but a newer command replaced it in the core before the worker read it: nothing of it was applied. Send it again.`;
+  if (pickup.kind === 'unsettled') {
+    // The worker's own log records the same event: it applied the command and its clear lost to a
+    // newer write. The document cannot separate that from our write being overwritten unread.
+    return `Message written for subagent ${ref} as command ${commandId} in ${document}, but another `
+      + 'write took the document before its fate was known: whether the worker applied it cannot be '
+      + 'told — it may have been applied and left behind when a newer command arrived. Check with '
+      + 'action "output" before resending.';
   }
-  if (pickup.kind === 'unknown') {
-    return `Message written for subagent ${ref} as command ${commandId} in ${document}, but delivery is unconfirmed: ${pickup.reason}.`;
-  }
-  return `Message written for subagent ${ref} as command ${commandId} in ${document}; the worker has not applied it yet, so it stays in the core until its extension reads it (check with action "output" before resending).`;
+  return `Message written for subagent ${ref} as command ${commandId} in ${document}, but delivery is unconfirmed: ${pickup.reason}. Check with action "output" before resending.`;
+}
+
+/**
+ * The non-refusal reading of an unread command, for the operator who set the pickup budget to 0
+ * (`PIHER_COMMAND_PICKUP_MS`): the send reported the write alone, exactly as the knob documents.
+ */
+function writtenOnlyText(ref: string, paneId: string, commandId: string): string {
+  return `Message written for subagent ${ref} as command ${commandId} in piher.cmd.${paneId}: the core `
+    + 'holds it (PIHER_COMMAND_PICKUP_MS=0 does not wait for the worker to read it). Check with action '
+    + '"output" before resending.';
+}
+
+/**
+ * The refusal for a command nothing confirmed reading (spec S16 keeps the diagnosis this replaces):
+ * a live pane whose extension host is not watching. Three things leave this trace and none of them
+ * can be told apart from the document: the host is not running; it read the command and its clear
+ * lost; or its document watch is reconnecting and will read it within seconds (a core restart). The
+ * write landed, so nothing is lost — but nothing is confirmed delivered either, and a master that
+ * called that delivered would wait for a turn that may never start.
+ */
+function unreadCommandText(paneId: string, taskId: string, command: string, budgetMs: number): string {
+  return `Error: subagent pane ${paneId} is alive but its message channel is dead (${command} was not `
+    + `confirmed read within ${budgetMs} ms): the worker's extension host is not running there; or it `
+    + 'read the command and could not clear it; or its document watch is reconnecting after a core '
+    + 'restart and will read it within seconds. NOTHING is confirmed delivered and the command stays '
+    + 'in the core, so a worker that comes back applies it — check action "output" before resending, '
+    + 'or raise PIHER_COMMAND_PICKUP_MS if the core is just slow. '
+    + `action "resume" with taskId ${taskId} restarts it in a new pane; action "close" retires the row.`;
 }
 
 export default function subagentPlugin(ctx: Context): void {
@@ -955,7 +990,7 @@ export default function subagentPlugin(ctx: Context): void {
    * The write is durable, so the result separates two facts instead of blurring them: the core holds
    * the command, and (when the worker read it) the worker applied it.
    */
-  async function executeSubagentSend(params: ToolParams, toolCtx: unknown) {
+  async function executeSubagentSend(params: ToolParams, toolCtx: unknown, signal?: AbortSignal) {
     const { entry, foreign } = targetOf(params, toolCtx);
     // A closed worker or a spent one-shot is not a conversation partner any more.
     const spent = spentText(entry);
@@ -965,6 +1000,21 @@ export default function subagentPlugin(ctx: Context): void {
     if (foreign) return toolError(foreignRefusal(entry.taskId, 'send'));
     if (!client.available) return toolError(`subagent: ${CORE_REQUIRED}`);
     const text = String(params?.message ?? '');
+    // The worker's guard refuses a value with no text, so an empty follow-up would sit in the core
+    // forever as a command nobody can apply: refuse it where the master can still act on it.
+    if (text.trim() === '') {
+      return toolError('Error: action send needs a non-empty message — there is nothing to steer the worker with.');
+    }
+    const command = steerCommand(text, entry.taskId);
+    const overflow = commandDocumentOverflow(command);
+    if (overflow !== null) {
+      // The measured number is the whole serialized document, not just the text: the id, the task id,
+      // the type and escaping are inside it too.
+      return toolError(`Error: action send refuses a ${overflow}-byte command document (the message `
+        + 'plus its envelope: id, task id, type and deliver-as): the core allows '
+        + `${MAX_DOCUMENT_BYTES} bytes per document, and a steer cut in half is worse than one not `
+        + 'sent. Split it into smaller sends.');
+    }
     try {
       // A just-spawned worker is still booting: its first task must land before any follow-up.
       const boot = boots.get(entry.gen.paneId);
@@ -972,19 +1022,33 @@ export default function subagentPlugin(ctx: Context): void {
       // A pane the core no longer lists cannot read a document, and housekeeping reclaims the panes
       // of settled workers: revive first (S3) and write to the generation that now exists.
       await ensureLive(entry);
-      const command = steerCommand(text);
       const written = await writeCommandDocument(client, entry.gen.paneId, command);
       if (!written.ok) {
         return toolError(`Error: failed to reach subagent ${entry.gen.paneId}: ${written.reason} — nothing was delivered.`);
       }
-      rearmAfterSteer(entry, command.id);
-      const ref = taskRef(entry.gen);
       const name = commandDocName(entry.gen.paneId);
       const pickup = name
-        ? await awaitCommandPickup(client, name, { id: command.id, version: written.version }, commandPickupMs)
+        ? await awaitCommandPickup(client, name, { id: command.id, version: written.version }, commandPickupMs, { signal: signal ?? undefined })
         : { kind: 'unknown' as const, reason: 'the address cannot name a document (S9)' };
+      // A delivery the worker took re-arms the row, and so does one whose fate we could not read: an
+      // `unknown` (a cancelled call, a doc.get failure) may still be applied a moment later, and a row
+      // left `consumed` would then be reaping evidence against a turn nobody watches, with its report
+      // dropped. A command nobody read (`unread`) or that the document moved past (`unsettled`) started
+      // no turn of ours: re-arming would claim one and then report silence for work never received.
+      if (pickup.kind === 'applied' || pickup.kind === 'unknown') rearmAfterSteer(entry, command.id);
+      if (pickup.kind === 'unread') {
+        const document = name ?? `piher.cmd.${entry.gen.paneId}`;
+        // PIHER_COMMAND_PICKUP_MS=0 is the documented "report the write alone" mode: the operator asked
+        // for no ack, so an unread command is not a failure, it is the answer.
+        return commandPickupMs <= 0
+          ? {
+            content: [{ type: 'text', text: writtenOnlyText(taskRef(entry.gen), entry.gen.paneId, command.id) }],
+            details: { paneId: entry.gen.paneId },
+          }
+          : toolError(unreadCommandText(entry.gen.paneId, entry.taskId, document, commandPickupMs));
+      }
       return {
-        content: [{ type: 'text', text: steerResultText(ref, entry.gen.paneId, command.id, pickup) }],
+        content: [{ type: 'text', text: steerResultText(taskRef(entry.gen), entry.gen.paneId, command.id, pickup) }],
         details: { paneId: entry.gen.paneId },
       };
     } catch (err) {
@@ -1228,11 +1292,11 @@ export default function subagentPlugin(ctx: Context): void {
     writeRecord,
   };
 
-  const ACTIONS: Record<string, (params: ToolParams, toolCtx: unknown, onUpdate?: (u: unknown) => void) => Promise<unknown>> = {
+  const ACTIONS: Record<string, (params: ToolParams, toolCtx: unknown, onUpdate?: (u: unknown) => void, signal?: AbortSignal) => Promise<unknown>> = {
     spawn: (params, toolCtx) => executeSubagentSpawn(params, toolCtx),
     resume: (params, toolCtx) => executeSubagentResume(params, toolCtx),
     list: (_params, toolCtx) => executeSubagentList(toolCtx),
-    send: (params, toolCtx) => executeSubagentSend(params, toolCtx),
+    send: (params, toolCtx, _onUpdate, signal) => executeSubagentSend(params, toolCtx, signal),
     retry: (params, toolCtx) => executeSubagentRetry(params, toolCtx),
     interrupt: (params, toolCtx) => executeSubagentInterrupt(params, toolCtx),
     output: (params, toolCtx) => executeSubagentOutput(params, toolCtx, outputActionDeps),
@@ -1290,14 +1354,13 @@ export default function subagentPlugin(ctx: Context): void {
     },
     async execute(toolCallId: string, params: ToolParams, signal: AbortSignal | undefined, onUpdate: ((update: unknown) => void) | undefined, toolCtx: unknown) {
       void toolCallId;
-      void signal;
       const flat = flattenToolParams(params);
       const action = typeof flat?.action === 'string' && flat.action.trim() ? flat.action.trim() : 'spawn';
       const handler = ACTIONS[action];
       if (!handler) {
         return toolError(`Error: unknown action "${action}" (valid: ${Object.keys(ACTIONS).join(', ')})`);
       }
-      return attachSubagentStructuredContent(action, await handler(flat, toolCtx, onUpdate));
+      return attachSubagentStructuredContent(action, await handler(flat, toolCtx, onUpdate, signal));
     },
   });
 }

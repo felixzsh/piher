@@ -140,6 +140,26 @@ test('fitReportDocument: a report at the ceiling is kept whole', () => {
   assert.equal(fitted.text, text, 'no marker when nothing had to be dropped');
 });
 
+test('the document store follows the measured version rule: a delete bumps it', async () => {
+  // Measured on hc 0.1.20 (private core, 2026-11-13): doc.set at v0 answers 1, at v1 answers 2,
+  // doc.set(null, v2) answers **3**, doc.get then reads {value: null, version: 3}, and the next
+  // doc.set(v3) answers 4. The core's prose says a deletion "retains its version"; that means the
+  // counter keeps a history, not that it stands still — and `planCommandPickup` reads the worker's
+  // ack off exactly that step, so this model and the rule must not drift apart silently.
+  const client = fakeCore();
+  assert.equal(await client.docSet('probe.doc', { a: 1 }, 0), 1);
+  assert.equal(await client.docSet('probe.doc', { a: 2 }, 1), 2);
+  assert.equal(await client.docSet('probe.doc', null, 2), 3, 'the delete lands at version + 1');
+  assert.deepEqual(await client.docGet('probe.doc'), { value: null, version: 3 });
+  assert.equal(await client.docSet('probe.doc', { a: 3 }, 3), 4,
+    'the next write lands two above the version the delete started from');
+  // Without the stale-version refusal the sequence would be a coincidence rather than a rule.
+  await assert.rejects(
+    () => client.docSet('probe.doc', { a: 4 }, 2),
+    (err: unknown) => (err as { kind?: string }).kind === 'conflict',
+  );
+});
+
 test('writeReportDocument: the first write lands at version 0', async () => {
   const client = fakeCore();
   const written = await writeReportDocument(client, 't9', value());

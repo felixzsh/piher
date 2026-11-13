@@ -752,6 +752,8 @@ test('send: a persistent worker whose pane was reclaimed is revived, not refused
 test('P3: a send steers a worker that is mid-turn, and the result reports the delivery', async (t) => {
   await withPipeEnv(async (env) => {
     env.parkPollers();
+    /** The worker the first subtest spawns; the second one sends to it again. */
+    let steerTaskId: string | null = null;
 
     await t.test('a steer to a working worker is applied, and its tool result says so', async () => {
       const spawned = await runSubagent(env.pi, { description: 'steer probe', prompt: PROMPT }, env.cwd);
@@ -772,21 +774,37 @@ test('P3: a send steers a worker that is mid-turn, and the result reports the de
       assert.equal(env.pipeConnections.p2 ?? 0, 0, 'the send opened no connection to a pipe name');
       // Applying it is not the same as being read: the worker cleared the document it applied (S11).
       assert.equal((await env.client.docGet('piher.cmd.p2'))?.value, null, 'the applied command is cleared');
+      // A delivery the worker took re-arms the row: a turn is coming, and its settlement belongs to
+      // this request.
+      steerTaskId = spawned.details?.taskId as string;
+      assert.equal(readTaskRecord(env.cwd, steerTaskId)?.gen.consumedAt, null,
+        'the applied steer re-arms the row');
       delete env.statuses[paneId];
     });
 
-    await t.test('a worker that never reads its command is not reported as delivered', async () => {
+    await t.test('a worker that never reads its command is refused, and its row is not re-armed', async () => {
       env.commandPickup = 'silent';
       const panesBefore = env.commands.length;
-      const sent = await runSubagent(env.pi, { action: 'send', agentId: 'p2', message: 'anyone there?' }, env.cwd);
-      const text = sent.content[0]!.text;
-      assert.doesNotMatch(text, /^Message sent/, 'a command nobody read is not a delivered message');
-      assert.match(text, /Message written for subagent/);
-      assert.match(text, /has not applied it yet/);
-      assert.match(text, /piher\.cmd\.p2/, 'the result names the document that holds it');
+      assert.ok(steerTaskId, 'the first subtest spawned the worker');
+      // The row is settled before the send, so "still settled afterwards" is what the assertion means.
+      env.port.current!.consumeReply('p2', 'REPORT: done');
+      const settledAt = readTaskRecord(env.cwd, steerTaskId)?.gen.consumedAt ?? null;
+      assert.notEqual(settledAt, null, 'the worker was settled before the send');
+      const rejected = await runSubagentRejects(env.pi, { action: 'send', agentId: 'p2', message: 'anyone there?' }, env.cwd);
+      // S16 keeps the diagnosis this replaces: a live pane whose extension host is not watching.
+      assert.match(rejected, /is alive but its message channel is dead/);
+      assert.match(rejected, /piher\.cmd\.p2/);
+      assert.match(rejected, /NOTHING/);
+      assert.match(rejected, /action "resume"/);
       assert.equal(env.commands.length, panesBefore + 1, 'the write did land in the core');
       const held = await env.client.docGet('piher.cmd.p2');
       assert.equal((held?.value as { text?: string } | null)?.text, 'anyone there?', 'the command stays queued (S12)');
+      // A command nobody read started no turn: re-arming would list the row as running and then report
+      // silence for work the worker never received.
+      assert.equal(readTaskRecord(env.cwd, steerTaskId)?.gen.consumedAt, settledAt,
+        'an unread command does not re-arm the row');
+      assert.ok(!(env.port.current?.listRunningSubs() ?? []).some((s) => s.paneId === 'p2'),
+        'and it is not listed as running');
       env.commandPickup = 'applied';
     });
   }, { policy: { commandPickupMs: 300 } });

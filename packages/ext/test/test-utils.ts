@@ -268,7 +268,8 @@ function timeout(ms: number): Promise<boolean> {
 
 /** CoreClientLike with inert defaults; pass only the methods a test cares about. Documents live in
  *  a per-client map with compare-and-swap versions, so report-document tests exercise the real
- *  conflict path (`conflict` on a stale version, `doc.get` + retry). */
+ *  conflict path (`conflict` on a stale version, `doc.get` + retry). A delete bumps the version too,
+ *  the rule measured on hc 0.1.20 and pinned in `report-documents.test.ts`. */
 export function fakeCore(over: Partial<CoreClientLike> = {}): CoreClientLike {
   const noop = async () => undefined;
   const docs = new Map<string, { value: unknown; version: number }>();

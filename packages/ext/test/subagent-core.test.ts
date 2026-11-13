@@ -21,6 +21,7 @@ import {
   allocateTaskSlug, parseTaskDocument, slugifyTask, taskRef, type TaskEntry,
 } from '../src/task-row.ts';
 import { CoreError } from '../src/core-client.ts';
+import { writeTaskRecord } from '../src/task-store.ts';
 import { keepsPane, keepsPaneForCoreError, planReadyAttempt, readyBackoffMs, readyFailureText, unreportedGraceMs } from '../src/subagent-spawn.ts';
 
 const RT = { nodePath: '/usr/local/bin/node', cliPath: '/opt/pi/dist/cli.js', extPath: '/ext/index.ts' };
@@ -785,10 +786,10 @@ test('subagent plugin: a send whose command cannot be written fails fast and say
   }
 });
 
-test('subagent plugin: a live pane whose worker never reads its command is reported as written, not delivered', async () => {
-  // The write is durable, so the two facts stay separate: the core holds the command (true here) and
-  // the worker applied it (false here — nothing in this stand-in reads documents). A master that read
-  // "Message sent" out of this would believe a steer that never happened.
+test('subagent plugin: a live pane whose extension host is not watching is refused, as before P3', async () => {
+  // S16 keeps the diagnosis: a live pane that takes no steering message is a pane whose extension host
+  // is not running. Nothing in this stand-in reads documents, which is exactly that state — the write
+  // lands, nothing reads it, and the caller must not read that as delivery.
   const { root, pi } = await mountSubagent({
     client: { getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'working' }) },
     tasks: [taskRow({ paneId: 't-silent', taskId: 'task-silent', cwd: '/test/no-pipe' })],
@@ -796,14 +797,151 @@ test('subagent plugin: a live pane whose worker never reads its command is repor
   });
   try {
     const startedAt = Date.now();
-    const res = await runSubagent(pi, { action: 'send', agentId: 't-silent', message: 'hola' });
-    const text = res.content[0]!.text;
-    assert.match(text, /^Message written for subagent /);
-    assert.match(text, /has not applied it yet/);
-    assert.match(text, /piher\.cmd\.t-silent/, 'the result names the document that holds it');
+    const text = await runSubagentRejects(pi, { action: 'send', agentId: 't-silent', message: 'hola' });
     assert.ok(Date.now() - startedAt < 5_000, 'the wait is the pickup budget, not a readiness budget');
+    assert.match(text, /its message channel is dead/);
+    assert.match(text, /extension host is not running/);
+    assert.match(text, /NOTHING/);
+    assert.match(text, /piher\.cmd\.t-silent/, 'the refusal names the document that holds it');
+    assert.match(text, /action "resume" with taskId task-silent/);
+    assert.match(text, /action "output" before resending/, 'the command is queued, so a resend may double it');
+    // A doc watch reconnecting after a core restart leaves the same trace while the host is alive and
+    // will read seconds later: the refusal names that instead of asserting one cause.
+    assert.match(text, /document watch is reconnecting after a core restart/);
+    assert.match(text, /raise PIHER_COMMAND_PICKUP_MS/);
   } finally {
     await root.fiber.dispose();
+  }
+});
+
+test('subagent plugin: a zero pickup budget reports the write alone, as the knob documents', async () => {
+  // PIHER_COMMAND_PICKUP_MS=0 is the operator saying "do not wait": the same silent worker is then not
+  // a failure (nothing was asked of it) but an honest "the core holds it, the read is unconfirmed".
+  const { root, pi } = await mountSubagent({
+    client: { getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'working' }) },
+    tasks: [taskRow({ paneId: 't-nowait', taskId: 'task-nowait', cwd: '/test/no-pipe' })],
+    deps: { policy: { commandPickupMs: 0 } },
+  });
+  try {
+    const res = await runSubagent(pi, { action: 'send', agentId: 't-nowait', message: 'no ack wanted' });
+    const text = res.content[0]!.text;
+    assert.match(text, /^Message written for subagent /, 'the documented mode reports the write alone');
+    assert.match(text, /PIHER_COMMAND_PICKUP_MS=0 does not wait/);
+    assert.match(text, /piher\.cmd\.t-nowait/);
+    assert.doesNotMatch(text, /message channel is dead/, 'nothing failed: the ack was never asked for');
+  } finally {
+    await root.fiber.dispose();
+  }
+});
+
+test('subagent plugin: an absence that landed two versions on is not this send\'s delivery', async () => {
+  // The measured loss this guards: two sibling sends for one worker write v1 and v2, the worker applies
+  // the second and clears to v3 — and the first must not read that absence as its own ack. Nor may it
+  // claim the opposite: no read can say the first was never applied (spec S7 forbids a second
+  // delivery), so the result says the fate cannot be told.
+  const repo = mkdtempSync(join(tmpdir(), 'piher-race-repo-'));
+  mkdirSync(join(repo, '.git'));
+  try {
+    const seeded = taskRow({ paneId: 't-race', taskId: 'task-race', cwd: repo, consumedAt: 5 });
+    // On disk too, so "the row was not re-armed" is read from the same record the master reads.
+    writeTaskRecord(repo, seeded);
+    const { root, pi } = await mountSubagent({
+      client: {
+        getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'working' }),
+        // Ours landed at version 1; the document is now empty at 3.
+        docSet: async () => 1,
+        docGet: async () => ({ value: null, version: 3 }),
+      },
+      tasks: [seeded],
+      deps: { policy: { commandPickupMs: 80 } },
+    });
+    try {
+      const res = await runSubagent(pi, { action: 'send', agentId: 't-race', message: 'first of two' });
+      const text = res.content[0]!.text;
+      assert.doesNotMatch(text, /^Message sent/, 'an empty document two steps on is not our ack');
+      assert.match(text, /^Message written for subagent /);
+      assert.match(text, /cannot be told/);
+      assert.doesNotMatch(text, /nothing of it was applied|never read/,
+        'no read can prove a steer was not applied, so the result must not say so');
+      // Nothing of this send was applied, so no turn is coming: the settled row stays settled rather
+      // than being listed as running and then reported silent.
+      assert.equal(readTaskRecord(repo, 'task-race')?.gen.consumedAt, 5,
+        'a send that was not applied does not re-arm the row');
+    } finally {
+      await root.fiber.dispose();
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('subagent plugin: an empty message is refused instead of writing a command nothing can apply', async () => {
+  const { root, pi } = await mountSubagent({
+    client: { getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'idle' }) },
+    tasks: [taskRow({ paneId: 't-empty', taskId: 'task-empty', cwd: '/test/no-pipe' })],
+  });
+  try {
+    for (const message of ['', '   ']) {
+      const text = await runSubagentRejects(pi, { action: 'send', agentId: 't-empty', message });
+      assert.match(text, /needs a non-empty message/);
+    }
+    const absent = await runSubagentRejects(pi, { action: 'send', agentId: 't-empty' });
+    assert.match(absent, /needs a non-empty message/, 'a send with no message at all is the same refusal');
+  } finally {
+    await root.fiber.dispose();
+  }
+});
+
+test('subagent plugin: a message over the core ceiling is refused with its size', async () => {
+  const written: string[] = [];
+  const { root, pi } = await mountSubagent({
+    client: {
+      getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'idle' }),
+      docSet: async (name, _value, version) => { written.push(name); return version + 1; },
+    },
+    tasks: [taskRow({ paneId: 't-huge', taskId: 'task-huge', cwd: '/test/no-pipe' })],
+  });
+  try {
+    const text = await runSubagentRejects(pi, { action: 'send', agentId: 't-huge', message: 'x'.repeat(1_048_576) });
+    assert.match(text, /refuses a \d+-byte command document/);
+    assert.match(text, /the message plus its envelope/, 'the size names what it measured');
+    assert.match(text, /1048576 bytes per document/);
+    assert.deepEqual(written, [], 'nothing was written: a steer cut in half is worse than one not sent');
+  } finally {
+    await root.fiber.dispose();
+  }
+});
+
+test('subagent plugin: a cancelled send stops waiting and still re-arms the row', async () => {
+  // A cancelled call, or a doc.get that failed, is `unknown`: the command is in the core and may be
+  // applied a moment later. The row must watch for that turn — left `consumed` it would count as
+  // reaping evidence and its report would be dropped as already-delivered.
+  const repo = mkdtempSync(join(tmpdir(), 'piher-cancel-repo-'));
+  mkdirSync(join(repo, '.git'));
+  try {
+    const seeded = taskRow({ paneId: 't-cancel', taskId: 'task-cancel', cwd: repo, consumedAt: 5 });
+    writeTaskRecord(repo, seeded);
+    const { root, pi } = await mountSubagent({
+      client: { getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'working' }) },
+      tasks: [seeded],
+      deps: { policy: { commandPickupMs: 60_000 } },
+    });
+    try {
+      const controller = new AbortController();
+      const execute = pi.tools.get('subagent')!.execute!;
+      const pending = execute('tc', { action: 'send', agentId: 't-cancel', message: 'stop me' },
+        controller.signal, undefined, { cwd: repo });
+      controller.abort();
+      const res = await pending as { content: Array<{ text: string }> };
+      // The aborted call reports what it knows instead of waiting out the budget: 60 s would be a hang.
+      assert.match(res.content[0]!.text, /delivery is unconfirmed: cancelled/);
+      assert.equal(readTaskRecord(repo, 'task-cancel')?.gen.consumedAt, null,
+        'an unread fate may still be a turn, so the row is re-armed');
+    } finally {
+      await root.fiber.dispose();
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
   }
 });
 

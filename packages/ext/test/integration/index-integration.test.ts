@@ -896,13 +896,16 @@ async function withDocCore(
     write: (name: string, value: unknown) => number;
     /** Read a document as the test sees it, version included. */
     read: (name: string) => { value: unknown; version: number } | undefined;
+    /** Fault injection for the clear the worker sends after it applies a command. */
+    faults: { clears: number };
   }) => Promise<void>,
 ): Promise<void> {
   const socketPath = join(mkdtempSync(join(tmpdir(), 'piher-doc-core-')), 's.sock');
   const calls: DocCall[] = [];
+  /** Clears the store must refuse with a transport-shaped failure, so a test can watch a retry. */
+  const faults = { clears: 0 };
   const docs = new Map<string, { value: unknown; version: number }>();
   const subscriptions: Array<{ params: Record<string, unknown>; notify: (name: string, version: number) => void }> = [];
-  const live = new Set<(line: string) => void>();
   const notifyAll = (name: string, version: number): void => {
     for (const sub of subscriptions) sub.notify(name, version);
   };
@@ -951,6 +954,11 @@ async function withDocCore(
         } else if (req.method === 'doc.set') {
           const name = String(req.params.name);
           const current = docs.get(name)?.version ?? 0;
+          if (req.params.value === null && faults.clears > 0) {
+            faults.clears -= 1;
+            sock.end(`${JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: -32000, message: 'internal', data: { kind: 'internal' } } })}\n`);
+            continue;
+          }
           if (current !== Number(req.params.version)) {
             sock.write(`${JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: -32000, message: 'conflict', data: { kind: 'conflict' } } })}\n`);
             continue;
@@ -965,7 +973,6 @@ async function withDocCore(
         sock.end(`${JSON.stringify({ jsonrpc: '2.0', id: req.id, result })}\n`);
       }
     });
-    live.add((line) => sock.write(line));
   });
   const { promise: listening, resolve } = Promise.withResolvers<void>();
   server.listen(socketPath, resolve);
@@ -982,6 +989,7 @@ async function withDocCore(
         return version;
       },
       read: (name) => docs.get(name),
+      faults,
     });
   } finally {
     server.close();
@@ -1015,7 +1023,8 @@ test('P3: a send steers the worker while its tool call is in flight, through its
       await fire(pi, 'turn_start');
       await fire(pi, 'tool_execution_start', { toolCallId: 'c1', toolName: 'bash' });
       const version = core.write('piher.cmd.t2', {
-        id: 'cmd-1', type: 'follow_up', text: 'stop and report what you have', deliverAs: 'steer',
+        id: 'cmd-1', taskId: 'task-steer', type: 'follow_up',
+        text: 'stop and report what you have', deliverAs: 'steer',
       });
       assert.equal(version, 1);
 
@@ -1042,9 +1051,20 @@ test('P3: a send steers the worker while its tool call is in flight, through its
       assert.equal(pi.userSent.length, 1, 'a re-read never applies the same command twice');
 
       // Another document's event is not ours: documents are core-global, so the watch sees them all.
-      core.write('piher.cmd.t9', { id: 'cmd-other', type: 'follow_up', text: 'not for me', deliverAs: 'steer' });
+      core.write('piher.cmd.t9', {
+        id: 'cmd-other', taskId: 'task-steer', type: 'follow_up', text: 'not for me', deliverAs: 'steer',
+      });
       await new Promise((resolve) => setTimeout(resolve, 60));
       assert.equal(pi.userSent.length, 1, 'another worker’s command is ignored');
+
+      // S3: an address outlives the worker that had it. A command written for another task — a
+      // leftover steer for a previous generation at this address — is not applied here.
+      core.write('piher.cmd.t2', {
+        id: 'cmd-stale', taskId: 'task-from-another-life', type: 'follow_up',
+        text: 'steer an unrelated worker', deliverAs: 'steer',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      assert.equal(pi.userSent.length, 1, 'a command for another task is refused');
 
       // A value that is not a command is never handed to pi (a foreign or half-written document).
       core.write('piher.cmd.t2', { text: 'no id, no deliverAs' });
@@ -1053,7 +1073,7 @@ test('P3: a send steers the worker while its tool call is in flight, through its
 
       // A second command after the first is applied again — the id, not the position, is the identity.
       core.write('piher.cmd.t2', {
-        id: 'cmd-2', type: 'follow_up', text: 'now summarize', deliverAs: 'followUp',
+        id: 'cmd-2', taskId: 'task-steer', type: 'follow_up', text: 'now summarize', deliverAs: 'followUp',
       });
       await waitFor(() => pi.userSent.length === 2);
       assert.deepEqual(pi.userSent[1], { content: 'now summarize', opts: { deliverAs: 'followUp', triggerTurn: true } });
@@ -1063,10 +1083,122 @@ test('P3: a send steers the worker while its tool call is in flight, through its
       await waitFor(() => core.subscriptions.length === 0);
       assert.equal(core.subscriptions.length, 0, 'the session closed its subscription');
       const before = core.calls.length;
-      core.write('piher.cmd.t2', { id: 'cmd-3', type: 'follow_up', text: 'after shutdown', deliverAs: 'steer' });
+      core.write('piher.cmd.t2', {
+        id: 'cmd-3', taskId: 'task-steer', type: 'follow_up', text: 'after shutdown', deliverAs: 'steer',
+      });
       await new Promise((resolve) => setTimeout(resolve, 80));
       assert.equal(pi.userSent.length, 2, 'no command is applied after the session ends');
       assert.equal(core.calls.length, before, 'the closed watch stops reading the core');
+    } finally {
+      await fire(pi, 'session_shutdown');
+    }
+  });
+}));
+
+test('P3: a steer pi never took is not latched, and a clear that fails is neither silent nor repeated', withCleanup(async (cleanup) => {
+  const agentDir = cleanup.tempDir('piher-steer-host-agent').path;
+  const cwd = cleanup.tempDir('piher-steer-host-cwd').path;
+  const sessionFile = join(agentDir, '2026-01-01T00-00-00-000Z_dddddddd-0000-4000-8000-000000000000.jsonl');
+  const command = (id: string, text: string) => ({
+    id, taskId: 'task-host', type: 'follow_up', text, deliverAs: 'steer',
+  });
+  await withDocCore(async (core) => {
+    const pi = await mountIndex(cleanup, 'core-worker', {
+      HC_TERMINAL_SOCKET: core.socketPath,
+      HC_TERMINAL_ID: 't2',
+      PI_CODING_AGENT_DIR: agentDir,
+      PI_SESSION_FILE: sessionFile,
+      PIHER_DELEGATION: JSON.stringify({ taskId: 'task-host', description: 'host probe', role: 'worker' }),
+    });
+    const ctx = { cwd, sessionManager: { getBranch: () => [], getSessionFile: () => sessionFile } };
+    const errors: string[] = [];
+    const realError = console.error;
+    console.error = (message?: unknown) => { errors.push(String(message)); };
+    try {
+      await fire(pi, 'session_start', { reason: 'new' }, ctx);
+      await waitFor(() => core.subscriptions.length === 1);
+
+      // A host that cannot take a message: the id must NOT latch, or the next read would classify the
+      // command as already applied and clear it without ever delivering it.
+      const realSend = pi.sendUserMessage;
+      (pi as unknown as { sendUserMessage?: unknown }).sendUserMessage = undefined;
+      core.write('piher.cmd.t2', command('cmd-host-1', 'never delivered'));
+      await waitFor(() => errors.some((line) => /was not handed to pi/.test(line)));
+      assert.ok(errors.some((line) => /was not handed to pi/.test(line)), 'the failure is logged, not swallowed');
+      assert.equal(pi.userSent.length, 0, 'nothing reached pi');
+      assert.deepEqual((core.read('piher.cmd.t2')?.value as { id?: string } | null)?.id, 'cmd-host-1',
+        'the command stays in the core, unlatched');
+
+      // The host comes back: the same command is applied on the next notification, and only then is
+      // it cleared.
+      (pi as unknown as { sendUserMessage?: unknown }).sendUserMessage = realSend;
+      core.subscriptions[0]!.notify('piher.cmd.t2', core.read('piher.cmd.t2')!.version);
+      await waitFor(() => pi.userSent.length === 1);
+      assert.equal(pi.userSent[0]!.content, 'never delivered');
+      await waitFor(() => core.read('piher.cmd.t2')?.value === null);
+
+      // A clear the core refuses is retried, so an applied steer does not stay behind for a restarted
+      // worker (which has no memory of ids) to apply a second time.
+      const clearsBefore = core.calls.filter((c) => c.method === 'doc.set' && c.params.value === null).length;
+      core.faults.clears = 1;
+      core.write('piher.cmd.t2', command('cmd-host-2', 'applied once'));
+      await waitFor(() => pi.userSent.length === 2);
+      await waitFor(() => core.read('piher.cmd.t2')?.value === null);
+      assert.equal(core.read('piher.cmd.t2')?.value, null, 'the retried clear lands');
+      const clears = core.calls.filter((c) => c.method === 'doc.set' && c.params.value === null).length;
+      assert.equal(clears - clearsBefore, 2,
+        'the refused clear was retried exactly once more, not given up on');
+
+      // A clear that cannot land at all is reported, and the latched id keeps the worker from applying
+      // the same steer twice while the document still holds it.
+      core.faults.clears = 99;
+      core.write('piher.cmd.t2', command('cmd-host-3', 'applied but stuck'));
+      await waitFor(() => pi.userSent.length === 3);
+      await waitFor(() => errors.some((line) => /could not be cleared/.test(line)));
+      assert.ok(errors.some((line) => /would apply it again/.test(line)),
+        'a clear that fails says what it costs');
+      assert.equal((core.read('piher.cmd.t2')?.value as { id?: string } | null)?.id, 'cmd-host-3',
+        'the document still holds the command');
+      core.faults.clears = 0;
+      core.subscriptions[0]!.notify('piher.cmd.t2', core.read('piher.cmd.t2')!.version);
+      await waitFor(() => core.read('piher.cmd.t2')?.value === null);
+      assert.equal(pi.userSent.length, 3, 'the same command is never applied twice in this process');
+      assert.equal(core.read('piher.cmd.t2')?.value, null,
+        'and once it can be cleared, the duplicate path clears it without applying it again');
+    } finally {
+      console.error = realError;
+      await fire(pi, 'session_shutdown');
+    }
+  });
+}));
+
+test('P3/S26: a worker with no delegation identity refuses every command', withCleanup(async (cleanup) => {
+  // A pane a person started by hand can sit at an address that once held another task, with that
+  // task's steer still in the core. The task id in the value is what tells it apart — and a worker
+  // that has no identity of its own cannot be the one any command was written for.
+  const agentDir = cleanup.tempDir('piher-no-identity-agent').path;
+  const cwd = cleanup.tempDir('piher-no-identity-cwd').path;
+  const sessionFile = join(agentDir, '2026-01-01T00-00-00-000Z_eeeeeeee-0000-4000-8000-000000000000.jsonl');
+  await withDocCore(async (core) => {
+    // No PIHER_DELEGATION and no worker marker: `isSubagent` is true, the identity is null.
+    const pi = await mountIndex(cleanup, 'core-worker', {
+      HC_TERMINAL_SOCKET: core.socketPath,
+      HC_TERMINAL_ID: 't2',
+      PI_CODING_AGENT_DIR: agentDir,
+      PI_SESSION_FILE: sessionFile,
+    });
+    const ctx = { cwd, sessionManager: { getBranch: () => [], getSessionFile: () => sessionFile } };
+    try {
+      await fire(pi, 'session_start', { reason: 'new' }, ctx);
+      await waitFor(() => core.subscriptions.length === 1);
+      core.write('piher.cmd.t2', {
+        id: 'cmd-leftover', taskId: 'task-from-before', type: 'follow_up',
+        text: 'steer the worker that used to be here', deliverAs: 'steer',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.equal(pi.userSent.length, 0, 'a command for a task this worker is not is never applied');
+      assert.equal((core.read('piher.cmd.t2')?.value as { id?: string } | null)?.id, 'cmd-leftover',
+        'and it is left alone rather than cleared by a stranger');
     } finally {
       await fire(pi, 'session_shutdown');
     }

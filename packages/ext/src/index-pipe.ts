@@ -16,7 +16,8 @@ export interface PipeHandlerSession {
   claimSettleNotice: (key: string) => boolean;
   deliverNotice: (content: string, paneId?: string, card?: SettlementCard | null) => Promise<void>;
   sendUserMessageIn: (content: string) => Promise<void>;
-  sendUserMessageAs: (content: string, mode: 'steer' | 'followUp') => Promise<void>;
+  /** Resolves whether pi actually took the message (a host without `sendUserMessage` takes none). */
+  sendUserMessageAs: (content: string, mode: 'steer' | 'followUp') => Promise<boolean>;
   abort: () => void;
   setPendingMachineRequest: (req: MachineRequest | null) => void;
 }

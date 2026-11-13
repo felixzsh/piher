@@ -133,7 +133,7 @@ export function planReportDelivery(input: {
  * the text to nothing, delivering a body that was only the marker.
  */
 export function fitReportDocument(value: ReportDocumentValue, maxBytes = MAX_DOCUMENT_BYTES): ReportDocumentValue {
-  if (byteLength(value) <= maxBytes) return value;
+  if (documentByteLength(value) <= maxBytes) return value;
   const original = value.text ?? '';
   const withPrefix = (keep: number): ReportDocumentValue => ({
     ...value,
@@ -147,7 +147,7 @@ export function fitReportDocument(value: ReportDocumentValue, maxBytes = MAX_DOC
   while (low <= high) {
     const mid = Math.floor((low + high) / 2);
     const candidate = withPrefix(mid);
-    if (byteLength(candidate) <= maxBytes) {
+    if (documentByteLength(candidate) <= maxBytes) {
       best = candidate;
       low = mid + 1;
     } else if (mid === 0) {
@@ -159,7 +159,8 @@ export function fitReportDocument(value: ReportDocumentValue, maxBytes = MAX_DOC
   return best ?? { ...value, text: '' };
 }
 
-function byteLength(value: unknown): number {
+/** Serialized size of a document value: what the core's per-document ceiling counts. */
+export function documentByteLength(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value) ?? '', 'utf8');
 }
 

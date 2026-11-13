@@ -148,11 +148,21 @@ export default async function (pi: ExtensionAPI) {
 
   if (env) installWriteLocks(pi, { client, env, hard: process.env[WRITE_LOCK_ENV] === '1' });
 
-  /** pi's sendUserMessage is fire-and-forget (void); callers of this wrapper still get a promise. */
-  const sendUserMessageAs = (content: string, mode: 'steer' | 'followUp'): Promise<void> => {
-    (pi as unknown as { sendUserMessage?: (content: string, opts?: { deliverAs?: string; triggerTurn?: boolean }) => void })
-      .sendUserMessage?.(content, { deliverAs: mode, triggerTurn: true });
-    return Promise.resolve();
+  /** pi's sendUserMessage is fire-and-forget (void); callers of this wrapper get a promise that says
+   *  whether pi actually took the message. A host without the method, or a throw from it, delivered
+   *  nothing — and a caller that latched "applied" on that promise would never try again. */
+  const sendUserMessageAs = (content: string, mode: 'steer' | 'followUp'): Promise<boolean> => {
+    try {
+      const api = pi as unknown as {
+        sendUserMessage?: (content: string, opts?: { deliverAs?: string; triggerTurn?: boolean }) => void;
+      };
+      if (typeof api.sendUserMessage !== 'function') return Promise.resolve(false);
+      api.sendUserMessage(content, { deliverAs: mode, triggerTurn: true });
+      return Promise.resolve(true);
+    } catch (err) {
+      console.error(`piher: pi refused a ${mode} message: ${(err as Error)?.message ?? err}`);
+      return Promise.resolve(false);
+    }
   };
 
   const notices = createNoticeBuffer({
@@ -221,7 +231,7 @@ export default async function (pi: ExtensionAPI) {
         port: subagentPort,
         claimSettleNotice,
         deliverNotice,
-        sendUserMessageIn: (content) => sendUserMessageAs(content, 'followUp'),
+        sendUserMessageIn: (content) => sendUserMessageAs(content, 'followUp').then(() => undefined),
         sendUserMessageAs,
         abort: () => { latestCtx?.abort?.(); },
         setPendingMachineRequest: (next) => { pendingMachineRequest = next; },
@@ -414,11 +424,35 @@ export default async function (pi: ExtensionAPI) {
     if (!name) return;
     const read = await client.docGet(name);
     if (read === null) return;
-    const plan = planCommandApplication({ value: read.value, appliedId: appliedCommandId });
+    const plan = planCommandApplication({
+      value: read.value,
+      appliedId: appliedCommandId,
+      // A leftover command for another task is not this worker's to apply (S3): terminal addresses
+      // restart with the core, so the address alone would let an old steer reach a new worker.
+      taskId: delegation?.taskId ?? null,
+    });
     if (plan.kind === 'none') return;
+    if (plan.kind === 'apply') {
+      // The latch follows the effect, never precedes it: a host that cannot send leaves the command
+      // where it is, so the next notification tries again instead of reading as already applied.
+      const handed = await sendUserMessageAs(plan.value.text, plan.value.deliverAs);
+      if (!handed) {
+        console.error(`piher: steering command ${plan.value.id} for ${address} was not handed to pi `
+          + '(sendUserMessage is unavailable or refused it); the command stays in the core');
+        return;
+      }
+    }
     appliedCommandId = plan.value.id;
-    if (plan.kind === 'apply') await sendUserMessageAs(plan.value.text, plan.value.deliverAs);
-    await clearCommandDocument(client, name, read.version);
+    const cleared = await clearCommandDocument(client, name, read.version);
+    if (!cleared) {
+      // The master reads this same document and cannot tell an applied-but-uncleared steer from one
+      // that was overwritten unread, so its result says "cannot be told". This log is the other half of
+      // that event: the command WAS applied, and a restarted worker would apply it again.
+      console.error(`piher: command ${plan.value.id} for ${address} was applied but could not be `
+        + `cleared from ${name} at version ${read.version}: a newer command now holds the document, or `
+        + 'the core refused the clear. A restarted worker, which has no memory of ids, would apply it '
+        + 'again');
+    }
   }
 
   function requestCommandApply(): void {

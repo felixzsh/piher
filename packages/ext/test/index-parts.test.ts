@@ -26,7 +26,8 @@ function pipeSession(over: Partial<PipeHandlerSession> = {}): PipeHandlerSession
     claimSettleNotice: () => true,
     deliverNotice: async () => {},
     sendUserMessageIn: async () => {},
-    sendUserMessageAs: async () => {},
+    // Whether pi took the message: the stubs here take it, so a handler never re-tries.
+    sendUserMessageAs: async () => true,
     abort: () => {},
     setPendingMachineRequest: () => {},
     ...over,
@@ -40,7 +41,7 @@ test('handlePipeRequest: ping / prompt / steer follow_up / interrupt', async () 
   const state: { pending: MachineRequest | null } = { pending: null };
   const session = pipeSession({
     sendUserMessageIn: async (content) => { inMsgs.push(content); },
-    sendUserMessageAs: async (content, mode) => { asMsgs.push({ text: content, mode }); },
+    sendUserMessageAs: async (content, mode) => { asMsgs.push({ text: content, mode }); return true; },
     abort: () => { aborted += 1; },
     setPendingMachineRequest: (req) => { state.pending = req; },
   });
