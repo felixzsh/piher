@@ -164,9 +164,42 @@ test('resolveSessionFile: the own label wins over the mtime order; a pipe self-r
   home.dispose();
 });
 
+test('reattributeStaleSessionFile: repairs a stale or poisoned value from the worker label, never guesses', async () => {
+  const agentDir = mkdtempSync(join(tmpdir(), 'piher-session-reattr-'));
+  const file = (name: string): string => {
+    const path = join(agentDir, name);
+    writeFileSync(path, '{}\n');
+    return path;
+  };
+  const ownFile = file('2026-09-21T06-00-00-000Z_11111111-1111-4111-8111-111111111111.jsonl');
+  const takenFile = file('2026-09-21T06-00-00-000Z_22222222-2222-4222-8222-222222222222.jsonl');
+  const foreignFile = file('2026-09-21T06-05-00-000Z_33333333-3333-4333-8333-333333333333.jsonl');
+  const stalePreferred = file('2026-09-16T07-15-46-751Z_44444444-4444-4444-8444-444444444444.jsonl');
+  utimesSync(stalePreferred, new Date(Date.now() - 3_600_000), new Date(Date.now() - 3_600_000));
+
+  const ioFor = (reported: string) => createSessionIo({
+    client: sessionClient({ 'tStale': reported, 'tOther': takenFile }),
+    getSessionId: () => ownFile,
+    sessionsDir: () => agentDir,
+  });
+  const reattribute = (reported: string, preferred: string | null) =>
+    ioFor(reported).reattributeStaleSessionFile('tStale', '/tmp/proj', Date.now(), preferred);
+
+  assert.equal(
+    await reattribute(ownFile, stalePreferred),
+    null,
+    'an own-transcript report is rejected even though the file is fresh',
+  );
+  assert.equal(await reattribute(foreignFile, stalePreferred), foreignFile);
+  assert.equal(await reattribute(foreignFile, foreignFile), foreignFile, 'a fresh preferred is kept as-is');
+  // The master rewrites its own transcript continuously, so freshness alone must not preserve poison;
+  // the report repairs it instead of returning null (= keep the old value).
+  assert.equal(await reattribute(foreignFile, ownFile), foreignFile);
+  assert.equal(await reattribute(foreignFile, takenFile), foreignFile);
+});
+
 
 /* ── output delta (pure) ────────────────────────────────────────── */
-
 const CURSOR = (tail: string, fullLength: number): SubagentOutputCursor => ({ tail, fullLength });
 
 test('tailOfPaneRead: the latest lines, bounded, never the whole boot chrome', () => {
@@ -608,6 +641,42 @@ test('session recovery: a still-running subagent gets its settlement watch re-ar
     assert.ok(settle, `missing settlement notice: ${JSON.stringify(notices)}`);
     assert.match(settle!, /RECOVERED_REPORT/);
     assert.ok(readTaskRecord(cwd, taskId)?.gen.consumedAt !== null, 'the settlement lands in the record');
+  } finally {
+    await root.fiber.dispose();
+    home.dispose();
+  }
+});
+
+test('session recovery: a watch that could not arm is not announced as re-armed', async () => {
+  // The notice is a claim about what the master now has. A session root that refuses the mount leaves
+  // the row with no reader at all, so the honest notice is none — not "re-armed".
+  const home = new TempHome('piher-recover-dead-home-');
+  const cwd = mkdtempSync(join(tmpdir(), 'piher-recover-dead-cwd-'));
+  const notices: string[] = [];
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const viewFile = join(home.dir('views'), '2026-09-20T06-10-00-000Z_dddd2222-3333-4444-8555-666666666666.jsonl');
+  seedTaskDocuments(viewFile, [{
+    taskId: 'eeee3333-4444-4555-8666-777777777777', paneId: 'p9', tabId: 't0', tabName: 'main',
+    cwd, description: 'unarmable probe', sessionFile: null, createdAt: Date.now() - 120_000,
+  }]);
+  const { root, pi } = await mountSubagent({
+    client: {
+      listTerminals: async () => [terminalInfo({ id: 'p9', status: 'idle', labels: {} })],
+      getTerminal: async (id) => terminalInfo({ id, status: 'idle', labels: {} }),
+    },
+    deps: {
+      // A root that cannot take a scope: the mount is the only way to arm a watch.
+      sessionRoot: { plugin: () => { throw new Error('the session root is gone'); } } as never,
+      getSessionId: () => '',
+      getSessionFile: () => viewFile,
+      getCwd: () => cwd,
+      deliverNotice: async (content: string) => { notices.push(content); },
+    },
+  });
+  try {
+    await fire(pi, 'session_start', { reason: 'reload' }, {});
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(notices, [], 'nothing was armed, so nothing is claimed');
   } finally {
     await root.fiber.dispose();
     home.dispose();

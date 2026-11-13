@@ -225,6 +225,12 @@ export interface SessionIo {
   probeAlive(paneId: string, cwd: string): Promise<AliveProbe>;
   /** The worker's own closing words, for its report and for `output`. Never a settlement decision. */
   readTurnClosing(paneId: string, cwd: string, sinceTs: number, preferred?: string | null): Promise<TurnClosing>;
+  /** Re-attribute a generation's sessionFile with no writes since `sinceTs`: keep `preferred` when
+   *  fresh, else accept herdr's per-pane report when fresh. An existing value is only replaced by the
+   *  authoritative report; null means "keep the old one" (never an mtime guess). Spawn's mtime
+   *  fallback can adopt a PRE-EXISTING session file, and this is the only repair of that value — the
+   *  one `resume` restores and an existing pane is matched by. */
+  reattributeStaleSessionFile(paneId: string, cwd: string, sinceTs: number, preferred: string | null): Promise<string | null>;
 }
 
 interface FileStamp {
@@ -359,6 +365,31 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     return probe;
   }
 
+  async function reattributeStaleSessionFile(
+    paneId: string,
+    cwd: string,
+    sinceTs: number,
+    preferred: string | null,
+  ): Promise<string | null> {
+    // Tolerate fs timestamp granularity against the pre-injection injectTs capture.
+    const minMtimeMs = sinceTs - 2_000;
+    const own = bareSessionId(h.getSessionId());
+    const { reported, taken } = await reportedAndTaken(paneId);
+    // Own/taken exclusions apply to `preferred` too: a registry value pointing at the master's own
+    // transcript is always "fresh", so the gate cannot veto it and herdr's report takes over.
+    const preferredId = preferred ? bareSessionId(preferred) : null;
+    const preferredHeld = preferredId != null && ((own != null && preferredId === own) || taken.has(preferredId));
+    const preferredStamp = preferred ? stampOf(preferred) : null;
+    if (preferred && !preferredHeld && preferredStamp && preferredStamp.mtimeMs >= minMtimeMs) return preferred;
+    const file = resolveSessionFileValue(cwd, h.sessionsDir(), reported);
+    if (!file) return null;
+    const id = bareSessionId(file);
+    if (own && id === own) return null;
+    if (taken.has(id)) return null;
+    const stamp = stampOf(file);
+    return stamp && stamp.mtimeMs >= minMtimeMs ? file : null;
+  }
+
   async function readTurnClosingFor(
     paneId: string,
     cwd: string,
@@ -382,6 +413,7 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     readAskFlag,
     probeAlive,
     readTurnClosing: readTurnClosingFor,
+    reattributeStaleSessionFile,
   };
 }
 

@@ -11,6 +11,7 @@
  * settle hook (index.ts) and the worker's command watch both build on this module.
  */
 import type { CoreClientLike } from './core-client.ts';
+import { shouldPushSettleReply } from './settle-wake-core.ts';
 
 /** Report document value (spec S10): the worker's own closing words plus the turn they belong to.
  *
@@ -229,4 +230,80 @@ export async function writeReportDocument(
 function errorText(err: unknown): string {
   const message = (err as { message?: unknown })?.message;
   return typeof message === 'string' && message !== '' ? message : String(err);
+}
+
+/* ── the worker's write side of a settlement (spec S6/S8) ──────── */
+
+/** Why a settle wrote no report document. */
+export type SettleWriteSkip =
+  /** Not a worker at all (the master's own session): it has no report to make. */
+  | 'not-a-subagent'
+  /** The worker's core client is unavailable: there is no document channel to write through. */
+  | 'no-core-client'
+  /** No `HC_TERMINAL_ID`: without an address nothing can name a document (spec S9). */
+  | 'no-address'
+  /** No delegation marker: the pane did not get piher's spawn contract (an older build, or a
+   *  terminal started by hand), so it does not know the task it would report for. */
+  | 'no-delegation'
+  /** This settle reports nothing by rule (an abort, or an error pi retries — S52). */
+  | 'reports-nothing';
+
+export type SettleWritePlan =
+  | {
+    kind: 'write';
+    value: ReportDocumentValue;
+    /** The core would not report the turn: it is written as 0 rather than losing the settlement. */
+    turnUnknown: boolean;
+  }
+  | { kind: 'skip'; reason: SettleWriteSkip };
+
+/**
+ * Whether one settle writes its report document, and with what value (spec S6/S8).
+ *
+ * Every settle a worker has a channel for writes, including a settle with nothing to say: that
+ * document carries `text: null` and `stopReason: null`, which is what lets the master tell "settled
+ * with nothing to say" from "never settled". Skipping is reserved for a settle that reports nothing
+ * at all and for a worker with no channel — the one case it cannot report itself, which the master
+ * then diagnoses from the core's `turn` (spec S5) instead of calling it silence.
+ */
+export function planSettleWrite(input: {
+  isSubagent: boolean;
+  clientAvailable: boolean;
+  address: string | null | undefined;
+  delegationTaskId: string | null | undefined;
+  aborted: boolean;
+  lastStopReason: string | null;
+  /** The core's turn counter, or null when the core would not report it. */
+  turn: number | null;
+  turnStopReason: string | null;
+  text: string | null;
+  /** Why the turn ended without words (a refused tool, an error). */
+  why: string | null;
+  session: string | null;
+  /** The settlement's own stamp: the document's identity (spec S7). */
+  at: number;
+}): SettleWritePlan {
+  if (!input.isSubagent) return { kind: 'skip', reason: 'not-a-subagent' };
+  if (!input.clientAvailable) return { kind: 'skip', reason: 'no-core-client' };
+  if (!input.address) return { kind: 'skip', reason: 'no-address' };
+  if (!input.delegationTaskId) return { kind: 'skip', reason: 'no-delegation' };
+  if (!shouldPushSettleReply({ aborted: input.aborted, lastStopReason: input.lastStopReason })) {
+    return { kind: 'skip', reason: 'reports-nothing' };
+  }
+  return {
+    kind: 'write',
+    turnUnknown: input.turn === null,
+    value: {
+      taskId: input.delegationTaskId,
+      // The turn is the core's counter, recorded for the master's eyes; the document's identity is
+      // `at`. A core that will not answer costs the counter, never the settlement.
+      turn: input.turn ?? 0,
+      // A turn that ended without words states its reason here instead (spec S8): `stopReason`
+      // alone would say "stop", which reads as a finished turn that had nothing to report.
+      stopReason: input.text === null ? input.why : input.turnStopReason,
+      session: input.session,
+      text: input.text,
+      at: input.at,
+    },
+  };
 }

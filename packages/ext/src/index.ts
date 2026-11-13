@@ -24,7 +24,7 @@ import { existsSync } from 'node:fs';
 import { platformPaths } from './platform-paths.ts';
 import { WRITE_LOCK_ENV } from './lock-core.ts';
 import { ABORT_STOP_REASON, planSettleWake, shouldPushSettleReply } from './settle-wake-core.ts';
-import { writeReportDocument } from './report-documents.ts';
+import { planSettleWrite, writeReportDocument } from './report-documents.ts';
 import { commandDocName } from './report-documents.ts';
 import { clearCommandDocument, planCommandApplication } from './command-documents.ts';
 import { parseRuntimeManifest } from './tool-gate.ts';
@@ -360,11 +360,10 @@ export default async function (pi: ExtensionAPI) {
     return true;
   }
 
-  /** P1 (spec S6, S8): write the settlement report document on every settle, whether or not the
-   *  master asked — the pipe push above is gated on a pending request, which is the reason a
-   *  master-side guess had to exist at all. Best effort like the push, but never silent: a write
-   *  that could not land is logged with its reason, and the master still learns the report through
-   *  the push (when one is pending) or the transcript fallback. */
+  /** Spec S6/S8: write the settlement report document on every settle that has a channel, whether or
+   *  not the master asked. `planSettleWrite` decides, so the one case that cannot write is named
+   *  rather than guessed at: a worker with no report channel at all, which the master then diagnoses
+   *  from the core's `turn` (spec S5) instead of waiting out a silence. */
   async function writeSettleDocument(input: {
     aborted: boolean;
     turnStopReason: string | null;
@@ -374,29 +373,40 @@ export default async function (pi: ExtensionAPI) {
     at: number;
   }): Promise<boolean> {
     const { aborted, turnStopReason, report, hadRequest, at } = input;
-    if (!isSubagent || !client.available || !env?.terminalId || !delegation) return false;
-    if (!shouldPushSettleReply({ aborted, lastStopReason: turnStopReason })) return false;
-    // A worker still thinking has no closing text and no reason: withhold like the pipe push.
-    if (report.text === null && report.why === null) return false;
-    if (report.turn === null) {
-      console.error(`piher: settle document for ${env.terminalId} skipped: the core would not report its turn`);
-      return false;
-    }
-    const written = await writeReportDocument(client, env.terminalId, {
-      taskId: delegation.taskId,
+    const address = env?.terminalId ?? null;
+    const plan = planSettleWrite({
+      isSubagent,
+      clientAvailable: client.available,
+      address,
+      delegationTaskId: delegation?.taskId ?? null,
+      aborted,
+      lastStopReason: turnStopReason,
       turn: report.turn,
-      // A turn that ended without words states its reason here instead (spec S8): `stopReason`
-      // alone would say "stop", which reads as a finished turn that had nothing to report.
-      stopReason: report.text === null ? report.why : turnStopReason,
-      session: report.file ?? (sessionId || null),
+      turnStopReason,
       text: report.text,
+      why: report.why,
+      session: report.file ?? (sessionId || null),
       at,
     });
+    if (plan.kind === 'skip') {
+      if (plan.reason === 'no-core-client' || plan.reason === 'no-address' || plan.reason === 'no-delegation') {
+        // The worker's one incurable case: it cannot write, so it cannot report that it cannot
+        // report. The master names it from the core's turn instead of calling the worker silent.
+        console.error(`piher: no settlement document from this worker (${plan.reason}): `
+          + 'it has no report channel, so a settle can only reach its master as "a turn ran and no report arrived"');
+      }
+      return false;
+    }
+    if (address === null) return false; // unreachable: the plan only writes when it has an address
+    if (plan.turnUnknown) {
+      console.error(`piher: settle document for ${address}: the core would not report its turn; written as turn 0`);
+    }
+    const written = await writeReportDocument(client, address, plan.value);
     if (!written.ok) {
-      console.error(`piher: settle document for ${env.terminalId} was not written: ${written.reason}`
+      console.error(`piher: settle document for ${address} was not written: ${written.reason}`
         + (hadRequest
           ? ' (the pipe push carries the same report)'
-          : ' (no request is pending: this settlement reaches the master through the transcript fallback)'));
+          : ' (and no request is pending: the master will report that a turn ran with no report)'));
       return false;
     }
     return true;

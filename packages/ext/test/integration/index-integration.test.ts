@@ -415,6 +415,8 @@ async function firePtyTurn(cleanup: CleanupContext, opts: {
   stale?: { text: string; ageMs: number };
   /** The turn's own closing message, stamped when the turn wrote it; null for a turn without words. */
   closing?: string | null;
+  /** Delete the transcript just before the settle: a worker with no readable transcript left. */
+  forgetTranscript?: boolean;
   /** What this settle should end in: a document (waited for) or nothing at all (a short grace). */
   expect: 'write' | 'silent';
 }): Promise<{ docs: Array<{ name: string; value: unknown; version: number }>; calls: string[]; shutdowns: number; pi: FakePi }> {
@@ -457,6 +459,7 @@ async function firePtyTurn(cleanup: CleanupContext, opts: {
     if (opts.closing != null) {
       await writeFile(file, jsonl(...scrolled, transcriptMessage('assistant', opts.closing, Date.now())));
     }
+    if (opts.forgetTranscript) rmSync(file, { force: true });
     await fire(pi, 'agent_settled', {}, ctx);
     const deadline = Date.now() + (opts.expect === 'write' ? 2_000 : 150);
     while (Date.now() < deadline && (shutdowns === 0 || core.docs.length === 0)) {
@@ -485,18 +488,42 @@ test('S54/P2: a one-shot whose brief came through the core still writes its repo
   assert.equal(result.shutdowns, 1, 'the one-shot exited once its report was in the master\'s hands');
 }));
 
-test('S54/P2: a settle with no closing words of its own never publishes an older turn\'s report', withCleanup(async (cleanup) => {
+test('S54/P2: a settle with no closing words of its own writes that, never an older turn\'s report', withCleanup(async (cleanup) => {
   const pane = 'p_pty_two';
   const result = await firePtyTurn(cleanup, {
     pane,
     stale: { text: 'STALE: a report from before this turn.', ageMs: 60_000 },
     closing: null,
-    expect: 'silent',
+    expect: 'write',
   });
   // The request boundary is this turn's start (no pipe frame armed one), not the beginning of the
   // session: with a zero boundary the stale closing message above would have settled this turn.
-  assert.deepEqual(result.docs, [], 'nothing was published, and no stale text was passed off as this turn');
-  assert.equal(result.shutdowns, 0, 'a worker with nothing to report does not exit as if it had');
+  assert.equal(result.docs.length, 1, 'a settle with nothing to say still writes its document (S6)');
+  const value = result.docs[0]!.value as { text?: string | null; stopReason?: string | null };
+  assert.equal(value.text, null, 'nothing is published as this turn\'s words');
+  assert.equal(value.stopReason, null, 'and no reason is invented for it');
+  assert.doesNotMatch(JSON.stringify(value), /STALE:/, 'no older text is passed off as this turn');
+  assert.equal(result.shutdowns, 1, 'the one-shot exits once its report document is written');
+}));
+
+test('F1: a worker whose transcript became unreadable still writes its report document', withCleanup(async (cleanup) => {
+  const pane = 'p_pty_gone';
+  const result = await firePtyTurn(cleanup, {
+    pane,
+    closing: 'REPORT: this text is never read back.',
+    forgetTranscript: true, // the worker's own transcript is gone before it settles
+    expect: 'write',
+  });
+  // Writing the document does not depend on reading a transcript: with nothing readable the worker
+  // still says it settled, with no words (S6/S8) — the master then tells "settled with nothing to say"
+  // apart from "never settled".
+  assert.equal(result.docs.length, 1, `one document, written on the settle (core calls: ${result.calls.join(',')})`);
+  const value = result.docs[0]!.value as { text?: string | null; stopReason?: string | null; turn?: number };
+  assert.equal(value.text, null);
+  assert.equal(value.stopReason, null);
+  assert.equal(value.turn, 1);
+  assert.doesNotMatch(JSON.stringify(value), /never read back/, 'the unreadable transcript is not invented back');
+  assert.equal(result.shutdowns, 1, 'and the one-shot exits once its document is in the master\'s hands');
 }));
 
 test('a persistent worker settles without exiting', withCleanup(async (cleanup) => {

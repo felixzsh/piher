@@ -38,13 +38,17 @@ export function planBlockedGate(state: WaitState, alreadyNotified: boolean): Blo
 export type SilenceTickPlan = {
   /** The worker said nothing to act on (working, or the watch is blind): this tick is a heartbeat. */
   refreshActivity: boolean;
-  action: 'pane-closed' | 'silence-timeout' | 'continue';
+  action: 'pane-closed' | 'silence-timeout' | 'settled-without-report' | 'continue';
 };
 
 /**
  * The silence budget: the only timer left in settlement, and it is not a settlement path. A worker
  * that never reports anything DID fail to report, so its silence has to end somewhere — this decides
  * where, and reports a pane that is simply gone (a native fact, not a guess).
+ *
+ * The core's `turn` separates the two endings: a worker whose turn ran has settled and left no
+ * report document (its write side is missing), which is not the same finding as a worker that never
+ * got anywhere — and telling the master the second when it is the first is a lie about its work.
  */
 export function planSilenceTick(input: {
   waitState: WaitState;
@@ -52,11 +56,15 @@ export function planSilenceTick(input: {
   now: number;
   lastActivityAt: number;
   timeoutMs: number;
+  /** The core's turn counter for this terminal, or null when the watch cannot say. */
+  turn: number | null;
 }): SilenceTickPlan {
   const refreshActivity = input.waitState === null;
   const lastActivityAt = refreshActivity ? input.now : input.lastActivityAt;
   if (!input.paneAlive) return { refreshActivity, action: 'pane-closed' };
-  if (input.now - lastActivityAt > input.timeoutMs) return { refreshActivity, action: 'silence-timeout' };
+  if (input.now - lastActivityAt > input.timeoutMs) {
+    return { refreshActivity, action: (input.turn ?? 0) >= 1 ? 'settled-without-report' : 'silence-timeout' };
+  }
   return { refreshActivity, action: 'continue' };
 }
 
@@ -81,12 +89,29 @@ export function formatSettleTimeoutNotice(input: {
   return `Background subagent ${input.paneId} (${input.description}) has shown no progress for ${input.idleSeconds}s (observed since ${input.startedAtIso}). Run subagent(action: "list") to check its live state; if it is working, let it run — its settlement notice will arrive automatically. Do not sleep-wait.`;
 }
 
+/** The other ending of the silence budget: the core says a turn ran, and no report document reached
+ *  the master (spec S6). Reporting this as silence would claim the worker produced nothing, when what
+ *  is missing is its write side — an older piher build, no herdr extension in its pane, or a failed
+ *  document write. */
+export function formatNoReportNotice(input: {
+  paneId: string;
+  description: string;
+  turn: number;
+  idleSeconds: number;
+}): string {
+  return `Background subagent ${input.paneId} (${input.description}) ran turn ${input.turn} and no report document reached you, so nothing of what it said can be delivered — this is NOT the task's result. `
+    + 'A settle always writes one, so the write side is missing: its pane has no report channel (an older piher build, or no herdr extension in it), or the document write failed. '
+    + `Read what it did with subagent(action: "output", agentId ${input.paneId})${input.idleSeconds > 0 ? `, then continue it with action "send", retry it, or resume its session` : ''}.`;
+}
+
 /* ── pane scope ─────────────────────────────────────────────────── */
 
-/** A wake that has nothing to settle parks this long before retrying. Not a poll cadence: the core's
- *  events drive the loop, and this only keeps a retry (a refused notice, a pane waiting on a person,
- *  a blind watch) from waiting forever. */
-const RECHECK_PARK_MS = 1_000;
+/** The shortest park for a wake with nothing to settle, and the longest. The core's events are the
+ *  fast path (a watch wakes on any change), so this only bounds a retry — a refused notice, a pane
+ *  waiting on a person, a blind watch — and it doubles while the worker stays quiet, so a long-lived
+ *  watch is not a once-a-second poll. */
+const MIN_RECHECK_PARK_MS = 1_000;
+const MAX_RECHECK_PARK_MS = 30_000;
 
 /** A revived pane can answer in the very second the poller starts, and a report written on that same
  *  second belongs to the new request. The boundary a document is judged against therefore carries a
@@ -140,13 +165,13 @@ export interface PollerHost {
   injectNotice(content: string, paneId?: string, card?: SettlementCard | null): Promise<void>;
   /** S54/S71: what a one-shot settlement reclaims — the pane, and any checkout its spawn created. */
   reclaim?(entry: TaskEntry): void;
-  claimSettleNotice(key: string): boolean;
   now?: () => number;
   policy?: Partial<RuntimePolicy>;
 }
 
 export interface Poller {
-  startPoller(paneId: string, cwd: string, injectTs: number, description: string, requestId: string): Promise<void>;
+  /** Resolves to whether the watch is armed; the loop itself runs detached. */
+  startPoller(paneId: string, cwd: string, injectTs: number, description: string, requestId: string): Promise<boolean>;
   readonly pollers: Set<string>;
 }
 
@@ -163,9 +188,6 @@ export function createPoller(h: PollerHost): Poller {
   const deliveredReports = new Set<string>();
   const now = h.now ?? Date.now;
   const timeoutMs = h.policy?.subagentTimeoutMs ?? runtimePolicy.subagentTimeoutMs;
-  /** How long a wake that has nothing to settle but cannot park on an event waits before retrying
-   *  (a refused notice, a pane waiting on a person). Not a poll cadence: events drive the loop. */
-  const recheckMs = RECHECK_PARK_MS;
   const watch = h.client.watchChildren();
 
   /**
@@ -201,19 +223,24 @@ export function createPoller(h: PollerHost): Poller {
   }
 
   /** The worker as the watch sees it. A blind watch (disconnected) never settles or fails anything. */
-  async function observe(paneId: string): Promise<{ state: CoreStatus | 'exited' | null; alive: boolean }> {
-    if (!watch.connected) return { state: null, alive: true };
+  async function observe(paneId: string): Promise<{
+    state: CoreStatus | 'exited' | null;
+    alive: boolean;
+    /** The core's turn counter: a settle happened iff it moved above zero (spec S2, S5). */
+    turn: number | null;
+  }> {
+    if (!watch.connected) return { state: null, alive: true, turn: null };
     let info: TerminalInfo | null | undefined = watch.get(paneId);
     if (!info) {
       // Not in the snapshot: a fresh spawn racing its `created` event, or a terminal that is gone.
       try {
         info = await h.client.getTerminal(paneId);
       } catch {
-        return { state: null, alive: true }; // an unreachable socket must not be read as a dead terminal
+        return { state: null, alive: true, turn: null }; // an unreachable socket must not be read as a dead terminal
       }
     }
-    if (!info || info.state === 'finished') return { state: 'exited', alive: false };
-    return { state: info.status, alive: true };
+    if (!info || info.state === 'finished') return { state: 'exited', alive: false, turn: info?.turn ?? null };
+    return { state: info.status, alive: true, turn: info.turn ?? null };
   }
 
   async function pollLoop(
@@ -225,9 +252,6 @@ export function createPoller(h: PollerHost): Poller {
   ): Promise<void> {
     const startedAt = now();
     let lastActivityAt = now();
-    /** Claimed settle key: on a rejected injection the claim stays ours, so the next wake retries
-     *  the notice instead of suppressing it as someone else's. */
-    let claimedKey: string | null = null;
     /** Stop watching this pane: stamp the delivery and write the record first, or a restart
      *  replays a ghost running row. Settling is `consumedAt` plus the write — nothing else. */
     const consume = (at: number): void => {
@@ -242,10 +266,15 @@ export function createPoller(h: PollerHost): Poller {
         else void retirePane(h.client, paneId);
       }
     };
-    /** Hand one settlement to the master: claim, notice, consume. The row is consumed only after the
-     *  notice is accepted, and a claim we own is retried on the next wake — a rejected injection must
+    /** Hand one settlement to the master: notice, then consume. The row is consumed only after the
+     *  notice is accepted, and a refused one is retried on the next wake — a rejected injection must
      *  not strand a finished worker as `running` with no notice, nor consume the row while the result
-     *  is still undelivered. Returns 'retry' when the notice was refused. */
+     *  is still undelivered. Returns 'retry' when the notice was refused.
+     *
+     *  There is no claim latch here: the settlement's identity IS the document instance (`address`,
+     *  `at`), which `deliverDocument` checks before calling this. A claim keyed by request would
+     *  swallow the worker's NEXT unrequested settle (a person typing in its pane, a queued steer)
+     *  and consume a report it never announced. */
     async function handOver(
       entry: TaskEntry,
       closing: string | null,
@@ -260,18 +289,6 @@ export function createPoller(h: PollerHost): Poller {
           await h.session.resolveSessionFile(paneId, cwd, undefined, { minMtimeMs: request.injectTs - 2_000 }),
         );
       }
-      const claimKey = `${paneId}:${request.requestId}`;
-      if (claimedKey !== claimKey) {
-        const claimed = h.claimSettleNotice(claimKey);
-        if (!claimed) {
-          consume(now());
-          return 'done';
-        }
-        claimedKey = claimKey;
-      }
-      // The settlement identity is the document instance (spec S7): the claim above is per request, and
-      // `deliveredReport` plus `deliveredReports` name the document itself, so neither a re-armed watch
-      // nor a second request id can announce one settlement twice.
       // `subagent output` may already have returned this exact report: point there, don't repeat it.
       const delivered = closing && entry.gen.reportDelivered?.fingerprint === reportFingerprint(closing)
         ? entry.gen.reportDelivered.at
@@ -332,11 +349,27 @@ export function createPoller(h: PollerHost): Poller {
     /** One notice per blocked episode, scoped to this watch: the host-wide set existed only because a
      *  re-armed watch could inherit another request's notice, and a watch cannot outlive its request. */
     let blockedNotified = false;
+    /** Park length for wakes with nothing to settle: it doubles while the worker says nothing new and
+     *  resets the moment anything changes — the watch's own events are the fast path, and a quiet
+     *  worker (idle, blocked on a person) must not cost a wake a second. */
+    let recheckMs = MIN_RECHECK_PARK_MS;
+    let lastStamp: string | null = null;
     /** Whether the row was already settled when this watch was armed. Such a watch was armed for
      *  nothing and ends at once. A row settled WHILE the loop runs — by the pipe push, which is the
      *  normal path — does not end it: that worker's next settle (a person typing in its pane, a
      *  queued steer) writes a document, and S6 says the master must read it. */
     const armedConsumed = taskForPane(h.tasks, h.panes, paneId)?.gen.consumedAt !== null;
+    /** The generation's transcript can be mis-attributed at spawn (the `piher.session` label lags, and
+     *  the mtime fallback can adopt a PRE-EXISTING session), and that value is what `resume` restores
+     *  and an existing pane is matched by. Repair it from the core's own report while the worker is
+     *  here; a document's `session` field is the other, later repair. */
+    const repairSessionFile = async (entry: TaskEntry, sinceTs: number): Promise<void> => {
+      if (!entry.gen.sessionFile) return;
+      const fixed = await h.session.reattributeStaleSessionFile(paneId, cwd, sinceTs, entry.gen.sessionFile);
+      if (!fixed || fixed === entry.gen.sessionFile) return;
+      entry.gen.sessionFile = fixed;
+      h.writeRecord(entry);
+    };
     try {
       while (true) {
         const current = requestByPane.get(paneId) ?? { injectTs, description, requestId };
@@ -350,7 +383,11 @@ export function createPoller(h: PollerHost): Poller {
           const woke = await watch.changed(paneId, seen, Math.max(0, ms));
           return woke;
         };
-        const { state, alive } = await observe(paneId);
+        const { state, alive, turn } = await observe(paneId);
+        // Back off only while the worker says nothing new: any change is news and resets the park.
+        const stamp = `${state ?? '-'}:${turn ?? '-'}`;
+        if (stamp === lastStamp) recheckMs = Math.min(MAX_RECHECK_PARK_MS, recheckMs * 2);
+        else { recheckMs = MIN_RECHECK_PARK_MS; lastStamp = stamp; }
         // The loop's own observations refresh the display cache; a blind watch notes nothing, so a
         // stale snapshot can never overwrite a liveness the loop actually saw (S26).
         if (watch.connected) {
@@ -364,6 +401,9 @@ export function createPoller(h: PollerHost): Poller {
         // Working is activity (the silence budget's heartbeat); `exited`/`unknown` carry no word to
         // act on, and `idle`/`done`/`error` are the states a report arrives in.
         const waitState: WaitState = state === 'exited' || state === 'unknown' || state === 'working' ? null : state;
+        if (state === 'idle' || state === 'done' || state === 'error') {
+          await repairSessionFile(entry, current.injectTs);
+        }
         const gate = planBlockedGate(waitState, blockedNotified);
         if (gate.kind === 'stay-blocked') {
           if (gate.notify) {
@@ -413,7 +453,7 @@ export function createPoller(h: PollerHost): Poller {
           // THIS request, so the silence budget below owns the wait.
         }
 
-        const tick = planSilenceTick({ waitState, paneAlive: alive, now: now(), lastActivityAt, timeoutMs });
+        const tick = planSilenceTick({ waitState, paneAlive: alive, now: now(), lastActivityAt, timeoutMs, turn });
         if (tick.refreshActivity) lastActivityAt = now();
         if (tick.action === 'pane-closed') {
           consume(now());
@@ -423,22 +463,31 @@ export function createPoller(h: PollerHost): Poller {
           } catch { /* non-fatal */ }
           return;
         }
-        if (tick.action === 'silence-timeout') {
-          // Silence is the whole finding: the row ends here (its `consumedAt` is what the tab, pane
-          // and checkout sweeps wait on) and the master is told, rather than waiting for a report
-          // that is not coming.
+        if (tick.action === 'silence-timeout' || tick.action === 'settled-without-report') {
+          // The budget ends the wait, not the supervision: the row is consumed here (its `consumedAt`
+          // is what the tab, pane and checkout sweeps wait on), and the master is told which of the
+          // two endings this was. The watch stays alive — this is the only master-side reader of
+          // `piher.rep.*`, and a worker that settles again (a person typing in its attachable pane, a
+          // queued steer) still has a report to deliver (S6/S21).
           consume(now());
-          const notice = formatSettleTimeoutNotice({
-            paneId,
-            description: current.description,
-            idleSeconds: Math.round((now() - lastActivityAt) / 1000),
-            startedAtIso: new Date(startedAt).toISOString(),
-          });
+          const notice = tick.action === 'silence-timeout'
+            ? formatSettleTimeoutNotice({
+              paneId,
+              description: current.description,
+              idleSeconds: Math.round((now() - lastActivityAt) / 1000),
+              startedAtIso: new Date(startedAt).toISOString(),
+            })
+            : formatNoReportNotice({
+              paneId,
+              description: current.description,
+              turn: turn ?? 0,
+              idleSeconds: Math.round((now() - lastActivityAt) / 1000),
+            });
           try {
             await h.injectNotice(notice, paneId,
               cardFor(entry, paneId, current.description, 'failed'));
           } catch { /* non-fatal */ }
-          return;
+          continue;
         }
         await park(Math.min(recheckMs, timeoutMs - (now() - lastActivityAt)));
       }
@@ -447,30 +496,50 @@ export function createPoller(h: PollerHost): Poller {
     }
   }
 
-  function startPoller(paneId: string, cwd: string, injectTs: number, description: string, requestId: string): Promise<void> {
+  /**
+   * Arm this pane's settlement watch. Resolves to whether the watch is armed — not to when it ends: a
+   * watch outlives the settlement that consumes its row (it keeps reading the worker's later reports,
+   * spec S6), so the loop runs detached and its lifetime is not a caller's to await. Callers that
+   * must not claim more than happened (recovery, which announces "re-armed") read the boolean.
+   */
+  async function startPoller(
+    paneId: string,
+    cwd: string,
+    injectTs: number,
+    description: string,
+    requestId: string,
+  ): Promise<boolean> {
     // Always refresh first: a follow_up arriving while the spawn poller still runs must move
     // settlement judgment to the new request instead of being dropped by the has() guard.
     const sinceTs = Math.max(0, injectTs - REQUEST_BOUNDARY_SLACK_MS);
     requestByPane.set(paneId, { injectTs: sinceTs, description, requestId });
-    if (pollers.has(paneId)) return Promise.resolve();
+    if (pollers.has(paneId)) return true; // an armed watch already reads this pane
     pollers.add(paneId);
-    return (async () => {
+    try {
+      if (!subScopes.has(paneId)) {
+        const fiber = await mountSubagentScope(h.sessionRoot, paneId, {
+          onDispose: () => { pollers.delete(paneId); },
+        });
+        subScopes.set(paneId, fiber);
+      }
+    } catch (err) {
+      pollers.delete(paneId);
+      console.error(`piher: subagent watch for ${paneId} could not be armed: ${(err as Error)?.message ?? err}`);
+      return false;
+    }
+    void (async () => {
       try {
-        if (!subScopes.has(paneId)) {
-          const fiber = await mountSubagentScope(h.sessionRoot, paneId, {
-            onDispose: () => { pollers.delete(paneId); },
-          });
-          subScopes.set(paneId, fiber);
-        }
         await pollLoop(paneId, cwd, sinceTs, description, requestId);
+      } catch (err) {
+        console.error(`piher: subagent poller ${paneId} crashed: ${(err as Error)?.message ?? err}`);
+      } finally {
+        pollers.delete(paneId);
         const fiber = subScopes.get(paneId);
         subScopes.delete(paneId);
         try { await fiber?.dispose(); } catch { /* already gone */ }
-      } catch (err) {
-        pollers.delete(paneId);
-        console.error(`piher: subagent poller ${paneId} crashed: ${(err as Error)?.message ?? err}`);
       }
     })();
+    return true;
   }
 
   return { startPoller, pollers };

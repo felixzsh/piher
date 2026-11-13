@@ -448,7 +448,6 @@ export default function subagentPlugin(ctx: Context): void {
     },
     session,
     injectNotice,
-    claimSettleNotice: d.claimSettleNotice,
     reclaim,
     policy: d.policy,
   });
@@ -488,13 +487,9 @@ export default function subagentPlugin(ctx: Context): void {
     for (const entry of running) {
       // A gone pane is resume work, not a re-arm.
       if (!liveTerminalIds.has(entry.gen.paneId)) continue;
-      try {
-        // Not awaited: a watch outlives the settlement that consumes its row (it keeps reading the
-        // worker's later reports, spec S6), so awaiting it here would hold the recovery notice for
-        // as long as the worker lives.
-        void startPoller(entry.gen.paneId, entry.cwd, entry.gen.startedAt, entry.description, `recover-${via}-${entry.gen.paneId}`);
+      // Only a watch that actually armed is announced: `startPoller` answers that fact, not the intent.
+      if (await startPoller(entry.gen.paneId, entry.cwd, entry.gen.startedAt, entry.description, `recover-${via}-${entry.gen.paneId}`)) {
         recovered.push(`${entry.gen.paneId} (${entry.description})`);
-      } catch {
       }
     }
     if (recovered.length > 0) {

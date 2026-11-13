@@ -3,8 +3,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  MAX_DOCUMENT_BYTES, fitReportDocument, isReportDocumentValue, planReportDelivery, reportDeliveryKey,
-  reportDocName, writeReportDocument, type ReportDocumentValue,
+  MAX_DOCUMENT_BYTES, fitReportDocument, isReportDocumentValue, planReportDelivery, planSettleWrite,
+  reportDeliveryKey, reportDocName, writeReportDocument, type ReportDocumentValue,
 } from '../src/report-documents.ts';
 import { CoreError, type CoreClientLike } from '../src/core-client.ts';
 import { fakeCore } from './test-utils.ts';
@@ -165,6 +165,89 @@ test('writeReportDocument: the first write lands at version 0', async () => {
   const written = await writeReportDocument(client, 't9', value());
   assert.deepEqual(written, { ok: true, version: 1 });
   assert.deepEqual((await client.docGet('piher.rep.t9'))?.value, value());
+});
+
+/* ── the worker's write side (spec S6/S8) ───────────────────────── */
+
+/** One settle, as index.ts sees it; each test overrides only the part it is about. */
+const settle = (over: Partial<Parameters<typeof planSettleWrite>[0]> = {}) => planSettleWrite({
+  isSubagent: true,
+  clientAvailable: true,
+  address: 'p9',
+  delegationTaskId: 'task-9',
+  aborted: false,
+  lastStopReason: 'stop',
+  turn: 4,
+  turnStopReason: 'stop',
+  text: 'REPORT: the work is done',
+  why: null,
+  session: '/w/s.jsonl',
+  at: 1_700_000_000_000,
+  ...over,
+});
+
+test('planSettleWrite: every settle with a channel writes, and nothing-to-say writes too', () => {
+  const withText = settle();
+  assert.deepEqual(withText, {
+    kind: 'write',
+    turnUnknown: false,
+    value: {
+      taskId: 'task-9', turn: 4, stopReason: 'stop', session: '/w/s.jsonl',
+      text: 'REPORT: the work is done', at: 1_700_000_000_000,
+    },
+  });
+
+  // A settle with no closing text and no reason: the document says exactly that. It is what lets the
+  // master tell "settled with nothing to say" from "never settled" (the deleted path used to deliver
+  // this as "It left no closing message").
+  const empty = settle({ text: null });
+  assert.equal(empty.kind, 'write');
+  assert.ok(empty.kind === 'write');
+  assert.equal(empty.value.text, null);
+  assert.equal(empty.value.stopReason, null, 'no reason is stated, and the stop word is not invented');
+  assert.equal(isReportDocumentValue(empty.value), true, 'the master can read it back');
+});
+
+test('planSettleWrite: a reason replaces the stop word, and the turn\'s own reason is kept with text', () => {
+  const refused = settle({ text: null, why: 'the `reviewer` manifest does not permit `bash`' });
+  assert.ok(refused.kind === 'write');
+  assert.equal(refused.value.text, null);
+  assert.equal(refused.value.stopReason, 'the `reviewer` manifest does not permit `bash`');
+
+  const capped = settle({ turnStopReason: 'length' });
+  assert.ok(capped.kind === 'write');
+  assert.equal(capped.value.stopReason, 'length', 'a turn that ended by token cap keeps its own reason');
+});
+
+test('planSettleWrite: a worker with no channel skips, and names the part that is missing', () => {
+  assert.deepEqual(settle({ isSubagent: false }), { kind: 'skip', reason: 'not-a-subagent' });
+  assert.deepEqual(settle({ clientAvailable: false }), { kind: 'skip', reason: 'no-core-client' });
+  assert.deepEqual(settle({ address: null }), { kind: 'skip', reason: 'no-address' });
+  assert.deepEqual(settle({ delegationTaskId: undefined }), { kind: 'skip', reason: 'no-delegation' });
+  // A settle that reports nothing by rule: an abort, or an error pi retries (S52).
+  assert.deepEqual(settle({ aborted: true }), { kind: 'skip', reason: 'reports-nothing' });
+  assert.deepEqual(settle({ lastStopReason: 'error' }), { kind: 'skip', reason: 'reports-nothing' });
+});
+
+test('planSettleWrite: a turn the core would not report costs the counter, not the settlement', () => {
+  const unknown = settle({ turn: null });
+  assert.ok(unknown.kind === 'write', 'the report still goes out');
+  assert.equal(unknown.turnUnknown, true, 'and the substitution is named, not silent');
+  assert.equal(unknown.value.turn, 0);
+});
+
+test('planSettleWrite + writeReportDocument: an empty settle reaches the core as a report', async () => {
+  const client = fakeCore();
+  const plan = planSettleWrite({
+    isSubagent: true, clientAvailable: true, address: 'p9', delegationTaskId: 'task-9',
+    aborted: false, lastStopReason: 'stop', turn: 2, turnStopReason: 'stop',
+    text: null, why: null, session: null, at: 1_700_000_000_001,
+  });
+  assert.ok(plan.kind === 'write');
+  assert.deepEqual(await writeReportDocument(client, 'p9', plan.value), { ok: true, version: 1 });
+  const stored = (await client.docGet('piher.rep.p9'))?.value as ReportDocumentValue;
+  assert.deepEqual(stored, plan.value);
+  assert.equal(isReportDocumentValue(stored), true, 'the master reads it as a settlement, not as absence');
 });
 
 test('writeReportDocument: an oversized report still lands, with its text trimmed', async () => {

@@ -17,6 +17,7 @@ import {
   readTaskRecord, repoTasksDir, taskRecordPath, TASK_VIEW_NAME,
 } from '../../src/task-store.ts';
 import { sessionStatePath } from '../../src/session-state.ts';
+import { planSettleWrite, writeReportDocument } from '../../src/report-documents.ts';
 import type { SubagentPortBox } from '../../src/subagent-core.ts';
 import type { TaskRow } from '../../src/task-row.ts';
 import { BootFailure, NodeGitAdapter, createSpawner, planTaskSend, taskNotStartedText, type GitExecFile } from '../../src/subagent-spawn.ts';
@@ -1453,11 +1454,18 @@ test('P4: a worker whose transcript is deleted mid-run still settles from its do
     rmSync(env.workerSessionFile);
     assert.equal(existsSync(env.workerSessionFile), false, 'the transcript is gone before the settle');
 
-    // The worker settles and writes its own report document: the one settlement channel left.
+    // The worker settles and writes its report through its OWN writer (S6/S8): `planSettleWrite`
+    // decides the value index.ts writes and `writeReportDocument` is the write itself, so what the
+    // master reads below is what the worker's code produces — not a value this test made up. The
+    // harness has no worker process to fire `agent_settled` in, so those two calls stand in for it.
     const DOC_TEXT = 'REPORT: the document is the only settlement left';
-    await env.client.docSet(`piher.rep.${paneId}`, {
-      taskId, turn: 1, stopReason: 'stop', session: null, text: DOC_TEXT, at: Date.now(),
-    }, 0);
+    const plan = planSettleWrite({
+      isSubagent: true, clientAvailable: true, address: paneId, delegationTaskId: taskId,
+      aborted: false, lastStopReason: 'stop', turn: 1, turnStopReason: 'stop',
+      text: DOC_TEXT, why: null, session: null, at: Date.now(),
+    });
+    assert.ok(plan.kind === 'write', 'a settle with a channel always writes');
+    assert.deepEqual(await writeReportDocument(env.client, paneId, plan.value), { ok: true, version: 1 });
     env.turns[paneId] = 1;
     env.wakeWorker();
     await waitFor(() => env.pi.userSent.length === 1, 8_000);
@@ -1481,20 +1489,24 @@ test('P4: a closing message in the transcript alone settles nothing', async () =
     const spawned = await runSubagent(env.pi, { description: 'transcript-only probe', prompt: PROMPT }, env.cwd);
     const paneId = spawned.details?.paneId as string;
     await waitFor(() => env.frames.length === 1);
-    // The transcript holds a finalized assistant message (SUB_TEXT) and the core says the turn is
-    // over: exactly what the deleted derivation used to announce as a settlement.
+    // The transcript holds a finalized assistant message (SUB_TEXT) and the core says a turn ran:
+    // exactly what the deleted derivation used to announce as a settlement.
     assert.ok(existsSync(env.workerSessionFile), 'the transcript is there and readable');
     env.turns[paneId] = 1;
     env.wakeWorker();
 
-    // No report document was written, so there is nothing to settle: the silence budget is what ends
-    // supervision, and it says so.
+    // No report document was written: the budget ends supervision and names the real finding — a
+    // turn ran and no report arrived — instead of calling the worker silent.
     await waitFor(() => env.pi.userSent.length > 0, 8_000);
     assert.ok(
       env.pi.userSent.every((m) => !m.content.includes(SUB_TEXT)),
       `a transcript is never a report (spec S5): ${JSON.stringify(env.pi.userSent.map((m) => m.content))}`,
     );
-    assert.match(env.pi.userSent.at(-1)!.content, /has shown no progress/, 'silence is reported as silence');
+    assert.match(
+      env.pi.userSent.at(-1)!.content,
+      /ran turn 1 and no report document reached you/,
+      'a turn that ran with no report is its own diagnosis, never "it said nothing"',
+    );
   }, { policy: { subagentTimeoutMs: 300 } });
 });
 

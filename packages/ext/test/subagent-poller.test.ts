@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { Context } from '@deepseek-ai/cordis';
 import {
   buildSettlementNoticeText, createPoller, createSessionRoot, disposeSessionRoot, formatSettleTimeoutNotice,
-  formatPaneClosedNotice, mountSubagentScope, planBlockedGate, planSilenceTick, type PollerHost,
+  formatPaneClosedNotice, formatNoReportNotice, mountSubagentScope, planBlockedGate, planSilenceTick, type Poller, type PollerHost,
 } from '../src/subagent-poller.ts';
 import type { TaskEntry } from '../src/task-row.ts';
 import type { SettlementCard } from '../src/settlement-card.ts';
@@ -24,12 +24,18 @@ test('planBlockedGate: the first block notifies, repeats stay silent, any other 
 });
 
 test('planSilenceTick: a null wait state is a heartbeat; a dead pane outranks the budget', () => {
-  assert.deepEqual(planSilenceTick({ waitState: null, paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 100 }), { refreshActivity: true, action: 'continue' });
-  assert.deepEqual(planSilenceTick({ waitState: 'idle', paneAlive: false, now: 50, lastActivityAt: 1, timeoutMs: 10 }), { refreshActivity: false, action: 'pane-closed' });
-  assert.deepEqual(planSilenceTick({ waitState: 'idle', paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10 }), { refreshActivity: false, action: 'silence-timeout' });
+  assert.deepEqual(planSilenceTick({ waitState: null, paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 100, turn: 0 }), { refreshActivity: true, action: 'continue' });
+  assert.deepEqual(planSilenceTick({ waitState: 'idle', paneAlive: false, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: 3 }), { refreshActivity: false, action: 'pane-closed' });
+  assert.deepEqual(planSilenceTick({ waitState: 'idle', paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: 0 }), { refreshActivity: false, action: 'silence-timeout' });
   // The budget is a failure to report, not a settlement: a worker that never writes a document has
   // nothing to hand over, and this is where supervision ends instead.
-  assert.deepEqual(planSilenceTick({ waitState: 'done', paneAlive: true, now: 50, lastActivityAt: 40, timeoutMs: 100 }), { refreshActivity: false, action: 'continue' });
+  assert.deepEqual(planSilenceTick({ waitState: 'done', paneAlive: true, now: 50, lastActivityAt: 40, timeoutMs: 100, turn: 1 }), { refreshActivity: false, action: 'continue' });
+  // The core's turn separates the two endings: a turn that ran is a settle without a report channel,
+  // which is not silence and must not be announced as "said nothing at all".
+  assert.deepEqual(planSilenceTick({ waitState: 'idle', paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: 1 }), { refreshActivity: false, action: 'settled-without-report' });
+  assert.deepEqual(planSilenceTick({ waitState: 'done', paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: 4 }), { refreshActivity: false, action: 'settled-without-report' });
+  // A watch that cannot report the turn cannot claim a settle either.
+  assert.deepEqual(planSilenceTick({ waitState: 'idle', paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: null }), { refreshActivity: false, action: 'silence-timeout' });
 });
 
 test('notice formatting: settlement text, pane-closed and settle-timeout wording', () => {
@@ -46,6 +52,14 @@ test('notice formatting: settlement text, pane-closed and settle-timeout wording
   });
   assert.match(timeout, /no progress for 120s \(observed since 2025-01-01T00:00:00\.000Z\)/);
   assert.match(timeout, /Run subagent\(action: "list"\)/);
+
+  // The other ending of the budget is its own diagnosis: a turn ran, the document did not arrive.
+  const noReport = formatNoReportNotice({ paneId: 'p1', description: 'build assets', turn: 3, idleSeconds: 300 });
+  assert.match(noReport, /ran turn 3 and no report document reached you/);
+  assert.match(noReport, /this is NOT the task's result/);
+  assert.match(noReport, /no report channel/);
+  assert.match(noReport, /subagent\(action: "output", agentId p1\)/);
+  assert.doesNotMatch(noReport, /has shown no progress/, 'a settle is never announced as silence');
 });
 
 /* ── pane scope ─────────────────────────────────────────────────── */
@@ -83,16 +97,17 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
   }
   const writes: RecordWrite[] = [];
   const notices: string[] = [];
-  const claimKeys: string[] = [];
   const livePanes: string[] = entry ? [entry.gen.paneId] : [];
   /** Every pane the loop had to resolve through `getTerminal` because the watch snapshot lacked it. */
   const getTerminalCalls: string[] = [];
   let waitState: CoreStatus | 'exited' | null = 'idle';
+  /** The core's turn counter for the worker: what the watch reports. */
+  let turn = 0;
   /** False takes the worker out of the watch snapshot, forcing the getTerminal fallback. */
   let inSnapshot = true;
   const retired: string[] = [];
   let connected = true;
-  let claimResult = true;
+  let reattributed: string | null = null;
   /** Extra behavior around a park: advance the scripted state, or hold the wait open. */
   let parkHook: ((ms: number) => boolean | Promise<boolean>) | null = null;
 
@@ -104,9 +119,9 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
     connected,
     terminals: () => {
       if (!inSnapshot) return [];
-      if (waitState === 'exited') return [terminalInfo({ id: paneId, state: 'finished', labels: { 'herdr.tab': 't0' } })];
+      if (waitState === 'exited') return [terminalInfo({ id: paneId, state: 'finished', turn, labels: { 'herdr.tab': 't0' } })];
       // `null` = no word to act on: the worker is (still) working.
-      return [terminalInfo({ id: paneId, status: waitState ?? 'working', labels: { 'herdr.tab': 't0' } })];
+      return [terminalInfo({ id: paneId, status: waitState ?? 'working', turn, labels: { 'herdr.tab': 't0' } })];
     },
     // A park IS the wait: the virtual clock advances by exactly its duration, so the loop under
     // test moves only through its own parks — deterministic, and no real timers are involved.
@@ -122,7 +137,7 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
     getTerminal: async (id: string) => {
       getTerminalCalls.push(id);
       return livePanes.includes(id)
-        ? terminalInfo({ id, status: 'idle', labels: { 'herdr.tab': 't0' } })
+        ? terminalInfo({ id, status: 'idle', turn, labels: { 'herdr.tab': 't0' } })
         : null;
     },
     watchChildren: () => watch,
@@ -141,6 +156,7 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
     readTurnClosing: async () => ({ text: null, why: null }),
     readAskFlag: async () => 'Which data source?',
     resolveSessionFile: async () => '/resolved/session.jsonl',
+    reattributeStaleSessionFile: async (_paneId: string, _cwd: string, _sinceTs: number, preferred: string | null) => reattributed ?? preferred,
     probeAlive: async () => ({ paneExists: true, agentStatus: 'working', lastActivityMs: 1 }),
   } satisfies SessionIo;
 
@@ -154,16 +170,16 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
     writeRecord: (e) => { writes.push({ entry: { ...e, gen: { ...e.gen } } }); },
     session,
     injectNotice: async (content, _paneId, card) => { notices.push(content); cards.push(card ?? null); },
-    claimSettleNotice: (key) => { claimKeys.push(key); return claimResult; },
     now: () => virtual.now,
     policy: { subagentTimeoutMs: 10_000 },
   };
 
   return {
-    host, entry, writes, notices, cards, claimKeys, virtual, panes: livePanes, getTerminalCalls, retired,
+    host, entry, writes, notices, cards, virtual, panes: livePanes, getTerminalCalls, retired,
     parks: () => watch.parks,
     waitState: (s: CoreStatus | 'exited' | null) => { waitState = s; },
-    setClaim: (v: boolean) => { claimResult = v; },
+    setTurn: (n: number) => { turn = n; },
+    reattribute: (f: string | null) => { reattributed = f; },
     setInSnapshot: (v: boolean) => { inSnapshot = v; },
     setConnected: (v: boolean) => { connected = v; watch = buildWatch(); },
     onPark: (fn: (ms: number) => boolean | Promise<boolean>) => { parkHook = fn; },
@@ -174,8 +190,18 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
   };
 }
 
-const start = (f: { host: PollerHost; entry: TaskEntry | null }, requestId = 'req-1', injectTs = 10_000) =>
-  createPoller(f.host).startPoller(f.entry!.gen.paneId, '/tmp', injectTs, 'desc', requestId);
+/** `startPoller` answers whether the watch armed; the loop runs detached, so a test waits for it to
+ *  end — every fixture ends it by closing, spending or exiting the row. */
+async function settleLoop(poller: Poller): Promise<void> {
+  for (let i = 0; i < 5_000 && poller.pollers.size > 0; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(poller.pollers.size, 0, 'the watch ended (a test must close, spend or exit its row)');
+}
+
+const start = async (f: { host: PollerHost; entry: TaskEntry | null }, requestId = 'req-1', injectTs = 10_000) => {
+  const poller = createPoller(f.host);
+  await poller.startPoller(f.entry!.gen.paneId, '/tmp', injectTs, 'desc', requestId);
+  await settleLoop(poller);
+};
 
 /** A report document value, as the worker writes it on every settle (spec S10). */
 const reportDoc = (
@@ -208,7 +234,7 @@ test('pollLoop: a report document consumes the row and delivers the notice', asy
   assert.equal(f.entry!.gen.sessionFile, '/resolved/session.jsonl', 'the path is still resolved for resume/output');
   assert.equal(f.writes.length, 1, 'one record for the one settlement');
   assert.equal(f.writes[0]!.entry.gen.consumedAt, 13_000);
-  assert.deepEqual(f.claimKeys, ['p-settle:req-1']);
+  assert.match(f.notices[0]!, /finished and will do no further work/);
   assert.match(f.notices[0]!, /Background subagent p-settle \(desc\) finished/);
   assert.ok(f.notices[0]!.includes('finished all the work'), 'the notice carries the document text verbatim');
 });
@@ -260,15 +286,21 @@ test('pollLoop: two settlements that say the same words are both delivered', asy
   assert.equal(f.notices.length, 2, `two settles, two notices: ${JSON.stringify(f.notices)}`);
 });
 
-test('pollLoop: a lost settle claim suppresses the notice but not the ledger write', async () => {
-  const f = fixture(makeEntry('p-dedup'));
-  f.setClaim(false);
-  f.seedDoc('piher.rep.p-dedup', reportDoc('task-1', 'done'));
-  f.onPark(() => { f.waitState('exited'); return false; });
+test('pollLoop: a second settle under the same request id is announced, not swallowed', async () => {
+  // The process-wide claim latch is keyed (pane, request) and the pipe push claims the same key, so a
+  // later unrequested settle on that pane re-entered the hand-over as "already announced" and stamped
+  // the new document delivered without announcing it. The settlement identity is the document, so a
+  // new document is news under any request id.
+  const f = fixture(makeEntry('p-same-request'));
+  const events = [
+    () => { f.seedDoc('piher.rep.p-same-request', reportDoc('task-1', 'the first settle')); return true; },
+    () => { f.seedDoc('piher.rep.p-same-request', reportDoc('task-1', 'a later, unrequested settle', { at: 21_000 })); return true; },
+    () => { f.waitState('exited'); return true; },
+  ];
+  f.onPark(async () => (events.shift() ?? (() => false))());
   await start(f);
-  assert.ok(f.entry!.gen.consumedAt !== null);
-  assert.equal(f.writes.length, 1, 'the record is written even when the notice is dropped');
-  assert.equal(f.notices.length, 0);
+  assert.equal(f.notices.length, 2, `both settles are announced: ${JSON.stringify(f.notices)}`);
+  assert.ok(f.notices[1]!.includes('a later, unrequested settle'));
 });
 
 test('pollLoop: a blocked report keeps its BLOCKED: first line and reads as the worker\'s own report', async () => {
@@ -313,7 +345,7 @@ test('pollLoop: a refused notice leaves the row running and retries the settleme
   assert.equal(attempts, 2, 'the rejected notice is retried, not lost');
   assert.ok(f.entry!.gen.consumedAt !== null);
   assert.equal(f.writes.length, 1, 'one record for the one settlement');
-  assert.deepEqual(f.claimKeys, ['p-refused:req-1'], 'the retry reuses the claim it already owns');
+  assert.match(f.notices[0]!, /Background subagent p-refused \(desc\) finished/);
   assert.match(f.notices[0]!, /Background subagent p-refused \(desc\) finished/);
 });
 
@@ -353,7 +385,7 @@ test('pollLoop: a blocked worker parks on the watch and makes no RPC', async () 
     return false;
   });
   await start(f);
-  assert.deepEqual(f.parks(), [1_000, 1_000, 1_000, 1_000, 1_000], 'every blocked tick waits out the re-check park');
+  assert.deepEqual(f.parks(), [1_000, 2_000, 4_000, 8_000, 16_000], 'the park doubles while the worker says nothing new');
   assert.deepEqual(f.getTerminalCalls, [], 'the snapshot already has the worker: no getTerminal per tick');
   assert.equal(f.notices.filter((n) => n.includes('BLOCKED')).length, 1, 'the gate notices once per episode');
 });
@@ -366,7 +398,7 @@ test('pollLoop: an idle pane with no report document parks, and settles nothing'
     return false;
   });
   await start(f);
-  assert.deepEqual(f.parks(), [1_000, 1_000, 1_000, 1_000]);
+  assert.deepEqual(f.parks(), [1_000, 2_000, 4_000, 3_000], 'the park backs off, then stops at the budget');
   assert.equal(f.notices.length, 0, 'an idle pane with nothing to report is not a settlement');
 });
 
@@ -424,24 +456,81 @@ test('pollLoop: a failure card carries the role and elapsed a settle card does',
   });
 
   const timedOut = fixture(makeEntry('p-timeout-card', { kind: 'worker', createdAt: 1_000 }));
-  timedOut.onPark(() => { timedOut.virtual.now += 15_000; return false; });
-  await start(timedOut);
-  assert.deepEqual(timedOut.cards[0], {
-    name: 'p-timeout-card (desc)',
-    role: 'worker',
-    outcome: 'failed',
-    elapsedMs: timedOut.virtual.now - 1_000,
+  let cardParks = 0;
+  timedOut.onPark(() => {
+    if (++cardParks === 1) timedOut.virtual.now += 15_000;
+    else timedOut.entry!.closedAt = timedOut.virtual.now; // the row ends the watch, as `close` does
+    return false;
   });
+  await start(timedOut);
+  const card = timedOut.cards[0]!;
+  assert.equal(card.name, 'p-timeout-card (desc)');
+  assert.equal(card.role, 'worker');
+  assert.equal(card.outcome, 'failed');
+  assert.ok((card.elapsedMs ?? 0) > 0, 'the failure card carries the elapsed time, as a settle card does');
 });
 
 test('pollLoop: no progress past the silence budget consumes the row as a timeout', async () => {
   const f = fixture(makeEntry('p-timeout'));
-  f.onPark(() => { f.virtual.now += 15_000; return false; });
+  let parks = 0;
+  f.onPark(() => {
+    if (++parks === 1) f.virtual.now += 15_000;
+    else f.entry!.closedAt = f.virtual.now; // the timeout no longer ends the watch; a close does
+    return false;
+  });
   await start(f);
   assert.ok(f.entry!.gen.consumedAt !== null);
   assert.equal(f.writes.length, 1, 'one record for the one settlement');
   assert.match(f.notices[0]!, /has shown no progress for/);
   assert.doesNotMatch(f.notices[0]!, /finished and will do no further work/, 'silence is a failure to report, not a settlement');
+});
+
+test('pollLoop: a turn that ran with no report document is its own diagnosis, not silence', async () => {
+  // The core says a turn happened and no `piher.rep.*` document arrived: the worker settled without a
+  // report channel (an older build, no herdr extension, a failed write). Saying "it said nothing" would
+  // claim it produced nothing, which is a different — and false — finding.
+  const f = fixture(makeEntry('p-no-channel'));
+  f.setTurn(2);
+  let parks = 0;
+  f.onPark(() => {
+    if (++parks === 1) f.virtual.now += 15_000;
+    else f.entry!.closedAt = f.virtual.now;
+    return false;
+  });
+  await start(f);
+  assert.equal(f.notices.length, 1, `one notice: ${JSON.stringify(f.notices)}`);
+  assert.match(f.notices[0]!, /ran turn 2 and no report document reached you/);
+  assert.match(f.notices[0]!, /NOT the task's result/);
+  assert.doesNotMatch(f.notices[0]!, /has shown no progress|left no closing message/);
+  assert.equal(f.cards[0]?.outcome, 'failed');
+  assert.ok(f.entry!.gen.consumedAt !== null, 'the row is consumed, so the sweeps can reclaim it');
+});
+
+test('pollLoop: a report written after the budget ended the row is still delivered', async () => {
+  // The budget consumes the row, and the watch keeps reading: a worker that settles again afterwards
+  // (a person typing in its attachable pane, a queued steer) still has a report to deliver (S6/S21).
+  const f = fixture(makeEntry('p-late-doc'));
+  const events = [
+    () => { f.virtual.now += 15_000; return true; }, // the budget fires: silence, no document yet
+    () => { f.seedDoc('piher.rep.p-late-doc', reportDoc('task-1', 'the report that came late')); return true; },
+    () => { f.waitState('exited'); return true; },
+  ];
+  f.onPark(async () => (events.shift() ?? (() => false))());
+  await start(f);
+  assert.equal(f.notices.length, 2, `a failure notice, then the report: ${JSON.stringify(f.notices)}`);
+  assert.match(f.notices[0]!, /has shown no progress for/);
+  assert.ok(f.notices[1]!.includes('the report that came late'), 'the later document still reaches the master');
+});
+
+test('pollLoop: the loop repairs a stale sessionFile from the core report', async () => {
+  // Spawn's mtime fallback can adopt a PRE-EXISTING session file; that value is what `resume` restores
+  // and an existing pane is matched by, so the loop repairs it while the worker is here.
+  const f = fixture(makeEntry('p-stale', { sessionFile: '/stale/last-week.jsonl' }));
+  f.reattribute('/fresh/real-session.jsonl');
+  docSettle(f, 'p-stale', reportDoc('task-1', 'done'));
+  await start(f);
+  assert.equal(f.entry!.gen.sessionFile, '/fresh/real-session.jsonl');
+  assert.ok(f.entry!.gen.consumedAt !== null);
 });
 
 test('pollLoop: an existing sessionFile is never re-resolved through the mtime fallback', async () => {
@@ -469,12 +558,11 @@ test('startPoller: a follow_up refreshes the tracked request while the loop is r
     return false;
   });
   const poller = createPoller(f.host);
-  const loop = poller.startPoller('p-refresh', '/tmp', 1_000, 'desc', 'req-1');
+  assert.equal(await poller.startPoller('p-refresh', '/tmp', 1_000, 'desc', 'req-1'), true, 'the watch armed');
   await poller.startPoller('p-refresh', '/tmp', 5_000, 'desc', 'req-2');
   firstPark.resolve();
-  await loop;
-  // The newest request wins: the follow-up's claim is the one taken, and its document is what settles.
-  assert.deepEqual(f.claimKeys, ['p-refresh:req-2']);
+  await settleLoop(poller);
+  // The newest request wins: the follow-up's document is what settles.
   assert.ok(f.notices[0]!.includes('the follow-up answer'));
   assert.deepEqual([...poller.pollers], [], 'the pane leaves the poller set when the loop ends');
 });
@@ -493,11 +581,11 @@ test('startPoller: a second call for an active pane does not start a second loop
     return false;
   });
   const poller = createPoller(f.host);
-  const loop = poller.startPoller('p-dup', '/tmp', 1_000, 'desc', 'req-1');
   await poller.startPoller('p-dup', '/tmp', 1_000, 'desc', 'req-1');
-  assert.deepEqual([...poller.pollers], ['p-dup']);
+  await poller.startPoller('p-dup', '/tmp', 1_000, 'desc', 'req-1');
+  assert.deepEqual([...poller.pollers], ['p-dup'], 'the second call joins the armed watch');
   firstPark.resolve();
-  await loop;
+  await settleLoop(poller);
   assert.equal(f.writes.length, 1, 'exactly one settlement');
   assert.equal(f.notices.length, 1, 'one notice, from one loop');
 });
@@ -528,7 +616,6 @@ test('pollLoop: a document older than the slack is not this request\'s settlemen
     `an earlier turn's report is never this request's settlement: ${JSON.stringify(f.notices)}`,
   );
   assert.match(f.notices.at(-1) ?? '', /stopped before settling/, 'the pane going, not the stale read, ended the row');
-  assert.deepEqual(f.claimKeys, [], 'the stale document never claimed a settlement');
 });
 
 
@@ -563,7 +650,6 @@ test('pollLoop: the report document settles on the turn event, with no transcrip
   assert.ok(!notice.includes('left no closing message'));
   assert.equal(f.entry!.gen.sessionFile, '/worker/s.jsonl', 'the document carries the session (S10)');
   assert.ok(f.entry!.gen.consumedAt !== null, 'the settlement consumes the row');
-  assert.deepEqual(f.claimKeys, ['p-doc:req-1']);
 });
 
 test('pollLoop: a second turn for the same document value delivers nothing twice', async () => {
@@ -571,7 +657,10 @@ test('pollLoop: a second turn for the same document value delivers nothing twice
   // One poller for both runs, as in production: the mount outlives the re-arm, so the delivery set
   // (`address`, `turn`) survives it.
   const poller = createPoller(f.host);
-  const begin = (requestId: string) => poller.startPoller(f.entry!.gen.paneId, '/tmp', 10_000, 'desc', requestId);
+  const begin = async (requestId: string) => {
+    await poller.startPoller(f.entry!.gen.paneId, '/tmp', 10_000, 'desc', requestId);
+    await settleLoop(poller);
+  };
   const firstEvents = [
     () => { f.seed(3); return true; },
     () => { f.waitState('exited'); return true; },
@@ -595,7 +684,6 @@ test('pollLoop: a second turn for the same document value delivers nothing twice
     1,
     'the same (address, turn) never settles twice',
   );
-  assert.deepEqual(f.claimKeys, ['p-doc:req-1'], 'no second claim for the same document');
 });
 
 test('pollLoop: a report document from another task is ignored, and settles nothing', async () => {
@@ -613,7 +701,6 @@ test('pollLoop: a report document from another task is ignored, and settles noth
   assert.equal(f.notices.filter((n) => /finished and will do no further work/.test(n)).length, 0, 'a foreign document settles nothing');
   assert.ok(f.notices.every((n) => !n.includes('not mine')));
   assert.match(f.notices.at(-1) ?? '', /stopped before settling/, 'the pane going is what ended the row');
-  assert.deepEqual(f.claimKeys, []);
 });
 
 test('pollLoop: a document older than the request boundary is not the new request\'s settlement', async () => {
@@ -634,9 +721,8 @@ test('pollLoop: a document older than the request boundary is not the new reques
   );
   assert.equal(f.notices.filter((n) => /finished and will do no further work/.test(n)).length, 0,
     'no settlement notice came out of the stale read');
-  // The pane ending is what ended the row, not the earlier turn's document.
   assert.match(f.notices.at(-1) ?? '', /stopped before settling/);
-  assert.deepEqual(f.claimKeys, [], 'the stale document never claimed a settlement');
+  // The pane ending is what ended the row, not the earlier turn's document.
 });
 
 test('pollLoop: a document written after the row was consumed still reaches the master', async () => {
@@ -707,7 +793,6 @@ test('pollLoop: a settlement the pipe already delivered is not re-announced from
   assert.equal(f.notices.filter((n) => /finished and will do no further work/.test(n)).length, 0,
     `the earlier settlement is not announced again: ${JSON.stringify(f.notices)}`);
   assert.ok(f.notices.every((n) => !n.includes('already delivered by the pipe')));
-  assert.deepEqual(f.claimKeys, [], 'and it claims nothing for the re-armed request');
 });
 
 test('pollLoop: a document written after the reply landed is still suppressed by identity', async () => {
