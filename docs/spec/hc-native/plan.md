@@ -412,3 +412,29 @@ and are not counted, so an inbox-heavy session can still pass 32 KiB; that is a 
 Process note, recorded because it happened: one mechanical rename in `plugins/subagent.ts` was applied with
 a python heredoc, which this repo's rules forbid; `tsc` and the suite confirm the content, but the method
 was out of bounds and the parent verified the file by reading the diff rather than trusting the script.
+L23. **E11 closed, and E10 classified as a core limit**: `d865976` (parent `bee7d36`), Risk: item 6 (the
+pane-closed notice became a settlement fact keyed on the core's reason), `tsc` clean + `npm test`
+**652 tests, 651 pass, 1 skipped, 0 fail** on that SHA, verified by the parent. The unit keys the ending on
+**`reason`**, never on the exit code — measured in P3, `hc kill` reports `exit_code: 0` with
+`reason: "killed"`, so an exit code would call an external kill a clean finish. `observe()` now carries the
+core's ending (reason + exit code, `null` when the terminal was reaped), the notice says which of the three
+shapes it saw, and the `pane-gone` fact is announced at the **observation instant** (`goneAt ??= now()`,
+held across retries) instead of waiting out the silence budget: the killed-pane test runs with a
+3,600,000 ms budget and asserts **zero parks**. A refused notice is retried under the same `(taskId, at)`,
+so one kill is one delivery; a settle followed by a reap delivers the settle only; a pane never observed
+running still yields the ordinary spawn failure. Two existing notice assertions were tightened (reason,
+task, elapsed, the `output` call, "no record") rather than loosened. **E10 is not closable inside piher**,
+and the invariant now says so with the evidence: a `doc` event does not reach a filtered subscription
+(measured in P3, S23/S24), so every worker holds an unfiltered `events.subscribe` and each `doc.set` is
+delivered to N+1 sockets. piher already filters locally in O(1); the fix belongs to the core —
+`events.subscribe { docs_of: [...] }`, or a namespace per terminal. The invariant stays **open, blocked on
+the core**, with the request written on its row, and it is the only skipped test left.
+L24. **Session close**: twelve of thirteen invariants closed and the last one blocked on the core is a fair
+place to stop. The delegation channel that this run started with — a private pipe, a watchdog per pane,
+timers guessing when a worker was done, and a delivery that showed three of ten — is now a ledger with a
+cursor, a row per settlement, a document that outlives its pane, a readiness gate that cannot call a
+working child a failure, a compaction that cannot swallow a notice, a session budget that says when it
+withholds, and an inbox that answers "what happened since I last looked" in one call. Twelve of the
+thirteen criteria are pinned by tests; E10 is a core limitation with a named request; the fixed costs are
+measured (3,311 B of tool schema per request, 212 MB per worker, 20 workers fit this machine and 40 do
+not).
