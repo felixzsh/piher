@@ -220,6 +220,13 @@ export interface SettlementLedger {
   readonly file: string | null;
   events(): readonly SettlementEvent[];
   lastSeq(): number;
+  /** Bytes the last {@link SettlementLedger} load read off disk: a file that holds text and not one
+   *  fact is somebody else's ledger (or an overwritten one), and a reader that answers to a person
+   *  has to say that instead of ``nothing new``. */
+  sourceBytes(): number;
+  /** The last line of the file had no terminator when it was read: the write never finished, so the
+   *  newest fact may be the one that is missing. */
+  torn(): boolean;
   /** Every seq at or below this one was accepted, and the one above it was not: the cursor is the
    *  contiguous prefix of accepted facts, so an out-of-order acceptance cannot hide a pending one
    *  below it. Everything above the prefix is re-delivered on the next start. */
@@ -271,6 +278,9 @@ export function openSettlementLedger(opts: { file: string | null }): SettlementL
   /** A torn tail left no terminator, so the next append must start a fresh line before its own. */
   let needsSeparator = false;
   let delivered = 0;
+  /** What the last `load` read: the file's size, and whether its last line was unfinished. */
+  let loadedBytes = 0;
+  let loadedTorn = false;
   /** Facts already appended, by `(taskId, at)`: the retry of a refused notice finds its own line. */
   const facts = new Map<string, SettlementEvent>();
   /** Seqs pi accepted in this process, including ones above a gap that is still open. The cursor
@@ -304,9 +314,11 @@ export function openSettlementLedger(opts: { file: string | null }): SettlementL
         swallow('settlement-ledger.read', err);
       }
     }
+    loadedBytes = Buffer.byteLength(text, 'utf8');
     const parsed = parseSettlementLedger(text);
     events = parsed.events;
     lastSeq = parsed.lastSeq;
+    loadedTorn = parsed.torn;
     needsSeparator = parsed.torn;
     delivered = 0;
     if (cursorFile !== null) {
@@ -335,6 +347,8 @@ export function openSettlementLedger(opts: { file: string | null }): SettlementL
     },
     events: () => events,
     lastSeq: () => lastSeq,
+    sourceBytes: () => loadedBytes,
+    torn: () => loadedTorn,
     deliveredSeq: () => delivered,
     append(input) {
       if (isSettlementFact(input.kind)) {

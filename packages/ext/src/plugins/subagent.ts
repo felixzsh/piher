@@ -79,6 +79,7 @@ import { MAX_DOCUMENT_BYTES, commandDocName, readReportDocument, type ReportDocu
 import { createGcController, restoreTasks, retirePane, seedForkView } from '../subagent-gc.ts';
 import { createSessionIo, executeSubagentOutput, type SessionReport, type SubagentOutputCursor } from '../subagent-session.ts';
 import { executeSubagentReports } from '../subagent-reports.ts';
+import { executeSubagentInbox } from '../subagent-inbox.ts';
 import type { NoticeRow } from '../index-notices.ts';
 import type { WorkerWidgetRow } from '../tree-view.ts';
 
@@ -121,38 +122,39 @@ export interface SubagentDeps {
 
 /** Sent with every request: what a call needs. Details live in SUBAGENT_MANUAL (`action: "help"`). */
 const SUBAGENT_DESCRIPTION = [
-  'Delegate a self-contained task to a subagent: a separate pi session in its own herdr pane (its own context — it does NOT see this conversation; a human can talk to it there).',
-  'Actions (default spawn): spawn | send | retry | output | reports | list | interrupt | resume | close | help.',
-  'spawn: `prompt` is the COMPLETE task, since only it reaches the worker; `description` labels the pane. Several spawns per message run in parallel (max 4).',
-  'spawn places the worker by `cwd` or by `worktree` (a name: piher creates the checkout and branch).',
-  'spawn returns at once; the result arrives as a settlement notice at your next turn boundary — never sleep or poll.',
-  'retry: re-sends the spawned prompt after a fault outside the task. send: follow-up steered between tool calls; a task with no pane revives first. output: report once finished, lines while it runs — normally unneeded; reports: the reports a batch notice withheld, by `ids`, in one call. resume: revive an unfinished task by taskId. list: yours plus another session\'s live ones, marked.',
-  'help: the full manual (placement, roles, documents).',
+  'Delegate to a subagent: a separate pi session in its own herdr pane (own context — it does NOT see this conversation; a human can talk to it there).',
+  'Actions (default spawn): spawn | send | retry | output | reports | inbox | list | interrupt | resume | close | help.',
+  'spawn: `prompt` is the COMPLETE task — it is all the worker gets; `description` labels the pane. Up to 4 run in parallel, placed by `cwd` or `worktree` (a name piher creates, with its branch).',
+  'spawn returns at once: the result arrives as a settlement notice at your turn boundary — never sleep or poll.',
+  'retry: re-sends the spawned prompt after a fault outside the task. send: follow-up steered between tool calls; a task with no pane revives first. output: report when finished, lines while it runs — normally unneeded; reports: the reports a batch notice withheld, by `ids`, in one call. inbox: the facts after `since` (default: the delivered cursor), `limit` at a time — how a lost notice is recovered. resume: revive an unfinished task by taskId. list: yours plus other sessions\' live ones, marked.',
+  'help: the manual.',
 ].join(' ');
 
 /** Returned by `action: "help"`: the reference text kept out of the per-request description. */
 const SUBAGENT_MANUAL = [
-  'subagent manual — `help` returns this text: what a call needs beyond the sent description.',
+  'subagent manual — `help` returns this: what a call needs beyond the description.',
   '',
-  'spawn — an independent worker on this workspace; its result arrives as a settlement notice, so return at once and never wait in-turn. `prompt` is the whole task (the worker does not see this conversation): paths, acceptance criteria, what to report. Every spawn mints a `taskId` for later actions. `description` labels the pane. No pane by default; `tab` joins or creates a tab. `cwd` runs in a checkout you have, `worktree` names one piher creates (branch of the same name); they are mutually exclusive.',
+  'spawn — an independent worker on this workspace; its result arrives as a settlement notice, so return at once. `prompt` is the whole task (the worker does not see this conversation): paths, acceptance criteria, what to report. Every spawn mints a `taskId`. `description` labels the pane. No pane by default; `tab` joins or creates one. `cwd` or `worktree` (a name piher creates, with its branch) places it, never both.',
   '',
-  'role + allowed_tools — the profile list below, from workspace `.piher/roles/`, then the user directory, then builtin. `allowed_tools` adds on top; role denies always win. Unknown names stay display labels; a profile is fixed for life.',
+  'role + allowed_tools — the list below: workspace `.piher/roles/`, then the user directory, then builtin. `allowed_tools` adds on top; role denies win. Unknown names stay labels; a profile is fixed.',
   '',
-  'durability — one task record per task at `<repo>/.piher/tasks/<taskId>.json`, and this session\'s view at `<sessionDir>/piher/<sessionId>/tasks.json`. Liveness is observed, never stored; spawn, settle and close write it.',
+  'durability — one record per task at `<repo>/.piher/tasks/<taskId>.json`, the append-only settlement ledger beside it, and this session\'s view at `<sessionDir>/piher/<sessionId>/tasks.json`. Liveness is observed, never stored; spawn, settle and close write it.',
   '',
-  'list — every actionable task, one line per row: `<slug>@<paneId> [<state>] (<kind> · <lifecycle>) <description>`. States: `running` (turn in flight), `idle` (report consumed), `no report`, `no pane` (gone pane). Another session\'s live task shows marked `[otra sesión]`; its gone pane never shows. Closed and spent rows never print.',
+  'list — every actionable task, one line per row: `<slug>@<paneId> [<state>] (<kind> · <lifecycle>) <description>`. States: `running` (turn in flight), `idle` (report consumed), `no report`, `no pane`. Another session\'s live task is marked `[otra sesión]`; its gone pane never shows, and closed or spent rows never print.',
   '',
-  'output — `agentId`; the state plus the finalized report or, while it runs, the latest lines (`max_chars`; whole pane only with `full: true`). Normally unneeded: the settlement notice carries the words, or names the rows that did not.',
+  'output — `agentId`; the state plus the finalized report or, while it runs, the latest lines (`max_chars`; the whole pane with `full: true`). Normally unneeded: the notice carries the words, or names the rows that did not.',
   '',
-  'reports — `ids` + `max_chars`: the reports a batch notice withheld, from their `piher.rep.<address>` documents, in one call; whole reports only, and the tail counts what did not fit.',
+  'reports — `ids` + `max_chars`: the reports a batch notice withheld, from their `piher.rep.<address>` documents, in one call; whole reports only, the tail counting the rest.',
   '',
-  'send — `agentId` + `message`: steered into a working worker at its next tool gap. A task whose pane is gone revives first, then takes the text. A closed or spent task is refused. `Message sent` means the worker applied it.',
+  'inbox — `since` + `limit`: the settlement facts after `since` (default: the delivered cursor), `limit` per call, each row with its seq. The body is read from `piher.rep.<pane>`, and a swept record still answers.',
   '',
-  'close — `agentId`; reclaims a finished worker: pane and tab go, and the record keeps the decision — close is final for every session, so later calls are refused. A turn in flight is refused — interrupt first. One-shots reclaim automatically; a `worktree` checkout goes too (dirty refused, branch survives). Another session\'s live task closes the same way.',
+  'send — `agentId` + `message`: steered into a working worker at its next tool gap. A task whose pane is gone revives first, then takes the text. A closed or spent task is refused; `Message sent` means it was applied.',
+  '',
+  'close — `agentId`; reclaims a finished worker: pane and tab go, the record keeps the decision, close is final for every session. A turn in flight is refused — interrupt first. One-shots reclaim automatically; a `worktree` checkout goes too (dirty refused, branch survives). Another session\'s task closes the same way.',
   '',
   'retry — `agentId` or `taskId`, no message: re-sends the prompt stored at spawn, after a fault outside the task. A closed or spent task starts a new one with the same brief, role and checkout; no stored prompt names `send`.',
   '',
-  'resume — `taskId`; revives an unfinished task in a new generation, reusing a live pane of the same session, never the master\'s own. A turn in flight is not resumed — use send or output. Closed tasks are refused, as is another session\'s (only its own resumes it); a missing transcript names its path, with `retry` as the way out.',
+  'resume — `taskId`; revives an unfinished task in a new generation, reusing a live pane of the same session, never the master\'s own. A turn in flight is not resumed — use send or output. Closed tasks are refused, as is another session\'s; a missing transcript names its path, with `retry` as the way out.',
 ].join('\n');
 
 const SUBAGENT_CONCURRENCY = 4;
@@ -1406,6 +1408,15 @@ export default function subagentPlugin(ctx: Context): void {
     interrupt: (params, toolCtx) => executeSubagentInterrupt(params, toolCtx),
     output: (params, toolCtx) => executeSubagentOutput(params, toolCtx, outputActionDeps),
     reports: (params) => executeSubagentReports(params, { client }),
+    // E1/E5: the master's own read of its ledger — what it missed when a notice was lost, readable
+    // after a `/reload` and after the record was swept, because the ledger is the source and the
+    // document only carries the body.
+    inbox: (params, toolCtx) => executeSubagentInbox(params, {
+      ledger: ledgerFor((toolCtx as { cwd?: string } | undefined)?.cwd ?? d.getCwd?.() ?? process.cwd()),
+      client,
+      description: (taskId: string) => tasks.get(taskId)?.description ?? '',
+      paneOwner: (pane: string) => panes.get(pane),
+    }),
     close: (params, toolCtx) => executeSubagentClose(params, toolCtx),
     help: async (_params, toolCtx) => {
       const cwd = (toolCtx as { cwd?: string })?.cwd ?? process.cwd();
@@ -1418,7 +1429,7 @@ export default function subagentPlugin(ctx: Context): void {
     label: 'Subagent',
     // B4: the model picks tools from the system prompt's snippet/guideline surface; delegation
     // decisions are made here, so state them rather than hoping for recall.
-    promptSnippet: 'subagent: delegate a self-contained task to a pi worker pane (spawn/send/output/reports/interrupt/resume/list/close/help).',
+    promptSnippet: 'subagent: delegate a self-contained task to a pi worker pane (spawn/send/output/reports/inbox/interrupt/resume/list/close/help).',
     promptGuidelines: [
       'Use subagent for self-contained work whose result is what matters: output that would flood this context, long builds/test runs, or independent parts of a bigger change that can run in parallel.',
       'The worker does not see this conversation: put paths, acceptance criteria, the test command and what to report back into the prompt.',
@@ -1435,6 +1446,7 @@ export default function subagentPlugin(ctx: Context): void {
         Type.Literal('interrupt'),
         Type.Literal('output'),
         Type.Literal('reports'),
+        Type.Literal('inbox'),
         Type.Literal('close'),
         Type.Literal('help'),
       ], { description: 'Default spawn' })),
@@ -1449,6 +1461,8 @@ export default function subagentPlugin(ctx: Context): void {
       agentId: Type.Optional(Type.String({ description: '[send|interrupt|output|close] Slug, pane id, or slug@paneId as printed by spawn/list' })),
       message: Type.Optional(Type.String({ description: '[send] Follow-up message' })),
       ids: Type.Optional(Type.Array(Type.String(), { description: '[reports] Pane ids whose reports to read, as a batch notice printed them' })),
+      since: Type.Optional(Type.Integer({ description: '[inbox] Return the facts after this seq (default: this session\'s delivered cursor; 0 = the whole ledger)' })),
+      limit: Type.Optional(Type.Integer({ description: '[inbox] How many facts one answer may carry (default 50, at most 200); the rest wait for the next call' })),
       max_chars: Type.Optional(Type.Integer({ description: '[output|reports] Output cap (default 6000, 100-16000)' })),
       full: Type.Optional(Type.Boolean({ description: '[output] Return the whole pane buffer instead of the latest lines (default false)' })),
     }),

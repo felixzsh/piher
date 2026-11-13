@@ -88,6 +88,18 @@ the exact call that reads it, and the last line names **one** call for all of th
 `subagent(action:"reports", ids:[…])`. Never spend a turn per worker reading what one call
 returns.
 
+A notice can still be lost without anyone lying: the process restarted between accepting it
+and recording that it was read, a compaction swallowed the boundary, a console scrolled past
+it. The ledger makes that recoverable instead of guessable. `subagent(action:"inbox")`
+returns every settled fact after this session's delivered cursor, in the row format above,
+each row naming its `seq`. `since` asks from an explicit fact (`since: 0` is the whole
+ledger), and `limit` bounds one answer (default 50, at most 200). The cursor crosses only
+what came back, so a second call returns nothing new and a truncated one leaves the rest for
+the next call. It never needs the task record: a swept record still yields its fact, and the
+body is read from `piher.rep.<pane>` — when that document is gone, belongs to another task,
+or the worker ended without words, the row says so instead of passing a pointer off as a
+report.
+
 ## Following up
 
 `retry` takes `agentId` (or `taskId`) and no message: it re-sends the prompt the task was

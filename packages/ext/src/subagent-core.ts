@@ -54,7 +54,7 @@ function tabIdFor(name: string): string {
 export const SUBAGENT_OUTPUT_SCHEMA = Type.Object({
   action: Type.Union([
     Type.Literal('spawn'), Type.Literal('resume'), Type.Literal('list'),
-    Type.Literal('send'), Type.Literal('interrupt'), Type.Literal('output'), Type.Literal('reports'), Type.Literal('close'), Type.Literal('help'),
+    Type.Literal('send'), Type.Literal('interrupt'), Type.Literal('output'), Type.Literal('reports'), Type.Literal('inbox'), Type.Literal('close'), Type.Literal('help'),
   ]),
   paneId: Type.Optional(Type.String()),
   taskId: Type.Optional(Type.String()),

@@ -28,6 +28,10 @@ export function noticeBodyBudgetBytes(env: NodeJS.ProcessEnv = process.env): num
  *  `description` and `outcome` are identity: they are printed for every settlement in the batch.
  *  `body` is the worker's own text, and it is what the budget buys. */
 export interface NoticeRow {
+  /** The ledger fact this row answers for, when the row is not a live settlement: `inbox` prints it
+   *  so a fact can be named by seq. Absent for the live delivery, whose text is unchanged without
+   *  it. */
+  seq?: number;
   /** Pane / agent id — also the address its report document is named after. */
   id: string;
   /** What the worker was asked to do, in the words `list` prints. */
@@ -70,11 +74,14 @@ export function batchReportPointer(ids: readonly string[]): string {
     + `subagent(action:"reports", ids:[${list}])`;
 }
 
-/** How a batch describes one row: identity first, then what the delivery did with its report. */
-function rowHead(row: NoticeRow): string {
+/** How a batch describes one row: identity first, then what the delivery did with its report. A row
+ *  that carries the fact's `seq` names it before the address, so a listed fact is addressable.
+ *  Exported for `inbox`, which renders ledger facts with the very same row a batch would print. */
+export function formatNoticeRow(row: NoticeRow): string {
   const description = row.description === '' ? '(no description)' : row.description;
   const report = row.body === null ? 'no report' : `${Buffer.byteLength(row.body, 'utf8')} B`;
-  return `${row.id} · ${description} · ${row.outcome} · ${report}`;
+  const seq = row.seq === undefined ? '' : `#${row.seq} · `;
+  return `${seq}${row.id} · ${description} · ${row.outcome} · ${report}`;
 }
 
 /** Plan one delivery: empty → null (nothing to send); a batch of one → its own text, byte for byte.
@@ -103,7 +110,7 @@ export function planNoticeBatch(
       blocks.push(notice.content);
       continue;
     }
-    const lines = [rowHead(row)];
+    const lines = [formatNoticeRow(row)];
     if (row.body !== null) {
       const bytes = Buffer.byteLength(row.body, 'utf8');
       if (spent + bytes <= bodyBudget) {
