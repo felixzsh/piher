@@ -260,3 +260,24 @@ the row is already consumed on disk** — a silent, durable lie that `list` repe
 the collapse, which at least says what it withheld. So E1 is not "rows by bytes": it is a durable ledger
 with `deliveredSeq` written only after pi accepts, a cursor that re-delivers after any restart, and
 then the budgeted row delivery on top. The budget without the ledger would make the loss prettier.
+L15. **E1a — the durable ledger, and delivery recorded only after pi accepted**: `0062166` (parent
+`b46e445`), Risk: item 5 (the meaning and write moment of `consumedAt` changed: it now says "the report
+reached the master", not "the notice entered a buffer"), `tsc` clean + `npm test` **576 tests, 570 pass,
+6 skipped, 0 fail** on that SHA, Route: delegated. The ledger is
+`<repo>/.piher/tasks/settlement-<sessionId>.jsonl`: append-only, one writer, one JSON fact per line
+`{seq, at, taskId, pane, turn, kind, group?, payloadRef?}`, `seq` from 1, tolerant of a torn tail. The
+cursor is a separate `<ledger>.jsonl.seq` written tmp+rename, because appending acks would need a kind
+outside the frozen enum and would mix bookkeeping into the facts. The ordering is the whole fix: the fact
+is appended **before** it is announced, and the delivery is recorded **only** after pi accepted the
+message — row `consumedAt` first, then the cursor, because a crash between the two leaves a record the
+replay recognises as its own duplicate, while the reverse would leave a cursor hiding an undelivered
+settlement. `consumedAt` now carries the settlement's own `at`, which makes `(taskId, at)` the
+idempotency key with no extra durable state; `awaitingAccept` keeps a pending notice from being killed
+by the silence budget or re-announced from its own document. Deliberately not stored: the report body —
+the event carries `payloadRef = piher.rep.<pane>` and replay reads the document only when it still names
+exactly this `(taskId, at)`, otherwise the notice says the document is gone and names the `output` call.
+The unit also had to fix four test fixtures whose fakes pushed the text and never claimed pi accepted
+it, i.e. they asserted a delivery they had not made; every assertion they guarded is unchanged. Unproven:
+the live replay after a real `/reload` (proven against a fake host only), and `spawned | booted |
+steered | closed` exist in the format but nothing emits them yet. E1 stays open: durability is done,
+delivery and `inbox` are not.

@@ -10,7 +10,7 @@ test se muda al fichero que posee ese comportamiento y este documento cambia de 
 
 | # | invariante | estado | qué lo mide |
 |---|---|---|---|
-| E1 | todo settlement se anuncia, exactamente una vez, con su identidad | **abierto** | `test/settlement-transport.test.ts` (3 de 10, medido) |
+| E1 | todo settlement se anuncia, exactamente una vez, con su identidad | **abierto** | durabilidad cerrada en `0062166` (ledger + cursor, probado a través de un reinicio); la **entrega** sigue en 3 de 10: `test/settlement-transport.test.ts` |
 | E2 | un worker que hizo su trabajo nunca se reporta como fallo | **cerrado** | `test/integration/subagent-spawn.test.ts`: un hijo que contesta y sale settlea con su informe; el fallo de arranque solo queda cuando no hay documento |
 | E3 | el estado que ves es el del core, nunca una conjetura | **cerrado** | settle = `turn` + documento; `test/subagent-poller.test.ts` |
 | E4 | el informe íntegro es alcanzable sin el pane | **cerrado** | `test/subagent-session.test.ts`; probado en vivo tras `/reload` (L9) |
