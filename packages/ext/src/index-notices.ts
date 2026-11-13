@@ -22,7 +22,15 @@ export function collapseNotices(contents: readonly string[], max = NOTICE_MAX_SH
 }
 
 export interface NoticeBuffer {
-  deliverNotice(content: string, paneId?: string, card?: SettlementCard | null): Promise<void>;
+  /** Hand one notice over. Resolving means the buffer has it — buffered while busy, or handed to pi.
+   *  `onAccepted` fires only when pi actually took the message, which is the only moment a delivery
+   *  may be recorded (a buffered notice is RAM, and RAM does not survive a `/reload`). */
+  deliverNotice(
+    content: string,
+    paneId?: string,
+    card?: SettlementCard | null,
+    onAccepted?: () => void,
+  ): Promise<void>;
   noticePending(): ReadonlySet<string>;
   flush(mode: NoticeSendMode): Promise<void>;
 }
@@ -30,31 +38,51 @@ export interface NoticeBuffer {
 export function createNoticeBuffer(opts: {
   /** True while the agent is in a turn, or after an abort that must not wake a new run. */
   isBusy: () => boolean;
-  /** One collapsed body; the card describes a single settlement and is omitted for a batch. */
-  send: (content: string, mode: NoticeSendMode, card?: SettlementCard) => Promise<void>;
+  /** One collapsed body; the card describes a single settlement and is omitted for a batch. False
+   *  means pi was not given the message (a host with no send method), so nothing may be recorded. */
+  send: (content: string, mode: NoticeSendMode, card?: SettlementCard) => Promise<boolean | void>;
 }): NoticeBuffer {
-  const pending: Array<{ content: string; paneId?: string; card?: SettlementCard }> = [];
+  type PendingNotice = { content: string; paneId?: string; card?: SettlementCard; onAccepted?: () => void };
+  const pending: PendingNotice[] = [];
   const pendingPaneIds = new Set<string>();
   /** A refused send is not a delivered settlement: keep the batch and its panes for the next flush. */
-  const requeue = (notices: readonly { content: string; paneId?: string; card?: SettlementCard }[]): void => {
+  const requeue = (notices: readonly PendingNotice[]): void => {
     pending.unshift(...notices);
   };
+  /** Record the deliveries pi accepted. A callback that throws must not cost the rest of the batch. */
+  const acceptAll = (notices: readonly PendingNotice[]): void => {
+    for (const notice of notices) {
+      try {
+        notice.onAccepted?.();
+      } catch (err) {
+        console.error(`piher: settlement acceptance handler failed: ${(err as Error)?.message ?? err}`);
+      }
+    }
+  };
   return {
-    async deliverNotice(content, paneId, card) {
+    async deliverNotice(content, paneId, card, onAccepted) {
+      const notice: PendingNotice = { content, paneId, ...(card ? { card } : {}), ...(onAccepted ? { onAccepted } : {}) };
       if (content !== '' && paneId !== undefined) pendingPaneIds.add(paneId);
       if (opts.isBusy()) {
-        pending.push({ content, paneId, ...(card ? { card } : {}) });
+        pending.push(notice);
         return;
       }
+      let accepted: boolean | void;
       try {
-        await opts.send(content, 'followUp', card ?? undefined);
+        accepted = await opts.send(content, 'followUp', card ?? undefined);
       } catch (err) {
         // pi drops prompts while the agent is mid-turn; holding the notice keeps it (and keeps its
         // pane GC-exempt) until a flush can deliver it, instead of losing the settlement here.
-        requeue([{ content, paneId, ...(card ? { card } : {}) }]);
+        requeue([notice]);
+        return;
+      }
+      if (accepted === false) {
+        // The host has no way to take a message: nothing was delivered, so nothing is recorded.
+        requeue([notice]);
         return;
       }
       if (content !== '' && paneId !== undefined) pendingPaneIds.delete(paneId);
+      acceptAll([notice]);
     },
     noticePending: () => pendingPaneIds,
     async flush(mode) {
@@ -62,9 +90,14 @@ export function createNoticeBuffer(opts: {
       const flushed = pending.splice(0);
       const collapsed = collapseNotices(flushed.map((n) => n.content));
       if (collapsed) {
+        let accepted: boolean | void;
         try {
-          await opts.send(collapsed, mode, flushed.length === 1 ? flushed[0]!.card : undefined);
+          accepted = await opts.send(collapsed, mode, flushed.length === 1 ? flushed[0]!.card : undefined);
         } catch {
+          requeue(flushed);
+          return;
+        }
+        if (accepted === false) {
           requeue(flushed);
           return;
         }
@@ -74,6 +107,9 @@ export function createNoticeBuffer(opts: {
       for (const { paneId } of flushed) {
         if (paneId !== undefined && !pending.some((n) => n.paneId === paneId)) pendingPaneIds.delete(paneId);
       }
+      // One collapsed message carries every notice in the batch: pi accepted them together. An empty
+      // batch carried nothing, so nobody's delivery is recorded.
+      if (collapsed) acceptAll(flushed);
     },
   };
 }

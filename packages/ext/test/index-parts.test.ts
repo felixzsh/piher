@@ -107,6 +107,40 @@ test('createNoticeBuffer: a batch a refused flush put back is delivered by the n
   assert.equal(buf.noticePending().size, 0);
 });
 
+test('createNoticeBuffer: delivery is recorded only when pi took the message', async () => {
+  // The ledger's one ordering rule lives here: a notice the buffer holds, or a send pi refused, is not
+  // a delivered settlement — so `onAccepted` must not fire for either.
+  let busy = true;
+  let refuse = true;
+  const accepted: string[] = [];
+  const buf = createNoticeBuffer({
+    isBusy: () => busy,
+    send: async () => {
+      if (refuse) throw new Error('pi is mid-turn');
+      return true;
+    },
+  });
+  await buf.deliverNotice('buffered', 'p1', null, () => { accepted.push('buffered'); });
+  assert.deepEqual(accepted, [], 'a notice only the buffer holds accepted nothing');
+
+  await buf.flush('steer'); // refused
+  assert.deepEqual(accepted, [], 'a refused send accepted nothing');
+
+  busy = false;
+  refuse = false;
+  await buf.flush('followUp');
+  assert.deepEqual(accepted, ['buffered'], 'the delivery pi took is the one that is recorded');
+});
+
+test('createNoticeBuffer: a host with no send method records no delivery', async () => {
+  // `sendSettlementNotice` answers false when pi has no way to take a message: requeued, not claimed.
+  const buf = createNoticeBuffer({ isBusy: () => false, send: async () => false });
+  let accepted = 0;
+  await buf.deliverNotice('nowhere to go', 'p1', null, () => { accepted += 1; });
+  assert.equal(accepted, 0, 'nothing reached the master, so nothing is recorded');
+  assert.deepEqual([...buf.noticePending()], ['p1'], 'and the pane stays exempt for the retry');
+});
+
 test('collapseNotices: empty → null; ≤3 verbatim; >3 → first three + count/pointer tail', () => {
   assert.equal(collapseNotices([]), null, 'an empty batch is not injected');
   const three = [5, 6, 7].map((n) => `Background subagent w8:p${n} (task) finished.`);

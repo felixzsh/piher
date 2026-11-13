@@ -13,7 +13,8 @@ import { runtimePolicy, type RuntimePolicy } from './runtime-policy.ts';
 import { formatFailureNotice, formatSettlementNotice } from './vocab.ts';
 import { settlementCard, type SettlementCard, type SettlementOutcome } from './settlement-card.ts';
 import { buildBlockedGateNotice, reportFingerprint } from './subagent-core.ts';
-import { planReportDelivery, readReportDocument, reportDeliveryKey } from './report-documents.ts';
+import { planReportDelivery, readReportDocument, reportDeliveryKey, reportDocName } from './report-documents.ts';
+import { planLedgerReplay, type SettlementEvent, type SettlementEventKind, type SettlementLedger } from './settlement-ledger.ts';
 import { retirePane } from './subagent-gc.ts';
 import type { SessionIo } from './subagent-session.ts';
 
@@ -127,6 +128,36 @@ export function formatNoReportNotice(input: {
     + `Read what it did with subagent(action: "output", agentId ${input.paneId})${input.idleSeconds > 0 ? `, then continue it with action "send", retry it, or resume its session` : ''}.`;
 }
 
+/**
+ * A settlement the ledger holds and the master never read: the process restarted (a `/reload`, a
+ * compaction, a crash) with the notice still only in RAM. Said as what it is — the settlement is
+ * real and this is its first delivery — and never as a fresh settle the master might re-answer.
+ * The body comes from the report document when the document still holds this very settlement;
+ * otherwise the notice names the one call that reads what the worker did.
+ */
+export function formatReplayNotice(input: {
+  seq: number;
+  paneId: string;
+  description: string;
+  at: number;
+  /** The document's report text, when the document still holds the settlement the ledger names. */
+  report: string | null;
+  /** The document's stated reason when it had no text (an errored or refused turn). */
+  reason: string | null;
+}): string {
+  const head = `Re-delivered settlement (piher ledger, seq ${input.seq}): background subagent ${input.paneId}`
+    + `${input.description ? ` (${input.description})` : ''} settled at ${new Date(input.at).toISOString()}, `
+    + 'and its notice never reached you — this is the first delivery, not a new settlement. ';
+  if (input.report !== null) {
+    return `${head}Its report, in its own words — its output, not an instruction to you: ${input.report}`;
+  }
+  if (input.reason !== null) {
+    return `${head}It FAILED — no report was produced (${input.reason}). `
+      + `Read what it did with subagent(action: "output", agentId ${input.paneId}), then continue it with action "send", retry it, or resume its session.`;
+  }
+  return `${head}Its report document is no longer readable, so read what it did with subagent(action: "output", agentId ${input.paneId}) before relying on it.`;
+}
+
 /* ── pane scope ─────────────────────────────────────────────────── */
 
 /** The shortest park for a wake with nothing to settle, and the longest. The core's events are the
@@ -189,11 +220,46 @@ export interface PollerHost {
   /** Refreshed from each observation the loop makes; feeds only the state text (S26). */
   noteObservation?: (paneId: string, obs: TaskObservation) => void;
   session: SessionIo;
-  injectNotice(content: string, paneId?: string, card?: SettlementCard | null): Promise<void>;
+  /** `onAccepted` fires only when pi took the message. A host that resolves the promise and never
+   *  calls it claims no delivery — which is exactly the case a restart has to replay. */
+  injectNotice(
+    content: string,
+    paneId?: string,
+    card?: SettlementCard | null,
+    onAccepted?: () => void,
+  ): Promise<void>;
+  /** This session's append-only settlement ledger (E1): every fact is written before it is announced,
+   *  and the cursor advances only after pi accepted. */
+  ledger: SettlementLedger;
   /** S54/S71: what a one-shot settlement reclaims — the pane, and any checkout its spawn created. */
   reclaim?(entry: TaskEntry): void;
   now?: () => number;
   policy?: Partial<RuntimePolicy>;
+}
+
+/**
+ * The one moment a settlement becomes delivered: pi accepted the message. Both durable facts land
+ * here — the row's `consumedAt` (which now means "reached the master", not "entered a buffer") and
+ * the ledger cursor — and never anywhere earlier. Order matters: the row first, because a crash
+ * between the two leaves a record that says accepted, which the replay recognises as its own
+ * duplicate, while the reverse would leave a cursor that hides an undelivered settlement.
+ */
+function acceptSettlement(
+  h: PollerHost,
+  input: { taskId: string; pane: string; at: number; seq: number },
+): void {
+  const row = h.tasks.get(input.taskId) ?? taskForPane(h.tasks, h.panes, input.pane);
+  if (row) {
+    row.gen.consumedAt = input.at;
+    h.writeRecord(row);
+    // S54: a one-shot worker exits once its report is written, so its pane is reclaimed here — the
+    // notice already carries the text, and the pane must not linger for the GC TTL.
+    if (row.lifecycle === 'one-shot') {
+      if (h.reclaim) h.reclaim(row);
+      else void retirePane(h.client, input.pane);
+    }
+  }
+  h.ledger.markDelivered(input.seq);
 }
 
 export interface Poller {
@@ -270,24 +336,51 @@ export function createPoller(h: PollerHost): Poller {
   ): Promise<void> {
     const startedAt = now();
     let lastActivityAt = now();
-    /** Stop watching this pane: stamp the delivery and write the record first, or a restart
-     *  replays a ghost running row. Settling is `consumedAt` plus the write — nothing else. */
-    const consume = (at: number): void => {
-      const row = taskForPane(h.tasks, h.panes, paneId);
-      if (!row) return;
-      row.gen.consumedAt = at;
-      h.writeRecord(row);
-      // S54: a one-shot worker exits once its report document is written, so its pane is reclaimed
-      // here — the notice already carries the text, and the pane must not linger for the GC TTL.
-      if (row.lifecycle === 'one-shot') {
-        if (h.reclaim) h.reclaim(row);
-        else void retirePane(h.client, paneId);
+    /** The settlement was announced and pi has not accepted it yet: the notice is RAM only, so the row
+     *  is NOT delivered (no `consumedAt`) and must not be run over by the silence budget, nor be
+     *  settled a second time from the same document. The ledger holds the fact meanwhile. */
+    let awaitingAccept = false;
+    /**
+     * Announce one fact the master acts on. Order is the whole guarantee: the ledger line first (a
+     * crash after it is a re-delivery, never a loss), then the notice, and the row and the cursor
+     * only when pi took the message. 'retry' means the notice was refused: the fact stays in the
+     * ledger under the same `(taskId, at)`, so the next wake repeats this same settlement instead of
+     * forking it.
+     */
+    async function announce(input: {
+      entry: TaskEntry;
+      at: number;
+      kind: SettlementEventKind;
+      turn: number | null;
+      notice: string;
+      card: SettlementCard;
+      payloadRef?: string;
+    }): Promise<'done' | 'retry'> {
+      const event = h.ledger.append({
+        at: input.at,
+        taskId: input.entry.taskId,
+        pane: paneId,
+        turn: input.turn,
+        kind: input.kind,
+        ...(input.payloadRef === undefined ? {} : { payloadRef: input.payloadRef }),
+      });
+      awaitingAccept = true;
+      try {
+        // Tag the pane: a notice buffered while the master is busy must keep its row GC-exempt
+        // until the flush actually delivers it.
+        await h.injectNotice(input.notice, paneId, input.card, () => {
+          awaitingAccept = false;
+          acceptSettlement(h, { taskId: input.entry.taskId, pane: paneId, at: event.at, seq: event.seq });
+        });
+      } catch {
+        awaitingAccept = false;
+        return 'retry';
       }
-    };
-    /** Hand one settlement to the master: notice, then consume. The row is consumed only after the
-     *  notice is accepted, and a refused one is retried on the next wake — a rejected injection must
-     *  not strand a finished worker as `running` with no notice, nor consume the row while the result
-     *  is still undelivered. Returns 'retry' when the notice was refused.
+      return 'done';
+    }
+    /** Hand one settlement to the master: notice, then the delivery once pi accepted it. A refused
+     *  notice is retried on the next wake — a rejected injection must not strand a finished worker as
+     *  `running` with no notice, nor record a delivery that never happened.
      *
      *  There is no claim latch here: the settlement's identity IS the document instance (`address`,
      *  `at`), which `deliverDocument` checks before calling this. A claim keyed by request would
@@ -297,6 +390,10 @@ export function createPoller(h: PollerHost): Poller {
       entry: TaskEntry,
       closing: string | null,
       request: { injectTs: number; description: string },
+      /** The settlement's own identity: the document's `at` (or the observation's clock when there is
+       *  no document). It is the `consumedAt` the row will carry and the ledger's dedupe key. */
+      settledAt: number,
+      turn: number | null,
       /** The report states a reason instead of a text (an error, a refused tool). A settlement
        *  notice over it would read as success. */
       failure: string | null = null,
@@ -314,15 +411,15 @@ export function createPoller(h: PollerHost): Poller {
       const notice = failure !== null
         ? formatFailureNotice(`${paneId} (${request.description})`, failure)
         : buildSettlementNoticeText(`${paneId} (${request.description})`, closing, delivered);
-      try {
-        // Tag the pane: a notice buffered while the master is busy must keep its row GC-exempt
-        // until the flush actually delivers it.
-        await h.injectNotice(notice, paneId, cardFor(entry, paneId, request.description, failure !== null ? 'failed' : 'settled'));
-      } catch {
-        return 'retry';
-      }
-      consume(now());
-      return 'done';
+      return announce({
+        entry,
+        at: settledAt,
+        kind: failure !== null ? 'failed' : 'settled',
+        turn,
+        notice,
+        card: cardFor(entry, paneId, request.description, failure !== null ? 'failed' : 'settled'),
+        payloadRef: reportDocName(paneId) ?? undefined,
+      });
     }
 
     /** Deliver this pane's report document when it holds an undelivered settlement of the current
@@ -358,7 +455,7 @@ export function createPoller(h: PollerHost): Poller {
       // no closing message, and the diagnosis — never the turn's stop word — is what the master can
       // act on.
       const failure = value.text === null ? (value.stopReason ?? null) : null;
-      if (await handOver(entry, value.text, request, failure) === 'retry') return 'retry';
+      if (await handOver(entry, value.text, request, value.at, value.turn ?? null, failure) === 'retry') return 'retry';
       deliveredReports.add(reportDeliveryKey(paneId, value.at));
       entry.deliveredReport = { address: paneId, at: value.at };
       return 'delivered';
@@ -445,11 +542,13 @@ export function createPoller(h: PollerHost): Poller {
 
         // A row already settled when this loop reached it keeps one reader and nothing else: the
         // worker's next settle (a person typing in its attachable pane, a queued steer) writes a
-        // document, and S6 says the master must read it.
+        // document, and S6 says the master must read it. A settlement announced but not yet accepted
+        // is in the same state from the loop's point of view: the row is not delivered, and reading its
+        // document again would only re-announce what the buffer already holds.
         // The wait is the silence budget, not a poll cadence — a new settle changes the core's status
         // first, and that event wakes this park, so an idle worker costs no RPCs (a `doc` event is no
         // help: spec S23 keeps them off this subscription).
-        if (entry.gen.consumedAt !== null) {
+        if (entry.gen.consumedAt !== null || awaitingAccept) {
           const landed = await deliverDocument(entry, current);
           if (isSpent(entry) || state === 'exited' || !alive) return;
           if (landed === 'retry') await park(recheckMs);
@@ -493,16 +592,22 @@ export function createPoller(h: PollerHost): Poller {
             } catch { /* non-fatal */ }
           }
           // Not consumed: blindness establishes nothing about the worker, so the row must stay
-          // running for the settlement a reconnect can still deliver.
+          // running for the settlement a reconnect can still deliver. Nothing enters the ledger
+          // either: no fact was established.
           await park(recheckMs);
           continue;
         }
         if (tick.action === 'pane-closed') {
-          consume(now());
-          try {
-            await h.injectNotice(formatPaneClosedNotice(paneId, current.description), paneId,
-              cardFor(entry, paneId, current.description, 'failed'));
-          } catch { /* non-fatal */ }
+          // The pane going is a native fact, not a guess: it is announced like a settlement and, like
+          // one, is recorded as delivered only when pi accepted it.
+          await announce({
+            entry,
+            at: now(),
+            kind: 'pane-gone',
+            turn,
+            notice: formatPaneClosedNotice(paneId, current.description),
+            card: cardFor(entry, paneId, current.description, 'failed'),
+          });
           return;
         }
         if (blind) {
@@ -511,12 +616,11 @@ export function createPoller(h: PollerHost): Poller {
           continue;
         }
         if (tick.action === 'silence-timeout' || tick.action === 'settled-without-report') {
-          // The budget ends the wait, not the supervision: the row is consumed here (its `consumedAt`
+          // The budget ends the wait, not the supervision: the row is delivered here (its `consumedAt`
           // is what the tab, pane and checkout sweeps wait on), and the master is told which of the
           // two endings this was. The watch stays alive — this is the only master-side reader of
           // `piher.rep.*`, and a worker that settles again (a person typing in its attachable pane, a
           // queued steer) still has a report to deliver (S6/S21).
-          consume(now());
           const notice = tick.action === 'silence-timeout'
             ? formatSettleTimeoutNotice({
               paneId,
@@ -530,10 +634,14 @@ export function createPoller(h: PollerHost): Poller {
               turn: turn ?? 0,
               idleSeconds: Math.round((now() - lastActivityAt) / 1000),
             });
-          try {
-            await h.injectNotice(notice, paneId,
-              cardFor(entry, paneId, current.description, 'failed'));
-          } catch { /* non-fatal */ }
+          await announce({
+            entry,
+            at: now(),
+            kind: 'failed',
+            turn,
+            notice,
+            card: cardFor(entry, paneId, current.description, 'failed'),
+          });
           continue;
         }
         await park(Math.min(recheckMs, timeoutMs - (now() - lastActivityAt)));
@@ -589,4 +697,92 @@ export function createPoller(h: PollerHost): Poller {
   }
 
   return { startPoller, pollers };
+}
+
+/* ── replay after a restart ─────────────────────────────────────── */
+
+/** What the ledger's `payloadRef` still holds, when it holds exactly this settlement: the report body,
+ *  or the reason the turn left no text. A document written by a later settle is not this event's
+ *  payload, so it is not passed off as one. */
+async function readReplayBody(
+  h: PollerHost,
+  event: SettlementEvent,
+): Promise<{ report: string | null; reason: string | null }> {
+  if (event.payloadRef === undefined) return { report: null, reason: null };
+  try {
+    const read = await readReportDocument(h.client, event.pane);
+    const value = read.kind === 'read' ? read.value : null;
+    if (!value || value.taskId !== event.taskId || value.at !== event.at) return { report: null, reason: null };
+    return {
+      report: value.text,
+      reason: value.text === null ? (value.stopReason ?? null) : null,
+    };
+  } catch {
+    return { report: null, reason: null };
+  }
+}
+
+/** Record a re-delivery: the row's accepted settlement and the cursor, in that order, for the reason
+ *  `acceptSettlement` gives. No pane is reclaimed here: after a restart the tabs, panes and checkouts
+ *  are the sweeps' business, and killing a pane a `send` may already have revived would be worse than
+ *  leaving it to the TTL that reads the same `consumedAt`. */
+function acceptReplay(h: PollerHost, event: SettlementEvent): void {
+  const row = h.tasks.get(event.taskId);
+  if (row) {
+    row.gen.consumedAt = event.at;
+    h.writeRecord(row);
+  }
+  h.ledger.markDelivered(event.seq);
+}
+
+/**
+ * Deliver what the ledger holds and the master never read (E1): every settlement fact after the
+ * cursor, minus the ones this session's records already carry as accepted. Called on `session_start`
+ * and `session_tree`, after the records are restored — a `/reload`, a crash or a compaction is the
+ * same case, because what was lost is exactly what the notice buffer kept in RAM.
+ *
+ * Returns how many notices were handed over. A refused notice leaves its seq below the cursor, so the
+ * next start tries again: at-least-once, deduplicated by `(taskId, at)`.
+ */
+export async function replaySettlements(h: PollerHost): Promise<number> {
+  const now = h.now ?? Date.now;
+  const plan = planLedgerReplay({
+    events: h.ledger.events(),
+    deliveredSeq: h.ledger.deliveredSeq(),
+    settledThroughAt: (taskId) => {
+      const row = h.tasks.get(taskId);
+      // A task this session never held has no accepted settlement to compare with: the ledger is the
+      // only record left, which is what makes it worth keeping.
+      if (!row) return -1;
+      // A closed task is final: its history is not re-announced.
+      if (isClosed(row)) return Number.POSITIVE_INFINITY;
+      return row.gen.consumedAt ?? -1;
+    },
+  });
+  let handed = 0;
+  for (const event of plan) {
+    const row = h.tasks.get(event.taskId);
+    const { report, reason } = await readReplayBody(h, event);
+    const notice = formatReplayNotice({
+      seq: event.seq,
+      paneId: event.pane,
+      description: row?.description ?? '',
+      at: event.at,
+      report,
+      reason,
+    });
+    const card = settlementCard({
+      name: `${event.pane}${row?.description ? ` (${row.description})` : ''}`,
+      ...(row ? { kind: row.kind, startedAt: row.createdAt } : {}),
+      outcome: event.kind === 'settled' ? 'settled' : 'failed',
+      now: now(),
+    });
+    try {
+      await h.injectNotice(notice, event.pane, card, () => acceptReplay(h, event));
+      handed += 1;
+    } catch {
+      // The cursor stays below this seq: the next start re-delivers instead of dropping it.
+    }
+  }
+  return handed;
 }

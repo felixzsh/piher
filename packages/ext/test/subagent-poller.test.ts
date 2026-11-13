@@ -13,6 +13,7 @@ import type { SettlementCard } from '../src/settlement-card.ts';
 import { fakeWatch, taskRow, terminalInfo, type TaskSeed } from './test-utils.ts';
 import type { CoreClientLike, CoreStatus } from '../src/core-client.ts';
 import { CoreError } from '../src/core-client.ts';
+import { openSettlementLedger } from '../src/settlement-ledger.ts';
 import type { SessionIo } from '../src/subagent-session.ts';
 
 /* ── planners ───────────────────────────────────────────────────── */
@@ -175,7 +176,16 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
     // One record write per mutation — what a restarting process reads back.
     writeRecord: (e) => { writes.push({ entry: { ...e, gen: { ...e.gen } } }); },
     session,
-    injectNotice: async (content, _paneId, card) => { notices.push(content); cards.push(card ?? null); },
+    // A settlement fact lives in the ledger before it is announced; in-memory here, because the
+    // durability itself is pinned in `settlement-ledger.test.ts`.
+    ledger: openSettlementLedger({ file: null }),
+    // The host says when pi took the notice: resolving means "the buffer has it", `onAccepted`
+    // means "the master read it", and only the second one records a delivery.
+    injectNotice: async (content, _paneId, card, onAccepted) => {
+      notices.push(content);
+      cards.push(card ?? null);
+      onAccepted?.();
+    },
     now: () => virtual.now,
     policy: { subagentTimeoutMs: 10_000 },
   };
@@ -338,12 +348,13 @@ test('pollLoop: a refused notice leaves the row running and retries the settleme
   const f = fixture(makeEntry('p-refused'));
   let attempts = 0;
   let rowAtFirstAttempt: { consumed: boolean; writes: number } | null = null;
-  f.host.injectNotice = async (content) => {
+  f.host.injectNotice = async (content, _paneId, _card, onAccepted) => {
     if (attempts++ === 0) {
       rowAtFirstAttempt = { consumed: f.entry!.gen.consumedAt !== null, writes: f.writes.length };
       throw new Error('pi is mid-turn');
     }
     f.notices.push(content);
+    onAccepted?.(); // the retry is what pi accepted
   };
   docSettle(f, 'p-refused', reportDoc('task-1', 'done'));
   await start(f);

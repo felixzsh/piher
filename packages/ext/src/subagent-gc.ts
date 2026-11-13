@@ -109,7 +109,12 @@ interface GcHost {
   /** The app's window on a checkout. Closing it ends the terminals inside, so only an empty one goes. */
   checkoutSpace?: CheckoutSpace;
   /** Settlement notice injector: buffers while the master is busy, flushes at turn_end. */
-  deliverNotice?: (content: string, paneId?: string, card?: SettlementCard | null) => Promise<void>;
+  deliverNotice?: (
+    content: string,
+    paneId?: string,
+    card?: SettlementCard | null,
+    onAccepted?: () => void,
+  ) => Promise<void>;
 }
 
 interface GcController {

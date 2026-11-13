@@ -184,7 +184,11 @@ async function checkoutPass(tasks: TaskEntry[], passes = 1): Promise<{
     },
     deps: {
       checkoutSpace: { close: async (id: string) => { closed.push(id); return null; } },
-      deliverNotice: async (content: string) => { notices.push(content); },
+      // Pushing the text IS the master reading it, so the fake says pi accepted the message.
+      deliverNotice: async (content: string, _paneId?: string, _card?: unknown, onAccepted?: () => void) => {
+        notices.push(content);
+        onAccepted?.();
+      },
     },
     tasks,
   });

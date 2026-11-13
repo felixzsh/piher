@@ -1272,7 +1272,12 @@ test('session recovery: a still-running subagent gets its settlement watch re-ar
       getSessionId: () => 'bbbb2222-3333-4444-8555-666666666666',
       getSessionFile: () => viewFile,
       getCwd: () => cwd,
-      deliverNotice: async (content: string) => { notices.push(content); },
+      // Reaching the `notices` list is the master reading it: the fake reports pi's acceptance, and
+      // only acceptance may write `consumedAt`.
+      deliverNotice: async (content: string, _paneId?: string, _card?: unknown, onAccepted?: () => void) => {
+        notices.push(content);
+        onAccepted?.();
+      },
     },
   });
   try {
@@ -1316,7 +1321,10 @@ test('session recovery: a watch that could not arm is not announced as re-armed'
       getSessionId: () => '',
       getSessionFile: () => viewFile,
       getCwd: () => cwd,
-      deliverNotice: async (content: string) => { notices.push(content); },
+      deliverNotice: async (content: string, _paneId?: string, _card?: unknown, onAccepted?: () => void) => {
+        notices.push(content);
+        onAccepted?.();
+      },
     },
   });
   try {

@@ -72,7 +72,8 @@ import {
   type CheckoutIo,
   type CheckoutSpace,
 } from '../worktree.ts';
-import { createPoller } from '../subagent-poller.ts';
+import { createPoller, replaySettlements, type PollerHost } from '../subagent-poller.ts';
+import { openSettlementLedger, settlementLedgerPath, type SettlementLedger } from '../settlement-ledger.ts';
 import { awaitCommandPickup, commandDocumentOverflow, steerCommand, writeCommandDocument, type CommandPickup } from '../command-documents.ts';
 import { MAX_DOCUMENT_BYTES, commandDocName, readReportDocument, type ReportDocumentRead } from '../report-documents.ts';
 import { createGcController, restoreTasks, retirePane, seedForkView } from '../subagent-gc.ts';
@@ -96,8 +97,14 @@ export interface SubagentDeps {
   getCwd?: () => string;
   /** Test seam: tasks the session starts out holding, as a restore would have seeded them. */
   initialTasks?: TaskEntry[];
-  /** Settlement notice injector from index: buffer while busy, flush at turn_end. */
-  deliverNotice?: (content: string, paneId?: string, card?: SettlementCard | null) => Promise<void>;
+  /** Settlement notice injector from index: buffer while busy, flush at turn_end. `onAccepted` fires
+   *  only when pi took the message — the one moment a settlement may be recorded as delivered. */
+  deliverNotice?: (
+    content: string,
+    paneId?: string,
+    card?: SettlementCard | null,
+    onAccepted?: () => void,
+  ) => Promise<void>;
   /** Panes whose settlement notice is still buffered (GC exemption). */
   noticePending?: () => ReadonlySet<string>;
   /** Pane-owning plugins (background jobs) are exempt from subagent panes collection. */
@@ -331,6 +338,22 @@ export default function subagentPlugin(ctx: Context): void {
   /** Pane id → its in-flight boot (readiness, first task); a follow-up waits for it. */
   const boots = new Map<string, Promise<void>>();
 
+  /**
+   * The session's settlement ledger (E1): one append-only file beside the task records it explains,
+   * opened at mount from the session's checkout and re-pointed when a start or a checkpoint names a
+   * different repository. Without a repository there is nowhere durable to write, so it stays in
+   * memory and the session behaves exactly as it did before the ledger.
+   */
+  const ledger = openSettlementLedger({
+    file: settlementLedgerPath(d.getCwd?.() ?? process.cwd(), d.getSessionId()),
+  });
+  /** Point the ledger at the repository the session actually restored in (a checkpoint may have
+   *  moved it). No file means no repository: the facts then live in this process only. */
+  function ledgerFor(cwd: string): SettlementLedger {
+    ledger.repoint(settlementLedgerPath(cwd, d.getSessionId()));
+    return ledger;
+  }
+
   /** Write one task record: the task, its current generation and its decision. */
   function writeRecord(entry: TaskEntry): void {
     writeTaskRecord(entry.cwd, entry);
@@ -452,9 +475,15 @@ export default function subagentPlugin(ctx: Context): void {
     if (port.current === boundPort) port.current = null;
   }, 'subagent-port');
 
-  const injectNotice = (content: string, paneId?: string, card?: SettlementCard | null): Promise<void> => {
-    if (d.deliverNotice) return d.deliverNotice(content, paneId, card);
+  const injectNotice = (
+    content: string,
+    paneId?: string,
+    card?: SettlementCard | null,
+    onAccepted?: () => void,
+  ): Promise<void> => {
+    if (d.deliverNotice) return d.deliverNotice(content, paneId, card, onAccepted);
     pi.sendUserMessage?.(content, { deliverAs: 'followUp' });
+    onAccepted?.();
     return Promise.resolve();
   };
 
@@ -465,12 +494,13 @@ export default function subagentPlugin(ctx: Context): void {
     getTaskIdForPane: (paneId: string) => panes.get(paneId) ?? null,
   });
   const spawn = createSpawner({ client, env, runtime, git, readinessTimeoutMs: d.policy?.readinessTimeoutMs });
-  const poller = createPoller({
+  const pollerHost: PollerHost = {
     client,
     sessionRoot,
     tasks,
     panes,
     writeRecord,
+    ledger,
     noteObservation: (paneId, obs) => {
       const taskId = panes.get(paneId);
       if (taskId) noteObservation(taskId, obs);
@@ -479,7 +509,8 @@ export default function subagentPlugin(ctx: Context): void {
     injectNotice,
     reclaim,
     policy: d.policy,
-  });
+  };
+  const poller = createPoller(pollerHost);
   const { startPoller, pollers } = poller;
   const gc = createGcController({
     client,
@@ -530,6 +561,22 @@ export default function subagentPlugin(ctx: Context): void {
     }
   }
 
+  /**
+   * E1: deliver what the ledger holds and the master never read, before anything else about this
+   * start is announced. A `/reload`, a crash and a compaction are one case: what was lost is exactly
+   * what the notice buffer kept in RAM, and the ledger is the list of it. Re-delivery is
+   * at-least-once and idempotent by `(taskId, at)` — a settlement this session's record already
+   * carries as accepted is not shown twice.
+   */
+  async function replaySettlementLedger(cwd: string | undefined): Promise<void> {
+    ledgerFor(cwd ?? d.getCwd?.() ?? process.cwd());
+    try {
+      await replaySettlements(pollerHost);
+    } catch (err) {
+      console.error(`piher: settlement replay failed: ${(err as Error)?.message ?? err}`);
+    }
+  }
+
   scoped.on('session_start', async (event: unknown, eventCtx: unknown) => {
     // The reason is core's own word for it (`startup`, `reload`, `new`, `resume`, `fork`): a fork is
     // the only one that lands on a session file with no state of its own, so it inherits the parent's
@@ -541,11 +588,13 @@ export default function subagentPlugin(ctx: Context): void {
     // configured override, else the process checkout.
     const ctxCwd = (eventCtx as { cwd?: string } | undefined)?.cwd;
     restoreTasks(board, typeof ctxCwd === 'string' ? ctxCwd : undefined);
+    await replaySettlementLedger(typeof ctxCwd === 'string' ? ctxCwd : undefined);
     await recoverRunningPollers('session_start');
   });
   scoped.on('session_tree', async (_event: unknown, eventCtx: unknown) => {
     const ctxCwd = (eventCtx as { cwd?: string } | undefined)?.cwd;
     restoreTasks(board, typeof ctxCwd === 'string' ? ctxCwd : undefined);
+    await replaySettlementLedger(typeof ctxCwd === 'string' ? ctxCwd : undefined);
     await recoverRunningPollers('session_tree');
   });
 

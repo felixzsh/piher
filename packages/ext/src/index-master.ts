@@ -18,7 +18,14 @@ export interface MasterPluginMount {
   env: CoreEnv | null;
   extPath: string;
   port: SubagentPortBox;
-  deliverNotice: (content: string, paneId?: string, card?: SettlementCard | null) => Promise<void>;
+  /** `onAccepted` fires only when pi took the message: the one moment a settlement may be recorded as
+   *  delivered (a buffered notice is RAM, and a restarted process has to re-deliver it). */
+  deliverNotice: (
+    content: string,
+    paneId?: string,
+    card?: SettlementCard | null,
+    onAccepted?: () => void,
+  ) => Promise<void>;
   noticePending: () => ReadonlySet<string>;
   getSessionId: () => string;
   /** This session's transcript path; the subagent registry is stored beside it. */

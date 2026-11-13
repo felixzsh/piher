@@ -63,9 +63,10 @@ export interface SettlementMessageApi {
 
 /**
  * Deliver one settlement notice. Custom message first (card rendered, content untouched), then the
- * plain notice when the host has no custom messages or the renderer could not be registered; a
- * synchronous throw from either path propagates so the caller can retry instead of losing the
- * settlement.
+ * plain notice when the host has no custom messages or the renderer could not be registered. The
+ * answer says whether pi was given the message at all: `false` means the host has no send method, so
+ * nothing may be recorded as delivered. A synchronous throw propagates so the caller can retry
+ * instead of losing the settlement.
  */
 export async function sendSettlementNotice(
   api: SettlementMessageApi,
@@ -77,7 +78,7 @@ export async function sendSettlementNotice(
     /** False when no `registerMessageRenderer` exists, so a card would render as raw JSON. */
     cardsRendered: boolean;
   },
-): Promise<void> {
+): Promise<boolean> {
   const opts = { deliverAs: input.mode, triggerTurn: true };
   if (input.cardsRendered && typeof api.sendMessage === 'function') {
     try {
@@ -87,10 +88,12 @@ export async function sendSettlementNotice(
         display: true,
         ...(input.card ? { details: input.card } : {}),
       }, opts);
-      return;
+      return true;
     } catch {
       /* Older host or a rejected custom message: the plain notice below is the delivery. */
     }
   }
-  api.sendUserMessage?.(input.content, opts);
+  if (typeof api.sendUserMessage !== 'function') return false;
+  api.sendUserMessage(input.content, opts);
+  return true;
 }
