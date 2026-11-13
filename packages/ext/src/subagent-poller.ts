@@ -33,9 +33,10 @@ export function planBlockedGate(state: WaitState, alreadyNotified: boolean): Blo
 }
 
 export type SilenceTickPlan = {
-  /** The worker said nothing to act on (working, or the watch is blind): this tick is a heartbeat. */
+  /** The worker said it is working: this tick is a heartbeat. A blind watch is never one — it says
+   *  nothing about the worker, so counting it as activity would hold the budget open forever. */
   refreshActivity: boolean;
-  action: 'pane-closed' | 'silence-timeout' | 'settled-without-report' | 'continue';
+  action: 'pane-closed' | 'watch-blind' | 'silence-timeout' | 'settled-without-report' | 'continue';
 };
 
 /**
@@ -49,6 +50,9 @@ export type SilenceTickPlan = {
  */
 export function planSilenceTick(input: {
   waitState: WaitState;
+  /** The watch is disconnected or the core would not answer: `waitState` is null because nothing
+   *  was observed, not because the worker is busy. */
+  blind: boolean;
   paneAlive: boolean;
   now: number;
   lastActivityAt: number;
@@ -56,10 +60,11 @@ export function planSilenceTick(input: {
   /** The core's turn counter for this terminal, or null when the watch cannot say. */
   turn: number | null;
 }): SilenceTickPlan {
-  const refreshActivity = input.waitState === null;
+  const refreshActivity = input.waitState === null && !input.blind;
   const lastActivityAt = refreshActivity ? input.now : input.lastActivityAt;
   if (!input.paneAlive) return { refreshActivity, action: 'pane-closed' };
   if (input.now - lastActivityAt > input.timeoutMs) {
+    if (input.blind) return { refreshActivity, action: 'watch-blind' };
     return { refreshActivity, action: (input.turn ?? 0) >= 1 ? 'settled-without-report' : 'silence-timeout' };
   }
   return { refreshActivity, action: 'continue' };
@@ -84,6 +89,27 @@ export function formatSettleTimeoutNotice(input: {
   startedAtIso: string;
 }): string {
   return `Background subagent ${input.paneId} (${input.description}) has shown no progress for ${input.idleSeconds}s (observed since ${input.startedAtIso}). Run subagent(action: "list") to check its live state; if it is working, let it run — its settlement notice will arrive automatically. Do not sleep-wait.`;
+}
+
+/** The budget's third ending: the watch is blind, so nothing about the worker was observed at all.
+ *  Calling that "no progress" would blame the worker for the master's own blindness. */
+export function formatBlindWatchNotice(input: {
+  paneId: string;
+  description: string;
+  blindSeconds: number;
+  startedAtIso: string;
+}): string {
+  return `Background subagent ${input.paneId} (${input.description}) has been watched blindly for ${input.blindSeconds}s (observed since ${input.startedAtIso}): its settlement watch is blind because the core did not answer, so neither its state nor its report can be read — this is NOT the task's result and says nothing about its progress. Run subagent(action: "list") to check the core; a settlement arrives on its own once the watch reconnects, and action "output" reads its pane or the report document it left.`;
+}
+
+/** A spawn whose settlement watch could not arm: the worker runs, but no notice will ever arrive for
+ *  it by itself. Said now, while the master can still choose to watch it by hand. */
+export function formatWatchNotArmedNotice(input: {
+  paneId: string;
+  taskId: string;
+  description: string;
+}): string {
+  return `Background subagent ${input.paneId} (${input.description}, task ${input.taskId}) is running, but its settlement watch could not be armed: no notice will arrive by itself when it settles, so this is the last automatic word about it. Watch it by hand with subagent(action: "list") and action "output" (agentId ${input.paneId}), then close it with action "close" when it is done.`;
 }
 
 /** The other ending of the silence budget: the core says a turn ran, and no report document reached
@@ -212,19 +238,24 @@ export function createPoller(h: PollerHost): Poller {
     alive: boolean;
     /** The core's turn counter: a settle happened iff it moved above zero (spec S2, S5). */
     turn: number | null;
+    /** The core did not answer: this observation establishes nothing, not even that it is working. */
+    blind: boolean;
   }> {
-    if (!watch.connected) return { state: null, alive: true, turn: null };
+    if (!watch.connected) return { state: null, alive: true, turn: null, blind: true };
     let info: TerminalInfo | null | undefined = watch.get(paneId);
     if (!info) {
       // Not in the snapshot: a fresh spawn racing its `created` event, or a terminal that is gone.
       try {
         info = await h.client.getTerminal(paneId);
       } catch {
-        return { state: null, alive: true, turn: null }; // an unreachable socket must not be read as a dead terminal
+        // An unreachable socket must not be read as a dead terminal — and it is blindness, not work.
+        return { state: null, alive: true, turn: null, blind: true };
       }
     }
-    if (!info || info.state === 'finished') return { state: 'exited', alive: false, turn: info?.turn ?? null };
-    return { state: info.status, alive: true, turn: info.turn ?? null };
+    if (!info || info.state === 'finished') {
+      return { state: 'exited', alive: false, turn: info?.turn ?? null, blind: false };
+    }
+    return { state: info.status, alive: true, turn: info.turn ?? null, blind: false };
   }
 
   async function pollLoop(
@@ -338,6 +369,9 @@ export function createPoller(h: PollerHost): Poller {
      *  worker (idle, blocked on a person) must not cost a wake a second. */
     let recheckMs = MIN_RECHECK_PARK_MS;
     let lastStamp: string | null = null;
+    /** One blindness notice per episode: a watch that stays disconnected must not speak on every
+     *  budget tick, and a reconnected one that goes blind again is news again. */
+    let blindNotified = false;
     /** Whether the row was already settled when this watch was armed. Such a watch was armed for
      *  nothing and ends at once. A row settled WHILE the loop runs does not end it: that worker's next
      *  settle (a person typing in its pane, a queued steer) writes a document, and S6 says the master
@@ -367,7 +401,7 @@ export function createPoller(h: PollerHost): Poller {
           const woke = await watch.changed(paneId, seen, Math.max(0, ms));
           return woke;
         };
-        const { state, alive, turn } = await observe(paneId);
+        const { state, alive, turn, blind } = await observe(paneId);
         // Back off only while the worker says nothing new: any change is news and resets the park.
         const stamp = `${state ?? '-'}:${turn ?? '-'}`;
         if (stamp === lastStamp) recheckMs = Math.min(MAX_RECHECK_PARK_MS, recheckMs * 2);
@@ -437,8 +471,28 @@ export function createPoller(h: PollerHost): Poller {
           // THIS request, so the silence budget below owns the wait.
         }
 
-        const tick = planSilenceTick({ waitState, paneAlive: alive, now: now(), lastActivityAt, timeoutMs, turn });
+        // A blind watch is never a heartbeat, so the budget can expire under it — and the notice
+        // below says blindness, not silence. One notice per blind episode, as with the blocked gate.
+        if (!blind) blindNotified = false;
+        const tick = planSilenceTick({ waitState, blind, paneAlive: alive, now: now(), lastActivityAt, timeoutMs, turn });
         if (tick.refreshActivity) lastActivityAt = now();
+        if (tick.action === 'watch-blind') {
+          if (!blindNotified) {
+            blindNotified = true;
+            try {
+              await h.injectNotice(formatBlindWatchNotice({
+                paneId,
+                description: current.description,
+                blindSeconds: Math.round((now() - lastActivityAt) / 1000),
+                startedAtIso: new Date(startedAt).toISOString(),
+              }), paneId, cardFor(entry, paneId, current.description, 'failed'));
+            } catch { /* non-fatal */ }
+          }
+          // Not consumed: blindness establishes nothing about the worker, so the row must stay
+          // running for the settlement a reconnect can still deliver.
+          await park(recheckMs);
+          continue;
+        }
         if (tick.action === 'pane-closed') {
           consume(now());
           try {
@@ -446,6 +500,11 @@ export function createPoller(h: PollerHost): Poller {
               cardFor(entry, paneId, current.description, 'failed'));
           } catch { /* non-fatal */ }
           return;
+        }
+        if (blind) {
+          // Already reported once; keep watching at the retry cadence so a reconnect is noticed.
+          await park(recheckMs);
+          continue;
         }
         if (tick.action === 'silence-timeout' || tick.action === 'settled-without-report') {
           // The budget ends the wait, not the supervision: the row is consumed here (its `consumedAt`

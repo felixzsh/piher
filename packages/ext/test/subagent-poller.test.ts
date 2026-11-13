@@ -5,7 +5,8 @@ import assert from 'node:assert/strict';
 import { Context } from '@deepseek-ai/cordis';
 import {
   buildSettlementNoticeText, createPoller, createSessionRoot, disposeSessionRoot, formatSettleTimeoutNotice,
-  formatPaneClosedNotice, formatNoReportNotice, mountSubagentScope, planBlockedGate, planSilenceTick, type Poller, type PollerHost,
+  formatPaneClosedNotice, formatNoReportNotice, mountSubagentScope, planBlockedGate, planSilenceTick,
+  type Poller, type PollerHost,
 } from '../src/subagent-poller.ts';
 import type { TaskEntry } from '../src/task-row.ts';
 import type { SettlementCard } from '../src/settlement-card.ts';
@@ -24,18 +25,22 @@ test('planBlockedGate: the first block notifies, repeats stay silent, any other 
 });
 
 test('planSilenceTick: a null wait state is a heartbeat; a dead pane outranks the budget', () => {
-  assert.deepEqual(planSilenceTick({ waitState: null, paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 100, turn: 0 }), { refreshActivity: true, action: 'continue' });
-  assert.deepEqual(planSilenceTick({ waitState: 'idle', paneAlive: false, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: 3 }), { refreshActivity: false, action: 'pane-closed' });
-  assert.deepEqual(planSilenceTick({ waitState: 'idle', paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: 0 }), { refreshActivity: false, action: 'silence-timeout' });
+  assert.deepEqual(planSilenceTick({ waitState: null, blind: false, paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 100, turn: 0 }), { refreshActivity: true, action: 'continue' });
+  assert.deepEqual(planSilenceTick({ waitState: 'idle', blind: false, paneAlive: false, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: 3 }), { refreshActivity: false, action: 'pane-closed' });
+  assert.deepEqual(planSilenceTick({ waitState: 'idle', blind: false, paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: 0 }), { refreshActivity: false, action: 'silence-timeout' });
   // The budget is a failure to report, not a settlement: a worker that never writes a document has
   // nothing to hand over, and this is where supervision ends instead.
-  assert.deepEqual(planSilenceTick({ waitState: 'done', paneAlive: true, now: 50, lastActivityAt: 40, timeoutMs: 100, turn: 1 }), { refreshActivity: false, action: 'continue' });
+  assert.deepEqual(planSilenceTick({ waitState: 'done', blind: false, paneAlive: true, now: 50, lastActivityAt: 40, timeoutMs: 100, turn: 1 }), { refreshActivity: false, action: 'continue' });
   // The core's turn separates the two endings: a turn that ran is a settle without a report channel,
   // which is not silence and must not be announced as "said nothing at all".
-  assert.deepEqual(planSilenceTick({ waitState: 'idle', paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: 1 }), { refreshActivity: false, action: 'settled-without-report' });
-  assert.deepEqual(planSilenceTick({ waitState: 'done', paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: 4 }), { refreshActivity: false, action: 'settled-without-report' });
+  assert.deepEqual(planSilenceTick({ waitState: 'idle', blind: false, paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: 1 }), { refreshActivity: false, action: 'settled-without-report' });
+  assert.deepEqual(planSilenceTick({ waitState: 'done', blind: false, paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: 4 }), { refreshActivity: false, action: 'settled-without-report' });
   // A watch that cannot report the turn cannot claim a settle either.
-  assert.deepEqual(planSilenceTick({ waitState: 'idle', paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: null }), { refreshActivity: false, action: 'silence-timeout' });
+  assert.deepEqual(planSilenceTick({ waitState: 'idle', blind: false, paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: null }), { refreshActivity: false, action: 'silence-timeout' });
+  // A blind watch says nothing — not even that the worker is working — so it is never a heartbeat,
+  // and the budget ends in a notice about the blindness rather than a claim about progress.
+  assert.deepEqual(planSilenceTick({ waitState: null, blind: true, paneAlive: true, now: 5, lastActivityAt: 1, timeoutMs: 10, turn: null }), { refreshActivity: false, action: 'continue' });
+  assert.deepEqual(planSilenceTick({ waitState: null, blind: true, paneAlive: true, now: 50, lastActivityAt: 1, timeoutMs: 10, turn: null }), { refreshActivity: false, action: 'watch-blind' });
 });
 
 test('notice formatting: settlement text, pane-closed and settle-timeout wording', () => {
@@ -415,21 +420,27 @@ test('pollLoop: a worker missing from the snapshot is read through getTerminal',
   assert.equal(f.notices.length, 1);
 });
 
-test('pollLoop: a disconnected watch never settles nor reports pane-closed/timeout while blind', async () => {
+test('pollLoop: a disconnected watch expires the budget and names the blind watch, never silence', async () => {
+  // The old behaviour treated a blind watch's null state as a heartbeat: `lastActivityAt` was
+  // stamped on every tick, so the budget never expired and the master heard nothing forever.
   const f = fixture(makeEntry('p-blind'));
   f.setConnected(false);
   f.panes.length = 0; // even a getTerminal fallback would read "gone"
   let parks = 0;
   f.onPark(() => {
-    if (++parks >= 20) f.entry!.closedAt = f.virtual.now; // end supervision without settling
+    if (++parks >= 6) f.entry!.closedAt = f.virtual.now; // end supervision without settling
     return false;
   });
   await start(f);
   assert.ok(f.entry!.closedAt !== null, 'the watch ended on the test’s own close');
   assert.deepEqual(f.getTerminalCalls, [], 'a stale snapshot is never trusted, and no fallback is made');
-  assert.equal(f.writes.length, 0, 'blindness never consumes the row');
-  assert.equal(f.notices.length, 0, 'no pane-closed and no timeout notice while blind');
-  assert.equal(f.parks().length, 20, 'it keeps parking on the watch, not polling');
+  assert.equal(f.writes.length, 0, 'blindness never consumes the row: it establishes nothing');
+  assert.equal(f.entry!.gen.consumedAt, null, 'the row stays running for a settlement a reconnect can deliver');
+  assert.equal(f.notices.length, 1, 'one notice per blind episode, not one per budget tick');
+  assert.match(f.notices[0]!, /watched blindly for \d+s/);
+  assert.match(f.notices[0]!, /watch is blind because the core did not answer/, 'the notice names the blind watch');
+  assert.doesNotMatch(f.notices[0]!, /has shown no progress/, 'blindness is never reported as the worker’s silence');
+  assert.equal(f.parks().length, 6, 'it keeps parking on the watch, not polling');
 });
 
 test('pollLoop: a vanished pane consumes the row as failed without waiting for the timeout', async () => {
