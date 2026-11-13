@@ -176,3 +176,18 @@ message — the document read live, not the scripted error the tests use. Open f
 three notices and point the master at transcripts (`NOTICE_MAX_SHOWN`), settlement is suppressed until
 the master's next turn after an abort, a settle that writes no document waits out the whole budget,
 `output` cannot read a document whose record was swept, and a per-notice cap is no session-wide budget.
+L10. **Benchmark, layer 1 (the channel, not the master)**: `(this commit)` (parent `28cbf19`), Risk: none —
+a test, no behaviour touched, `npm test` **549/549** on it, Route: parent. `test/settlement-transport.test.ts`
+measures one thing: with `collapseNotices` and the body distribution measured over 187 real settlements
+(median 374 B, p90 8.108 B), how many reports a single delivery carries, and what a byte-budgeted
+candidate would cost instead. At N=10 with median bodies, today delivers **1.739 B carrying 3 of 10**; the
+candidate carries **10 of 10 in 4.081 B**; with p90 bodies the candidate is **902 B of rows, 0 bodies and
+10 pointers**. The test asserts what the numbers hide: today is cheap *because* it drops seven reports
+(assert the gap is the withheld text, not efficiency), the withheld reports are absent rather than
+summarised, and every candidate pointer names the `agentId` in the exact call that recovers it. Base
+check: raising `NOTICE_MAX_SHOWN` to 4 turns exactly the three "today" tests red and leaves the candidate
+tests green — the separation the file exists to prove. Not measured, and why: **attention** needs the
+fan-out first. With 3 of 10 delivered, a wrong decision is explained by lost information rather than by
+attention, so layer 3 (same 10 rows in one message vs ten spaced messages, scored against two planted
+blockers) waits for S27 to land. Layer 2 — ten real explorers settling while the master is busy — also
+pending, and it does not need new code.
