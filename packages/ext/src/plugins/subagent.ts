@@ -74,9 +74,9 @@ import {
 } from '../worktree.ts';
 import { createPoller } from '../subagent-poller.ts';
 import { awaitCommandPickup, commandDocumentOverflow, steerCommand, writeCommandDocument, type CommandPickup } from '../command-documents.ts';
-import { MAX_DOCUMENT_BYTES, commandDocName } from '../report-documents.ts';
+import { MAX_DOCUMENT_BYTES, commandDocName, readReportDocument, type ReportDocumentRead } from '../report-documents.ts';
 import { createGcController, restoreTasks, retirePane, seedForkView } from '../subagent-gc.ts';
-import { createSessionIo, executeSubagentOutput, type SubagentOutputCursor } from '../subagent-session.ts';
+import { createSessionIo, executeSubagentOutput, type SessionReport, type SubagentOutputCursor } from '../subagent-session.ts';
 import type { WorkerWidgetRow } from '../tree-view.ts';
 
 type ToolParams = Record<string, unknown> | undefined;
@@ -214,6 +214,49 @@ function unreadCommandText(paneId: string, taskId: string, command: string, budg
     + `action "resume" with taskId ${taskId} restarts it in a new pane; action "close" retires the row.`;
 }
 
+/** The `resume` refusal, in the words the tool contract fixes (docs/spec/contracts.md): it names the
+ *  three places the session could still be and says only what each read established. A clause is
+ *  never asserted on a read that did not happen — a label read that the core never answered, or a
+ *  document that was never written, say so in their own words, and "no session to resume" is only
+ *  claimed when the core actually answered. */
+function noSessionText(input: {
+  taskId: string;
+  paneId: string;
+  address: ReportDocumentRead;
+  /** Null when the address was not read at all: it holds another task's report document. */
+  report: SessionReport | null;
+  foreignAddress: boolean;
+}): string {
+  const tail = 'reviving it would start a fresh conversation. Use action "spawn" for new work, or '
+    + '"retry" to start a new task from the same brief.';
+  if (input.report?.kind === 'unavailable' || input.address.kind === 'unavailable') {
+    return `Error: task ${input.taskId} cannot be checked for a session right now: the core did not `
+      + `answer for its terminal ${input.paneId || '(none)'} or its settlement document, so no session `
+      + 'could be read. Try action "resume" again once the core answers.';
+  }
+  // The address holds another task's report: this task's session was never established there, so
+  // this is not the "no session anywhere" refusal — it is "this address is not yours".
+  if (input.foreignAddress) {
+    return `Error: task ${input.taskId} cannot be resumed at its address ${input.paneId}: that address `
+      + "now holds another task's settlement document, so the terminal there and its `hresume` label are "
+      + "that worker's conversation, not this task's, and its record carries no session either — reviving "
+      + `it would start a fresh conversation. Use action "spawn" for new work, or "retry" to start a new `
+      + 'task from the same brief.';
+  }
+  const terminal = input.paneId === ''
+    ? 'it has no terminal left'
+    : input.report?.kind === 'gone'
+      ? 'its core terminal is gone'
+      : input.report?.kind === 'not-ours'
+        ? `its core terminal ${input.paneId} is not its own (${input.report.why})`
+        : 'its core terminal reports no session';
+  const document = input.address.kind === 'read'
+    ? 'its settlement document reported no session'
+    : 'it has no settlement document';
+  return `Error: task ${input.taskId} has no session to resume: ${terminal}, ${document}, and its `
+    + `record carries none — ${tail}`;
+}
+
 export default function subagentPlugin(ctx: Context): void {
   const surface = cordisGet(ctx, 'piher.surface');
   const d = cordisGet(ctx, 'piher.subagent-deps');
@@ -269,7 +312,6 @@ export default function subagentPlugin(ctx: Context): void {
   const outputCursors = new Map<string, SubagentOutputCursor>();
   /** Read counters shown in `subagent output` headers (one monotonic number per worker). */
   const outputRevisions = new Map<string, number>();
-  const lastRequestIdByPane = new Map<string, string>();
   /** Pane id → its in-flight boot (readiness, first task); a follow-up waits for it. */
   const boots = new Map<string, Promise<void>>();
 
@@ -400,7 +442,12 @@ export default function subagentPlugin(ctx: Context): void {
     return Promise.resolve();
   };
 
-  const session = createSessionIo({ client, getSessionId: d.getSessionId, sessionsDir: defaultAgentSessionsDir });
+  const session = createSessionIo({
+    client,
+    getSessionId: d.getSessionId,
+    sessionsDir: defaultAgentSessionsDir,
+    getTerminalId: () => env?.terminalId ?? null,
+  });
   const spawn = createSpawner({ client, env, runtime, git, readinessTimeoutMs: d.policy?.readinessTimeoutMs });
   const poller = createPoller({
     client,
@@ -454,7 +501,7 @@ export default function subagentPlugin(ctx: Context): void {
       // A gone pane is resume work, not a re-arm.
       if (!liveTerminalIds.has(entry.gen.paneId)) continue;
       // Only a watch that actually armed is announced: `startPoller` answers that fact, not the intent.
-      if (await startPoller(entry.gen.paneId, entry.cwd, entry.gen.startedAt, entry.description, `recover-${via}-${entry.gen.paneId}`)) {
+      if (await startPoller(entry.gen.paneId, entry.cwd, entry.gen.startedAt, entry.description)) {
         recovered.push(`${entry.gen.paneId} (${entry.description})`);
       }
     }
@@ -501,7 +548,7 @@ export default function subagentPlugin(ctx: Context): void {
     if (!isAlive(probe, Date.now())) return; // keep the original error only when the agent is truly dead
     // Move a live agent to the poller so its eventual result replaces the false error.
     if (!pollers.has(paneId)) {
-      startPoller(paneId, entry.cwd, entry.gen.startedAt, entry.description, lastRequestIdByPane.get(paneId) ?? `probe-${paneId}`);
+      startPoller(paneId, entry.cwd, entry.gen.startedAt, entry.description);
       writeRecord(entry);
     }
     return {
@@ -721,6 +768,13 @@ export default function subagentPlugin(ctx: Context): void {
     return true;
   }
 
+  /** The settlement document at a worker address, as the core holds it (spec S12 keeps it across a
+   *  core restart): where a record that lost its session can still find it, and the fact that says
+   *  whether the address is still this task's. */
+  function readAddressReport(paneId: string): Promise<ReportDocumentRead> {
+    return paneId ? readReportDocument(client, paneId) : Promise.resolve({ kind: 'absent' as const });
+  }
+
   async function executeSubagentResume(params: ToolParams, toolCtx: unknown) {
     if (!client.available) return toolError(`subagent: ${CORE_REQUIRED}`);
     const rawTaskId = idParam(params, 'taskId', 'agentId');
@@ -794,24 +848,30 @@ export default function subagentPlugin(ctx: Context): void {
       const verdict = spentText(latest);
       if (verdict !== null) return toolError(verdict);
     }
-    // S18: the worker's session identity comes from the core's `hresume` label, written by the
-    // worker's own Herdr extension. The record already carries it when a settlement document reported
-    // a `session`, and a pane that is still alive can report it now; with neither, a resume would start
-    // a fresh conversation under the old task's name — refuse instead of pretending.
-    const reported = latest.gen.sessionFile ? null : await session.reportedSessionFile(latest.gen.paneId);
-    if (!latest.gen.sessionFile && reported) {
-      latest.gen.sessionFile = reported;
+    // S18/S26: this task's session can be in three places — its record, the settlement document its
+    // worker wrote at its address (S12 keeps it across a core restart), and the core's `hresume` label
+    // on that address. An address is not an identity: a core restart reuses terminal ids, so the label
+    // is read only from a terminal this task's master made, and only when the document does not show
+    // the address already belongs to another task. With none of the three, a resume would start a
+    // fresh conversation under the old task's name — refuse instead of pretending, saying only what
+    // was actually read.
+    let restoredFrom: 'document' | 'label' | null = null;
+    if (!latest.gen.sessionFile) {
+      const address = await readAddressReport(latest.gen.paneId);
+      // The document names the task that wrote it: another task's document means the address was
+      // reused, and whatever `hresume` sits there now is that other worker's conversation.
+      const foreignAddress = address.kind === 'read' && address.value.taskId !== taskId;
+      const report = foreignAddress ? null : await session.readSessionReport(latest.gen.paneId);
+      const fromDocument = address.kind === 'read' && address.value.taskId === taskId ? address.value.session : null;
+      const fromLabel = report?.kind === 'reported' ? report.file : null;
+      const adopted = fromDocument ?? fromLabel;
+      if (!adopted) {
+        return toolError(noSessionText({ taskId, paneId: latest.gen.paneId, address, report, foreignAddress }));
+      }
+      latest.gen.sessionFile = adopted;
+      restoredFrom = fromDocument ? 'document' : 'label';
       // The record is what a later resume reads, so the report is written down the moment it is used.
       writeTaskRecord(latest.cwd, latest);
-    }
-    if (!latest.gen.sessionFile) {
-      const where = latest.gen.paneId ? `its terminal ${latest.gen.paneId} carries no \`hresume\` label` : 'it has no pane left';
-      return toolError(
-        `Error: task ${taskId} has no session to resume: the record holds none, ${where}, and no `
-        + 'settlement document for it reported a `session`. Resuming without one would start a fresh '
-        + 'conversation that knows nothing of this task. '
-        + `Start the work again with action "spawn" (or action "retry" to re-send task ${taskId}'s brief).`,
-      );
     }
     // D94: reuse an existing pane for the same session to avoid competing pi processes. This
     // lookup only reads terminal labels, so it runs before the ownership check below.
@@ -852,9 +912,14 @@ export default function subagentPlugin(ctx: Context): void {
         await reviveEntry(entry);
         tasks.set(entry.taskId, entry);
       }
+      const source = restoredFrom === 'document'
+        ? 'session restored from its settlement document'
+        : restoredFrom === 'label'
+          ? 'session restored from its core `hresume` report'
+          : 'session restored';
       const how = existing
-        ? 'reused existing pane with same session; pi still running there'
-        : 'session restored';
+        ? `${source}; reused existing pane with same session, pi still running there`
+        : source;
       return {
         content: [{ type: 'text', text: `resumed subagent ${taskRef(entry.gen)} from task ${taskId} (${how}).` }],
         details: { paneId: entry.gen.paneId, taskId },
@@ -869,18 +934,17 @@ export default function subagentPlugin(ctx: Context): void {
    *  with nothing in flight, and the settlement (spec S5) is judged against this request. Rolled back
    *  when no watch takes over — `startPoller` answers that, and a watch that could not arm would
    *  otherwise leave the row re-armed with no reader, so the steer's report would never be delivered. */
-  function rearmAfterSteer(entry: TaskEntry, requestId: string): void {
+  function rearmAfterSteer(entry: TaskEntry): void {
     const prevConsumedAt = entry.gen.consumedAt;
     entry.gen.consumedAt = null;
     writeRecord(entry);
-    lastRequestIdByPane.set(entry.gen.paneId, requestId);
     const rollback = (): void => {
       // Only the value this call cleared: a settlement that landed in between owns `consumedAt` now.
       if (entry.gen.consumedAt !== null) return;
       entry.gen.consumedAt = prevConsumedAt;
       writeRecord(entry);
     };
-    void startPoller(entry.gen.paneId, entry.cwd, Date.now(), entry.description, requestId)
+    void startPoller(entry.gen.paneId, entry.cwd, Date.now(), entry.description)
       .then((armed) => { if (!armed) rollback(); }, rollback);
   }
 
@@ -938,7 +1002,7 @@ export default function subagentPlugin(ctx: Context): void {
       // left `consumed` would then be reaping evidence against a turn nobody watches, with its report
       // dropped. A command nobody read (`unread`) or that the document moved past (`unsettled`) started
       // no turn of ours: re-arming would claim one and then report silence for work never received.
-      if (pickup.kind === 'applied' || pickup.kind === 'unknown') rearmAfterSteer(entry, command.id);
+      if (pickup.kind === 'applied' || pickup.kind === 'unknown') rearmAfterSteer(entry);
       if (pickup.kind === 'unread') {
         const document = name ?? `piher.cmd.${entry.gen.paneId}`;
         // PIHER_COMMAND_PICKUP_MS=0 is the documented "report the write alone" mode: the operator asked
@@ -1003,6 +1067,10 @@ export default function subagentPlugin(ctx: Context): void {
     // No ownership refusal here: `close` refuses a worker with a turn in flight and points at
     // `interrupt`, so refusing `interrupt` across sessions would make another session's stuck
     // worker impossible to end. Interrupting writes no document and adopts nothing.
+    // Nor is `isSpent` consulted (`isSpent` means the master already holds this task's report, not
+    // that the worker has no turn): a person may type into a persistent worker's attachable pane
+    // after its report was consumed (S21), and that turn is exactly what someone wants stopped. The
+    // probe below decides whether there is a turn, and it is the only fact this action needs.
     if (isClosed(entry)) {
       return toolError(
         `Error: subagent ${taskRef(entry.gen)} is closed — its pane and tab are gone, so there is `
@@ -1035,10 +1103,14 @@ export default function subagentPlugin(ctx: Context): void {
     // Nothing left in piher can stop a turn without the core, and a worker with no turn in flight is
     // refused above by what the core said — this is the last point the core is still needed.
     if (!client.available) return toolError(`subagent: ${CORE_REQUIRED}`);
-    // P5 (spec S19): the core's own `terminal.interrupt` is the only place left to stop a turn. The
-    // private socket that used to carry this frame is gone, and `terminal.keys` is not a substitute:
-    // it pastes bytes into the TUI, and what ESC does there belongs to pi's input handling, not to
-    // this action. The core reports what happened to the turn, so the result states it.
+    // P5 (spec S19): the core's own `terminal.interrupt` is the only place left to stop a turn. It
+    // stops it the way a person would: it presses the stop key in that pane — `esc` for a program
+    // that reports status, else `ctrl+c` (the vendored core contract, `terminal.interrupt`), and it
+    // never escalates. So this action DOES type into the worker's PTY, exactly as the first task
+    // does; what stayed with the human is every other keystroke, because no report, steer or control
+    // message of piher's is injected as one, and the pane's keyboard is otherwise left alone (D45).
+    // The core reports what happened to the turn, so the result states it instead of inferring it
+    // (spec S17).
     try {
       const outcome = await client.interrupt(entry.gen.paneId);
       // A core that will not say what happened to the turn is not a failure of the interrupt: the
@@ -1178,7 +1250,6 @@ export default function subagentPlugin(ctx: Context): void {
     writeRecord,
     appendView,
     dropTask,
-    lastRequestIdByPane,
     boots,
     notifySpawnFailed: injectNotice,
     git,
@@ -1204,9 +1275,11 @@ export default function subagentPlugin(ctx: Context): void {
       return next;
     },
     // Transcript fallback: small worker panes show only the opaque status overlay, so the pane delta can never
-    // carry the final report. No preferred file — start from the worker's own `hresume` report, not a stale registry value.
-    readFinalReport: async (paneId: string, entryCwd: string) =>
-      (await session.readTurnClosing(paneId, entryCwd, 0)).text,
+    // carry the final report. The row's own session is the first candidate, so a reused address can never
+    // hand the task another conversation's last words; behind it the worker's own `hresume` report decides
+    // (spec S18).
+    readFinalReport: async (paneId: string, entryCwd: string, preferred: string | null) =>
+      (await session.readTurnClosing(paneId, entryCwd, 0, preferred)).text,
     writeRecord,
   };
 

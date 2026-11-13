@@ -168,6 +168,29 @@ export type DocumentWriteResult =
   | { ok: true; version: number }
   | { ok: false; reason: string };
 
+/** What one read of a worker's report document established (spec S12 keeps the document across a
+ *  core restart, so it outlives both the record and the pane).
+ *
+ *  The three cases are kept apart on purpose: "nothing was written", "what is there is not a
+ *  report" and "the core did not answer" are different facts, and a caller that merges them tells a
+ *  person the document reported no session when it was never read. */
+export type ReportDocumentRead =
+  | { kind: 'read'; value: ReportDocumentValue }
+  | { kind: 'absent' }
+  | { kind: 'unavailable' };
+
+/** The report document at a worker address, as the core holds it. */
+export async function readReportDocument(client: CoreClientLike, address: string): Promise<ReportDocumentRead> {
+  const name = reportDocName(address);
+  if (!name) return { kind: 'absent' };
+  try {
+    const got = await client.docGet(name);
+    return got && isReportDocumentValue(got.value) ? { kind: 'read', value: got.value } : { kind: 'absent' };
+  } catch {
+    return { kind: 'unavailable' };
+  }
+}
+
 /**
  * Write a piher document with compare-and-swap (spec S11): read the version, write against it, and
  * on `conflict` re-read and retry — never an unconditional overwrite. A transport failure is

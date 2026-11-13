@@ -307,6 +307,8 @@ async function firePtyTurn(cleanup: CleanupContext, opts: {
   forgetTranscript?: boolean;
   /** What this settle should end in: a document (waited for) or nothing at all (a short grace). */
   expect: 'write' | 'silent';
+  /** Mount the extension with the turn already running: no `turn_start` ever reached this process. */
+  midTurn?: boolean;
 }): Promise<{ docs: Array<{ name: string; value: unknown; version: number }>; calls: string[]; shutdowns: number; pi: FakePi }> {
   const home = cleanup.tempDir(`piher-pty-home-${opts.pane}`).path;
   const cwd = cleanup.tempDir(`piher-pty-ws-${opts.pane}`).path;
@@ -341,7 +343,8 @@ async function firePtyTurn(cleanup: CleanupContext, opts: {
     ];
     await writeFile(file, jsonl(...scrolled));
     // No pipe frame: the master's brief came through `terminal.send` and pi starts the turn itself.
-    await fire(pi, 'turn_start');
+    // A remount lands mid-turn instead: the turn began before this process existed.
+    if (!opts.midTurn) await fire(pi, 'turn_start');
     await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'stop' } }, ctx);
     // The turn's own words are stamped now, after its start — what a real transcript looks like.
     if (opts.closing != null) {
@@ -391,6 +394,25 @@ test('S54/P2: a settle with no closing words of its own writes that, never an ol
   assert.equal(value.text, null, 'nothing is published as this turn\'s words');
   assert.equal(value.stopReason, null, 'and no reason is invented for it');
   assert.doesNotMatch(JSON.stringify(value), /STALE:/, 'no older text is passed off as this turn');
+  assert.equal(result.shutdowns, 1, 'the one-shot exits once its report document is written');
+}));
+
+test('S5/P5: a session that mounted mid-turn publishes no older turn\'s words as this settle\'s answer', withCleanup(async (cleanup) => {
+  const pane = 'p_pty_midturn';
+  const result = await firePtyTurn(cleanup, {
+    pane,
+    midTurn: true, // a reload/HMR landed while the turn was already running
+    stale: { text: 'STALE: an earlier turn\'s report.', ageMs: 60_000 },
+    closing: null,
+    expect: 'write',
+  });
+  // The settle boundary starts at the mount, the oldest fact this process can stand behind: 0 would
+  // read as "any turn" and hand the master an earlier turn's closing message with a fresh `at`.
+  assert.equal(result.docs.length, 1, 'a settle with nothing to say still writes its document (S6)');
+  const value = result.docs[0]!.value as { text?: string | null; stopReason?: string | null };
+  assert.equal(value.text, null, 'nothing is published as this turn\'s words');
+  assert.equal(value.stopReason, null, 'and no reason is invented for it');
+  assert.doesNotMatch(JSON.stringify(value), /STALE:/, 'a turn that began before the mount is not read back');
   assert.equal(result.shutdowns, 1, 'the one-shot exits once its report document is written');
 }));
 

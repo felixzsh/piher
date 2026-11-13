@@ -156,7 +156,7 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
     readTurnClosing: async () => ({ text: null, why: null }),
     readAskFlag: async () => 'Which data source?',
     resolveSessionFile: async () => '/resolved/session.jsonl',
-    reportedSessionFile: async () => null,
+    readSessionReport: async () => ({ kind: 'absent' } as const),
     reattributeStaleSessionFile: async (_paneId: string, _cwd: string, _sinceTs: number, preferred: string | null) => reattributed ?? preferred,
     probeAlive: async () => ({ paneExists: true, agentStatus: 'working', lastActivityMs: 1 }),
   } satisfies SessionIo;
@@ -198,9 +198,9 @@ async function settleLoop(poller: Poller): Promise<void> {
   assert.equal(poller.pollers.size, 0, 'the watch ended (a test must close, spend or exit its row)');
 }
 
-const start = async (f: { host: PollerHost; entry: TaskEntry | null }, requestId = 'req-1', injectTs = 10_000) => {
+const start = async (f: { host: PollerHost; entry: TaskEntry | null }, injectTs = 10_000) => {
   const poller = createPoller(f.host);
-  await poller.startPoller(f.entry!.gen.paneId, '/tmp', injectTs, 'desc', requestId);
+  await poller.startPoller(f.entry!.gen.paneId, '/tmp', injectTs, 'desc');
   await settleLoop(poller);
 };
 
@@ -559,8 +559,8 @@ test('startPoller: a follow_up refreshes the tracked request while the loop is r
     return false;
   });
   const poller = createPoller(f.host);
-  assert.equal(await poller.startPoller('p-refresh', '/tmp', 1_000, 'desc', 'req-1'), true, 'the watch armed');
-  await poller.startPoller('p-refresh', '/tmp', 5_000, 'desc', 'req-2');
+  assert.equal(await poller.startPoller('p-refresh', '/tmp', 1_000, 'desc'), true, 'the watch armed');
+  await poller.startPoller('p-refresh', '/tmp', 5_000, 'desc');
   firstPark.resolve();
   await settleLoop(poller);
   // The newest request wins: the follow-up's document is what settles.
@@ -582,8 +582,8 @@ test('startPoller: a second call for an active pane does not start a second loop
     return false;
   });
   const poller = createPoller(f.host);
-  await poller.startPoller('p-dup', '/tmp', 1_000, 'desc', 'req-1');
-  await poller.startPoller('p-dup', '/tmp', 1_000, 'desc', 'req-1');
+  await poller.startPoller('p-dup', '/tmp', 1_000, 'desc');
+  await poller.startPoller('p-dup', '/tmp', 1_000, 'desc');
   assert.deepEqual([...poller.pollers], ['p-dup'], 'the second call joins the armed watch');
   firstPark.resolve();
   await settleLoop(poller);
@@ -597,7 +597,7 @@ test('startPoller: the request boundary keeps a slack, so an answer in the same 
   // boundary itself, and the slack is what keeps that answer from reading as stale.
   f.seedDoc('piher.rep.p-slack', reportDoc('task-1', 'answered on the boundary', { at: 9_000 }));
   f.onPark(() => { f.waitState('exited'); return false; });
-  await start(f, 'req-1', 10_000);
+  await start(f, 10_000);
   assert.ok(f.entry!.gen.consumedAt !== null);
   assert.ok(f.notices[0]!.includes('answered on the boundary'));
 });
@@ -611,7 +611,7 @@ test('pollLoop: a document older than the slack is not this request\'s settlemen
     f.waitState('exited');
     return false;
   });
-  await start(f, 'req-1', 10_000);
+  await start(f, 10_000);
   assert.ok(
     f.notices.every((n) => !n.includes('the previous answer')),
     `an earlier turn's report is never this request's settlement: ${JSON.stringify(f.notices)}`,
@@ -658,8 +658,8 @@ test('pollLoop: a second turn for the same document value delivers nothing twice
   // One poller for both runs, as in production: the mount outlives the re-arm, so the delivery set
   // (`address`, `turn`) survives it.
   const poller = createPoller(f.host);
-  const begin = async (requestId: string) => {
-    await poller.startPoller(f.entry!.gen.paneId, '/tmp', 10_000, 'desc', requestId);
+  const begin = async () => {
+    await poller.startPoller(f.entry!.gen.paneId, '/tmp', 10_000, 'desc');
     await settleLoop(poller);
   };
   const firstEvents = [
@@ -667,7 +667,7 @@ test('pollLoop: a second turn for the same document value delivers nothing twice
     () => { f.waitState('exited'); return true; },
   ];
   f.onPark(async () => (firstEvents.shift() ?? (() => false))());
-  await begin('req-1');
+  await begin();
   assert.equal(f.notices.filter((n) => /finished and will do no further work/.test(n)).length, 1);
 
   // A follow_up re-arms the row, and the core replays the turn event with the same document value
@@ -679,7 +679,7 @@ test('pollLoop: a second turn for the same document value delivers nothing twice
     () => { f.waitState('exited'); return true; },
   ];
   f.onPark(async () => (secondEvents.shift() ?? (() => false))());
-  await begin('req-2');
+  await begin();
   assert.equal(
     f.notices.filter((n) => /finished and will do no further work/.test(n)).length,
     1,

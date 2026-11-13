@@ -36,7 +36,7 @@ import {
 import { allocateTaskSlug, taskRef, type TaskEntry } from './task-row.ts';
 import type { Poller } from './subagent-poller.ts';
 import type { SessionIo } from './subagent-session.ts';
-import { HRESUME_LABEL, hresumeSessionFile } from './subagent-session.ts';
+import { HRESUME_LABEL, hresumeSessionFile, hresumeReport } from './subagent-session.ts';
 
 const statAsync = promisify(statCb);
 
@@ -620,15 +620,17 @@ export function createSpawner(h: SpawnerHost): Spawner {
   }
 
   /** D94: reuse a terminal that already runs the same session instead of competing on one transcript.
-   *  The worker's own Herdr extension reports its session in the `hresume` label (spec S18). */
+   *  The worker's own Herdr extension reports its session in the `hresume` label (spec S18), and only a
+   *  pi process is a candidate: another agent's label matching the same id is not a pi session to
+   *  share, and reusing it would point the row at a program piher cannot resume. */
   async function findExistingPane(sessionFile: string | null): Promise<{ paneId: string; tabId: string } | null> {
     if (!sessionFile) return null;
     const wanted = bareSessionId(sessionFile);
     try {
       const terminals = await h.client.listTerminals();
       const match = terminals.find((t) => {
-        const reported = hresumeSessionFile(t.labels[HRESUME_LABEL]);
-        return reported != null && bareSessionId(reported) === wanted;
+        const reported = hresumeReport(t.labels[HRESUME_LABEL]);
+        return reported != null && reported.agent === 'pi' && bareSessionId(reported.file) === wanted;
       });
       if (!match) return null;
       return { paneId: match.id, tabId: match.labels['herdr.tab'] ?? '' };
@@ -660,7 +662,6 @@ interface SpawnActionHost {
   appendView(taskId: string): void;
   /** A spawn that never started leaves no record and no view id behind. */
   dropTask?(taskId: string): void;
-  lastRequestIdByPane: Map<string, number | string>;
   /** Pane id → its in-flight boot (readiness, first task, session resolution). */
   boots: Map<string, Promise<void>>;
   /** A spawn whose boot failed off the caller's turn: the only report a failed start can make. */
@@ -835,7 +836,6 @@ export function createSpawnAction(h: SpawnActionHost) {
       // Keep the brief: an upstream failure is nobody's fault in the task, and `retry` re-sends this
       // text instead of making the master spend tokens writing it again.
       saveTaskPrompt(taskId, spec.prompt);
-      const injectId = `prompt-${taskId}`;
       const boot = (async (): Promise<void> => {
         // S14: the core's own status is the readiness gate, and the send's own result is delivery.
         // One budget for the whole boot (readiness + delivery retries): a retry may not restart a
@@ -857,8 +857,7 @@ export function createSpawnAction(h: SpawnActionHost) {
           budgetMs: Math.max(0, deadline - Date.now()),
           statusAtReady: ready.status,
         });
-        h.lastRequestIdByPane.set(paneId, injectId);
-        void startPoller(paneId, cwd, injectTs, spec.description, injectId);
+        void startPoller(paneId, cwd, injectTs, spec.description);
         h.writeRecord(entry);
       })();
       h.boots.set(paneId, boot);
@@ -881,8 +880,7 @@ export function createSpawnAction(h: SpawnActionHost) {
           // poller is what sets it here: its silence budget is the watchdog that ends a worker which
           // never took its task, and it also owns the blocked-gate notice for a pane a person must
           // answer. Without it the pane, row, record and any checkout would live out the session.
-          h.lastRequestIdByPane.set(paneId, `boot-failed-${taskId}`);
-          void startPoller(paneId, cwd, Date.now(), spec.description, `boot-failed-${taskId}`);
+          void startPoller(paneId, cwd, Date.now(), spec.description);
         }
         try {
           await h.notifySpawnFailed(

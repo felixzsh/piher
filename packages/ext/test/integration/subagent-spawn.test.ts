@@ -40,6 +40,24 @@ const spawnerFor = (client: Partial<CoreClientLike>, over: Record<string, unknow
   ...over,
 } as Parameters<typeof createSpawner>[0]);
 
+test('D94/S18: findExistingPane reuses a pi pane running the session, and no other agent\'s', async () => {
+  const file = '/sessions/abc.jsonl';
+  const label = (agent: string) => JSON.stringify({ agent, session: 'abc', file, cwd: '/w', pid: 1, boot: 'b' });
+  const spawner = spawnerFor({
+    listTerminals: async () => [
+      terminalInfo({ id: 'pa', labels: { 'herdr.tab': 'tabA', [HRESUME_LABEL]: label('claude') } }),
+      terminalInfo({ id: 'pb', labels: { 'herdr.tab': 'tabB', [HRESUME_LABEL]: label('pi') } }),
+    ],
+  });
+  // The same id under another agent is not a pi session to share: reusing it would point the row at
+  // a program piher cannot resume.
+  assert.deepEqual(await spawner.findExistingPane(file), { paneId: 'pb', tabId: 'tabB' });
+  const onlyForeign = spawnerFor({
+    listTerminals: async () => [terminalInfo({ id: 'pa', labels: { [HRESUME_LABEL]: label('claude') } })],
+  });
+  assert.equal(await onlyForeign.findExistingPane(file), null, 'nothing pi runs that session');
+});
+
 test('waitReady/planTaskSend: the core decides readiness, and the turn proves delivery', async (t) => {
   await t.test('a gone terminal fails fast with its last output, and its pane is not kept', async () => {
     const spawner = spawnerFor({

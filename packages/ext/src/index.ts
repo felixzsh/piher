@@ -52,9 +52,10 @@ export default async function (pi: ExtensionAPI) {
   const roleBase = process.env.PIHER_ROLE_BASE || process.cwd();
 
   let sessionId: string = process.env.PI_SESSION_FILE ?? process.env.PI_SESSION_ID ?? '';
-  /** The transcript path pi itself reports for this session, cached at session_start. The settle push
-   *  must read it, and re-deriving it from the bare id failed in a live worker (`hasFile=false`), which
-   *  silently disabled the instant reply and left every settlement to the master's poller. */
+  /** The transcript path pi itself reports for this session, cached at session_start. The settlement
+   *  document is written from it, and re-deriving it from the bare id failed in a live worker
+   *  (`hasFile=false`), which silently dropped the report and left every settlement to the master's
+   *  poller. */
   let ownSessionFile: string | null = null;
   const { client, env } = createCoreClient();
   /** RFC rfc-delegation-identity §2.1: resolved env → marker → branch fold; worker panes only. */
@@ -174,8 +175,14 @@ export default async function (pi: ExtensionAPI) {
 
   /* ── the settle boundary: where this turn's closing words begin ──
    *  Nothing arms it from outside any more: the master's first task and every steer arrive through
-   *  the core (spec S14/S15), so a turn's own start is the only boundary there is. */
-  let turnStartedAt = 0;
+   *  the core (spec S14/S15), so a turn's own start is the only boundary there is. A turn that began
+   *  before this extension mounted has no `turn_start` in this process, so the boundary starts at the
+   *  mount — the oldest fact this process can stand behind. It must never be 0: `readTurnClosing`
+   *  reads 0 as "any turn", which would publish the last words of an EARLIER turn as this settle's
+   *  answer, stamped with a fresh `at` the master's staleness guard cannot catch. With the mount as
+   *  the boundary, a remount mid-turn reports that turn's own words whenever it wrote them after the
+   *  mount, and "left no closing message" when it did not. */
+  let turnStartedAt = Date.now();
 
   /** The worker's own closing words: the finalized text, else the reason the turn ended without
    *  one (a refused tool, an error). Shared by the report document and the one-shot exit so the two

@@ -8,7 +8,7 @@
  * Nothing here decides that a task settled: no caller may infer it (spec S5).
  */
 import { accessSync, constants, statSync } from 'node:fs';
-import type { CoreClientLike, CoreStatus } from './core-client.ts';
+import type { CoreClientLike, CoreStatus, TerminalInfo } from './core-client.ts';
 import {
   bareSessionId,
   listSessionFiles,
@@ -27,12 +27,19 @@ import { toolError } from './tool-error.ts';
  *  boot}` view of the pi session running in that terminal. piher writes no session label of its own. */
 export const HRESUME_LABEL = 'hresume';
 
-/** The session a terminal reports through `hresume` (spec S18), as a value a transcript resolver can
- *  use: the reported `file` when it names one, else the reported `session` id (Herdr reports ids and
- *  paths interchangeably). Null when the label is absent, is not the documented object, or carries
- *  neither — a report piher cannot read is not a session report, and treating it as one would point
- *  a resume at the wrong conversation. */
-export function hresumeSessionFile(label: string | null | undefined): string | null {
+/** What the `hresume` label reports that piher reads: the agent that wrote it and the transcript it
+ *  names. Null when the label is absent, is not the documented object, or names no session — a report
+ *  piher cannot read is not a session report, and treating it as one would point a resume at the wrong
+ *  conversation. */
+export interface HresumeReport {
+  /** The reporter's own name for its agent kind (`pi` for a pi session); null when it names none. */
+  agent: string | null;
+  /** The reported `file` when it names one, else the reported `session` id (Herdr reports ids and
+   *  paths interchangeably). */
+  file: string;
+}
+
+export function hresumeReport(label: string | null | undefined): HresumeReport | null {
   const raw = (label ?? '').trim();
   if (raw === '') return null;
   let parsed: unknown;
@@ -42,20 +49,50 @@ export function hresumeSessionFile(label: string | null | undefined): string | n
     return null;
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-  const { file, session } = parsed as { file?: unknown; session?: unknown };
-  if (typeof file === 'string' && file.trim() !== '') return file;
-  if (typeof session === 'string' && session.trim() !== '') return session;
-  return null;
+  const { agent, file, session } = parsed as { agent?: unknown; file?: unknown; session?: unknown };
+  const reported = typeof file === 'string' && file.trim() !== ''
+    ? file
+    : typeof session === 'string' && session.trim() !== '' ? session : null;
+  if (reported === null) return null;
+  return { agent: typeof agent === 'string' && agent.trim() !== '' ? agent : null, file: reported };
 }
 
-/** The session a live terminal reports, read from the core when the caller does not have it at hand. */
-async function reportedSessionFileOf(client: CoreClientLike, paneId: string): Promise<string | null> {
-  if (!paneId) return null;
-  try {
-    return hresumeSessionFile((await client.getTerminal(paneId))?.labels[HRESUME_LABEL]);
-  } catch {
-    return null;
+/** The session a terminal reports through `hresume` (spec S18), as a value a transcript resolver can
+ *  use. Null when the label carries no session report. */
+export function hresumeSessionFile(label: string | null | undefined): string | null {
+  return hresumeReport(label)?.file ?? null;
+}
+
+/** What a live terminal establishes about a task's conversation (spec S18).
+ *
+ *  A terminal address is not an identity: a core restart reuses terminal ids (spec S26 says so for
+ *  command documents, and the same premise applies here), so the label at an address may describe
+ *  somebody else's conversation. The label is therefore read only from a terminal this task's master
+ *  made, written by pi — and only the positive facts refuse, because a field the core has not filled
+ *  in yet must not turn a resume into a refusal. */
+export type SessionReport =
+  | { kind: 'reported'; file: string }
+  /** The core answered: the terminal carries no readable pi `hresume` label. */
+  | { kind: 'absent' }
+  /** The address now holds a terminal that is not this task's own worker. */
+  | { kind: 'not-ours'; why: string }
+  /** The core answered: no such terminal. */
+  | { kind: 'gone' }
+  /** The core did not answer, so nothing was established either way. */
+  | { kind: 'unavailable' };
+
+/** Read one terminal's `hresume` report as this task's own (spec S18/S26). */
+function sessionReportOf(terminal: TerminalInfo | null, masterTerminalId: string | null): SessionReport {
+  if (!terminal) return { kind: 'gone' };
+  if (masterTerminalId && terminal.parent && terminal.parent !== masterTerminalId) {
+    return { kind: 'not-ours', why: `its parent is ${terminal.parent}, not this master (${masterTerminalId})` };
   }
+  const report = hresumeReport(terminal.labels[HRESUME_LABEL]);
+  if (!report) return { kind: 'absent' };
+  if (report.agent !== 'pi') {
+    return { kind: 'not-ours', why: `its label was written by ${report.agent ?? 'an unnamed agent'}, not pi` };
+  }
+  return { kind: 'reported', file: report.file };
 }
 
 /* ── subagent output delta (pure) ───────────────────────────────── */
@@ -249,6 +286,9 @@ export interface SessionIoHost {
   client: CoreClientLike;
   getSessionId: () => string;
   sessionsDir: () => string;
+  /** This master's own terminal id, for the `hresume` identity gate (spec S26): a worker terminal's
+   *  parent is the master that made it. Unknown means "cannot establish", never "not ours". */
+  getTerminalId?: () => string | null;
 }
 
 export interface ResolveSessionFileOpts {
@@ -259,9 +299,9 @@ export interface ResolveSessionFileOpts {
 
 export interface SessionIo {
   resolveSessionFile(paneId: string, cwd: string, preferred?: string | null, opts?: ResolveSessionFileOpts): Promise<string | null>;
-  /** The session this pane reports through the core's `hresume` label (spec S18), or null: the one
-   *  authoritative report a worker makes about its own conversation. */
-  reportedSessionFile(paneId: string): Promise<string | null>;
+  /** What the terminal at this address reports about the conversation now (spec S18, S26): a pi
+   *  `hresume` report from a terminal this task's master made, or the reason there is none. */
+  readSessionReport(paneId: string): Promise<SessionReport>;
   readAskFlag(paneId: string): Promise<string | null>;
   probeAlive(paneId: string, cwd: string): Promise<AliveProbe>;
   /** The worker's own closing words, for its report and for `output`. Never a settlement decision. */
@@ -318,44 +358,74 @@ class DerivedCache<T> {
 export function createSessionIo(h: SessionIoHost): SessionIo {
   const closingCache = new DerivedCache<TurnClosing>();
 
-  /** This terminal's `hresume` report plus the sessions claimed by other terminals; one
-   *  `terminal.list` serves both, so the poll hot paths pay a single RPC. */
-  async function reportedAndTaken(paneId: string): Promise<{ reported: string | null; taken: Set<string> }> {
-    const taken = new Set<string>();
-    let reported: string | null = null;
+  /** What the terminal at this address reports about the conversation now (spec S18), read from the
+   *  core: the only authoritative report a worker makes about its own session. */
+  async function readSessionReport(paneId: string): Promise<SessionReport> {
+    if (!paneId) return { kind: 'gone' };
     try {
-      for (const terminal of await h.client.listTerminals({ all: true })) {
-        const sessionFile = hresumeSessionFile(terminal.labels[HRESUME_LABEL]);
-        if (!sessionFile) continue;
-        if (terminal.id === paneId) reported = sessionFile;
-        else taken.add(bareSessionId(sessionFile));
-      }
-      // list may not include a terminal created moments ago: ask for it directly before giving up.
-      if (!reported) reported = await reportedSessionFileOf(h.client, paneId);
+      return sessionReportOf(await h.client.getTerminal(paneId), h.getTerminalId?.() ?? null);
     } catch {
-      reported = await reportedSessionFileOf(h.client, paneId);
+      return { kind: 'unavailable' };
     }
-    return { reported, taken };
   }
 
-  /** Ordered candidates: the worker's own `hresume` report (authoritative), the value the row already
-   *  carries (which is where a settlement document's `session` lands), then the newest session files. */
+  /** This task's terminal report plus the sessions claimed by other terminals; one `terminal.list`
+   *  serves both, so the poll hot paths pay a single RPC. */
+  async function reportedAndTaken(paneId: string): Promise<{
+    reported: string | null;
+    taken: Set<string>;
+    /** 'other' when the address now holds a terminal this task's master did not make. */
+    identity: 'ours' | 'other';
+  }> {
+    const taken = new Set<string>();
+    let paneReport: SessionReport | null = null;
+    try {
+      for (const terminal of await h.client.listTerminals({ all: true })) {
+        if (terminal.id === paneId) {
+          paneReport = sessionReportOf(terminal, h.getTerminalId?.() ?? null);
+          continue;
+        }
+        const sessionFile = hresumeSessionFile(terminal.labels[HRESUME_LABEL]);
+        if (sessionFile) taken.add(bareSessionId(sessionFile));
+      }
+    } catch {
+      /* the list is how other terminals' claims are read; the pane itself is asked below */
+    }
+    // list may not include a terminal created moments ago: ask for it directly before giving up.
+    paneReport ??= await readSessionReport(paneId);
+    return {
+      reported: paneReport.kind === 'reported' ? paneReport.file : null,
+      taken,
+      identity: paneReport.kind === 'not-ours' ? 'other' : 'ours',
+    };
+  }
+
+  /** Ordered candidates: the worker's own `hresume` report (authoritative, spec S18), the value the
+   *  row already carries (which is where a settlement document's `session` lands), then the newest
+   *  session files.
+   *
+   *  A session another terminal reports is never adopted — it is a conversation already claimed. The
+   *  pane's own report is the exception: a person attaching to the same session in a second pane makes
+   *  the session "taken", and filtering the worker's own report through that set would throw away the
+   *  only authoritative candidate. And when the address holds a terminal that is not this task's own,
+   *  nothing about the pane is a candidate at all: an address identifies no conversation (S26). */
   async function resolveSessionFileCandidates(paneId: string, cwd: string, preferred?: string | null): Promise<string[]> {
     // A sub's sessionFile must never resolve to the master's own transcript (compare via
     // bareSessionId: herdr reports ids and paths interchangeably).
     const own = bareSessionId(h.getSessionId());
-    const { reported, taken } = await reportedAndTaken(paneId);
+    const { reported, taken, identity } = await reportedAndTaken(paneId);
     const out: string[] = [];
-    const push = (file: string | null): void => {
+    const push = (file: string | null, claimedByAnother: boolean): void => {
       if (!file || out.includes(file)) return;
       const id = bareSessionId(file);
       if (own && id === own) return;
-      if (taken.has(id)) return;
+      if (claimedByAnother && taken.has(id)) return;
       out.push(file);
     };
-    push(resolveSessionFileValue(cwd, h.sessionsDir(), preferred));
-    push(resolveSessionFileValue(cwd, h.sessionsDir(), reported));
-    for (const f of listSessionFiles(cwd, h.sessionsDir(), 4)) push(f);
+    push(reported, false);
+    push(resolveSessionFileValue(cwd, h.sessionsDir(), preferred), true);
+    if (identity === 'other') return out;
+    for (const f of listSessionFiles(cwd, h.sessionsDir(), 4)) push(f, true);
     return out;
   }
 
@@ -409,20 +479,23 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     // Tolerate fs timestamp granularity against the pre-injection injectTs capture.
     const minMtimeMs = sinceTs - 2_000;
     const own = bareSessionId(h.getSessionId());
-    const { reported, taken } = await reportedAndTaken(paneId);
+    const { reported, taken, identity } = await reportedAndTaken(paneId);
     // Own/taken exclusions apply to `preferred` too: a registry value pointing at the master's own
-    // transcript is always "fresh", so the gate cannot veto it and herdr's report takes over.
-    const preferredId = preferred ? bareSessionId(preferred) : null;
-    const preferredHeld = preferredId != null && ((own != null && preferredId === own) || taken.has(preferredId));
-    const preferredStamp = preferred ? stampOf(preferred) : null;
-    if (preferred && !preferredHeld && preferredStamp && preferredStamp.mtimeMs >= minMtimeMs) return preferred;
-    const file = resolveSessionFileValue(cwd, h.sessionsDir(), reported);
-    if (!file) return null;
-    const id = bareSessionId(file);
-    if (own && id === own) return null;
-    if (taken.has(id)) return null;
-    const stamp = stampOf(file);
-    return stamp && stamp.mtimeMs >= minMtimeMs ? file : null;
+    // transcript is always "fresh", so the gate cannot veto it.
+    const fresh = (file: string | null): string | null => {
+      if (!file) return null;
+      const id = bareSessionId(file);
+      if (own && id === own) return null;
+      if (taken.has(id)) return null;
+      const stamp = stampOf(file);
+      return stamp && stamp.mtimeMs >= minMtimeMs ? file : null;
+    };
+    // The live report is the authority (spec S18), so a fresh one repairs the row before the value the
+    // row already carries is trusted: a report that lags, is stale, or comes from a terminal that is
+    // not this task's own leaves room for the row's own post-request value. Null means "keep the old
+    // one", never an mtime guess.
+    const fromReport = identity === 'other' ? null : fresh(resolveSessionFileValue(cwd, h.sessionsDir(), reported));
+    return fromReport ?? fresh(preferred);
   }
 
   async function readTurnClosingFor(
@@ -445,7 +518,7 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
 
   return {
     resolveSessionFile,
-    reportedSessionFile: (paneId: string) => reportedSessionFileOf(h.client, paneId),
+    readSessionReport,
     readAskFlag,
     probeAlive,
     readTurnClosing: readTurnClosingFor,
@@ -483,8 +556,9 @@ export async function executeSubagentOutput(
     /** Monotonic per-pane read counter shown in the header. */
     nextRevision: (paneId: string) => number;
     /** Last finalized assistant text from the worker's transcript: the pane read alone cannot
-     * recover it when the fullscreen TUI shows only the status overlay. Optional for tests. */
-    readFinalReport?: (paneId: string, entryCwd: string) => Promise<string | null>;
+     * recover it when the fullscreen TUI shows only the status overlay. Optional for tests. The third
+     * argument is the session the row already carries, which is tried before the live label. */
+    readFinalReport?: (paneId: string, entryCwd: string, preferred: string | null) => Promise<string | null>;
     /** Persists the generation's `reportDelivered` so the settlement notice can skip a report already shown. */
     writeRecord?: (entry: TaskEntry) => void;
   },
@@ -532,7 +606,7 @@ export async function executeSubagentOutput(
   let reportSection: string | null = null;
   if ((status === 'settled' || status === 'idle') && deps.readFinalReport) {
     try {
-      const report = await deps.readFinalReport(entry.gen.paneId, entry.cwd);
+      const report = await deps.readFinalReport(entry.gen.paneId, entry.cwd, entry.gen.sessionFile);
       const fingerprint = report ? reportFingerprint(report) : '';
       if (report && fingerprint && fingerprint !== deltaResult.nextCursor.reportTail) {
         const bounded = boundText(report, Math.max(1, Math.min(maxChars ?? OUTPUT_DEFAULT_MAX_CHARS, OUTPUT_HARD_CAP_CHARS)));

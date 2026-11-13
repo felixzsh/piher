@@ -1108,6 +1108,58 @@ test('subagent plugin: interrupt names the way back for a settled and for a clos
   }
 });
 
+test('subagent plugin: interrupt presses the pane\'s own stop key in the core and states what it saw', async () => {
+  // The core's `terminal.interrupt` IS the stop key in that pane (esc/ctrl+c, the vendored contract),
+  // so the action is only as good as the call and the wording of its result. Both are pinned here.
+  const outcomes = [
+    { outcome: 'stopped' as const, detail: /The core reports the turn stopped\./ },
+    { outcome: 'still_working' as const, detail: /The core reports the turn still running; it was asked to stop\./ },
+    { outcome: 'exited' as const, detail: /Its process had already exited\./ },
+    { outcome: 'unknown' as const, detail: null },
+  ];
+  for (const { outcome, detail } of outcomes) {
+    const calls: string[] = [];
+    const { root, pi } = await mountSubagent({
+      client: {
+        getTerminal: async (id: string) => terminalInfo({ id, status: 'working' }),
+        interrupt: async (id: string) => { calls.push(id); return outcome; },
+      },
+      tasks: [taskRow({ paneId: 'p-work', taskId: 'task-work' })],
+    });
+    try {
+      const res = await runSubagent(pi, { action: 'interrupt', agentId: 'p-work' });
+      assert.deepEqual(calls, ['p-work'], 'the core stops the turn; nothing is written and nothing is killed');
+      const text = res.content[0]!.text;
+      assert.match(text, /Interrupt accepted for subagent p-work \(fire-and-return\)\./);
+      if (detail) assert.match(text, detail);
+      else assert.match(text, /\(fire-and-return\)\.$/, 'a core that does not say adds no claim (S17)');
+      assert.equal(/is closed|nothing to stop/i.test(text), false, 'the accepted path refuses nothing');
+    } finally {
+      await root.fiber.dispose();
+    }
+  }
+});
+
+test('subagent plugin: interrupt acts on a consumed row whose worker is still turning (isSpent is not the question)', async () => {
+  // `isSpent` says the master already holds this task's report, not that the worker has no turn: a
+  // person may type into a persistent worker's attachable pane afterwards (S21), and that turn is
+  // exactly what someone wants stopped. The probe decides, so a consumed row with a live turn stops.
+  const calls: string[] = [];
+  const { root, pi } = await mountSubagent({
+    client: {
+      getTerminal: async (id: string) => terminalInfo({ id, status: 'working' }),
+      interrupt: async (id: string) => { calls.push(id); return 'stopped'; },
+    },
+    tasks: [taskRow({ paneId: 'p-typed', taskId: 'task-typed', consumedAt: 1_000 })],
+  });
+  try {
+    await runSubagent(pi, { action: 'interrupt', agentId: 'p-typed' });
+    assert.deepEqual(calls, ['p-typed'], 'a consumed persistent row can still be interrupted');
+  } finally {
+    await root.fiber.dispose();
+  }
+});
+
 test('subagent plugin: close reclaims a finished worker and keeps its task resumable', async () => {
   const retired: string[] = [];
   const { root, pi } = await mountSubagent({

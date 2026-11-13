@@ -172,6 +172,65 @@ test('resolveSessionFile: the own label wins over the mtime order; a pipe self-r
   home.dispose();
 });
 
+test('resolveSessionFile: the worker\'s own report outranks the value the row carries (spec S18)', async () => {
+  const { home, cwd, file, sessionsDir } = projectSessions('piher-session-order-');
+  const reported = file('2026-09-20T05-21-01-111Z_11111111-2222-3333-4444-555555555555.jsonl');
+  const preferred = file('2026-09-20T05-14-07-064Z_01a0bd3c-6557-746b-adf6-5128f2326c57.jsonl');
+  // The row's value is the older file: S18 makes the worker's own report the authority, not the row.
+  const ioFor = () => createSessionIo({
+    client: sessionClient({ tW: reported }),
+    getSessionId: () => '22222222-2222-3333-4444-555555555555',
+    sessionsDir: () => sessionsDir,
+  });
+  assert.equal(
+    await ioFor().resolveSessionFile('tW', cwd, preferred),
+    reported,
+    'the live `hresume` report comes before the value the row already carries',
+  );
+  home.dispose();
+});
+
+test('resolveSessionFile: a session a second pane also reports does not displace the worker\'s own report', async () => {
+  const { home, cwd, file, sessionsDir } = projectSessions('piher-session-attached-');
+  const sub = file('2026-09-20T05-21-01-111Z_11111111-2222-3333-4444-555555555555.jsonl');
+  const newer = file('2026-09-20T05-30-01-111Z_99999999-2222-3333-4444-555555555555.jsonl');
+  utimesSync(newer, 9_000, 9_000);
+  // A person attached to the worker's own session in a second pane (S21): that label claims the same
+  // session, so the session is "taken" — and the worker's own report must still win for its pane,
+  // or a resume/output read would fall through to an unrelated newer file.
+  const io = createSessionIo({
+    client: sessionClient({ tW: sub, tHuman: sub }),
+    getSessionId: () => '22222222-2222-3333-4444-555555555555',
+    sessionsDir: () => sessionsDir,
+  });
+  assert.equal(await io.resolveSessionFile('tW', cwd), sub);
+  home.dispose();
+});
+
+test('resolveSessionFile: a terminal this master did not make is not this task\'s conversation', async () => {
+  const { home, cwd, file, sessionsDir } = projectSessions('piher-session-reused-');
+  const other = file('2026-09-20T05-21-01-111Z_11111111-2222-3333-4444-555555555555.jsonl');
+  const preferred = file('2026-09-20T05-14-07-064Z_01a0bd3c-6557-746b-adf6-5128f2326c57.jsonl');
+  const terminal = (): ReturnType<typeof terminalInfo> => terminalInfo({
+    id: 't9', parent: 'tOTHER', labels: { [HRESUME_LABEL]: hresumeLabel(other) },
+  });
+  // A core restart reopened the address under another master (S26's premise): its `hresume` label is
+  // that worker's conversation, so neither it nor an mtime guess over the checkout may be adopted.
+  const io = createSessionIo({
+    client: fakeCore({ listTerminals: async () => [terminal()], getTerminal: async () => terminal() }),
+    getSessionId: () => '22222222-2222-3333-4444-555555555555',
+    sessionsDir: () => sessionsDir,
+    getTerminalId: () => 't0',
+  });
+  assert.equal(await io.resolveSessionFile('t9', cwd), null, 'no candidate at all: the address is not ours');
+  assert.equal(
+    await io.resolveSessionFile('t9', cwd, preferred),
+    preferred,
+    'the record\'s own value still reads; only the foreign address is dropped',
+  );
+  home.dispose();
+});
+
 test('reattributeStaleSessionFile: repairs a stale or poisoned value from the worker label, never guesses', async () => {
   const agentDir = mkdtempSync(join(tmpdir(), 'piher-session-reattr-'));
   const file = (name: string): string => {
@@ -204,6 +263,24 @@ test('reattributeStaleSessionFile: repairs a stale or poisoned value from the wo
   // the report repairs it instead of returning null (= keep the old value).
   assert.equal(await reattribute(foreignFile, ownFile), foreignFile);
   assert.equal(await reattribute(foreignFile, takenFile), foreignFile);
+});
+
+test('reattributeStaleSessionFile: a fresh report repairs a fresh row value, because the report is the authority', async () => {
+  const agentDir = mkdtempSync(join(tmpdir(), 'piher-session-reattr2-'));
+  const file = (name: string): string => {
+    const path = join(agentDir, name);
+    writeFileSync(path, '{}\n');
+    return path;
+  };
+  const reported = file('2026-09-21T06-00-00-000Z_11111111-1111-4111-8111-111111111111.jsonl');
+  // Both were written after the request, so freshness cannot separate them; S18 does.
+  const wrongPreferred = file('2026-09-21T06-00-00-000Z_22222222-2222-4222-8222-222222222222.jsonl');
+  const io = createSessionIo({
+    client: sessionClient({ tStale: reported }),
+    getSessionId: () => '33333333-3333-4333-8333-333333333333',
+    sessionsDir: () => agentDir,
+  });
+  assert.equal(await io.reattributeStaleSessionFile('tStale', '/tmp/proj', Date.now(), wrongPreferred), reported);
 });
 
 
@@ -609,10 +686,204 @@ test('resume: a task with no session anywhere is refused, and the refusal names 
   try {
     await fire(pi, 'session_start', { reason: 'reload' }, {});
     const refused = await runSubagentRejects(pi, { action: 'resume', taskId }, cwd);
-    assert.match(refused, /has no session to resume/);
-    assert.match(refused, /`hresume` label/, 'the refusal names the report that is missing');
-    assert.match(refused, /`session`/, 'and the document field that would have carried it');
-    assert.match(refused, /fresh conversation/);
+    // The refusal is the contract's fixed shape, and each clause names what that read established:
+    // the terminal was read and reports no session, no document was found, the record carries none.
+    assert.equal(
+      refused,
+      `task ${taskId} has no session to resume: its core terminal reports no session, it has no `
+      + 'settlement document, and its record carries none — reviving it would start a fresh conversation. '
+      + 'Use action "spawn" for new work, or "retry" to start a new task from the same brief.',
+    );
+  } finally {
+    await root.fiber.dispose();
+    home.dispose();
+  }
+});
+
+test('resume: the contract\'s canonical refusal is what a gone terminal and a reportless document say', async () => {
+  const home = new TempHome('piher-resume-canonical-');
+  const cwd = mkdtempSync(join(tmpdir(), 'piher-resume-canonical-cwd-'));
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const viewFile = join(home.dir('views'), '2026-09-20T07-10-00-000Z_66666666-6666-4666-8666-666666666666.jsonl');
+  const taskId = '99999999-9999-4999-8999-999999999999';
+  seedTaskDocuments(viewFile, [{
+    taskId, paneId: 'pgone', tabId: 't0', tabName: 'main',
+    cwd, description: 'gone conversation', sessionFile: null, createdAt: Date.now() - 60_000,
+  }]);
+  const { root, pi } = await mountSubagent({
+    client: {
+      listTerminals: async () => [],
+      getTerminal: async () => null,
+      // The document survived the worker (S12) and is read before the refusal: it reports no session.
+      docGet: async (name) => (name === 'piher.rep.pgone'
+        ? { value: { taskId, turn: 1, stopReason: 'stop', session: null, text: 'did the work', at: 1_000 }, version: 3 }
+        : { value: null, version: 0 }),
+    },
+    deps: {
+      getSessionId: () => '66666666-6666-4666-8666-666666666666',
+      getSessionFile: () => viewFile,
+      getCwd: () => cwd,
+    },
+  });
+  try {
+    await fire(pi, 'session_start', { reason: 'reload' }, {});
+    const refused = await runSubagentRejects(pi, { action: 'resume', taskId }, cwd);
+    assert.equal(
+      refused,
+      `task ${taskId} has no session to resume: its core terminal is gone, its settlement `
+      + 'document reported no session, and its record carries none — reviving it would start a fresh '
+      + 'conversation. Use action "spawn" for new work, or "retry" to start a new task from the same brief.',
+    );
+  } finally {
+    await root.fiber.dispose();
+    home.dispose();
+  }
+});
+
+test('resume: the settlement document restores the session the record lost, and says so', async () => {
+  const home = new TempHome('piher-resume-doc-');
+  const cwd = mkdtempSync(join(tmpdir(), 'piher-resume-doc-cwd-'));
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const sessionFile = join(home.dir('sessions'), '2026-09-20T07-20-00-000Z_55555555-5555-4555-8555-555555555555.jsonl');
+  writeFileSync(sessionFile, '{}\n');
+  const viewFile = join(home.dir('views'), '2026-09-20T07-20-00-000Z_55555555-5555-4555-8555-555555555556.jsonl');
+  const taskId = 'aaaa1111-2222-4333-8444-555555555555';
+  seedTaskDocuments(viewFile, [{
+    taskId, paneId: 'pdoc', tabId: 't0', tabName: 'main',
+    cwd, description: 'document restore', sessionFile: null, createdAt: Date.now() - 60_000,
+  }]);
+  const { root, pi } = await mountSubagent({
+    client: {
+      // The pane the record names is gone; a second pane already runs the session the document names
+      // (D94), which is the pane resume may reuse without starting a competing pi process.
+      listTerminals: async () => [terminalInfo({ id: 'pother', labels: { [HRESUME_LABEL]: hresumeLabel(sessionFile) } })],
+      getTerminal: async () => null,
+      docGet: async (name) => (name === 'piher.rep.pdoc'
+        ? { value: { taskId, turn: 1, stopReason: 'stop', session: sessionFile, text: 'carried on', at: 2_000 }, version: 4 }
+        : { value: null, version: 0 }),
+    },
+    deps: {
+      getSessionId: () => '55555555-5555-4555-8555-555555555555',
+      getSessionFile: () => viewFile,
+      getCwd: () => cwd,
+    },
+  });
+  try {
+    await fire(pi, 'session_start', { reason: 'reload' }, {});
+    const resumed = await runSubagent(pi, { action: 'resume', taskId }, cwd);
+    assert.match(resumed.content[0]!.text, /session restored from its settlement document/);
+    assert.equal(readTaskRecord(cwd, taskId)?.gen.sessionFile, sessionFile, 'the record now carries it');
+    assert.equal(resumed.details?.paneId, 'pother', 'the pane running that session is the one reused');
+  } finally {
+    await root.fiber.dispose();
+    home.dispose();
+  }
+});
+
+test('resume: a document naming another task means the address was reused, so its label is never read', async () => {
+  const home = new TempHome('piher-resume-reused-');
+  const cwd = mkdtempSync(join(tmpdir(), 'piher-resume-reused-cwd-'));
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const otherSession = join(home.dir('sessions'), '2026-09-20T07-30-00-000Z_44444444-4444-4444-8444-444444444444.jsonl');
+  writeFileSync(otherSession, '{}\n');
+  const viewFile = join(home.dir('views'), '2026-09-20T07-30-00-000Z_44444444-4444-4444-8444-444444444445.jsonl');
+  const taskId = 'bbbb2222-3333-4444-8555-666666666666';
+  seedTaskDocuments(viewFile, [{
+    taskId, paneId: 't9', tabId: 't0', tabName: 'main',
+    cwd, description: 'address reused', sessionFile: null, createdAt: Date.now() - 60_000,
+  }]);
+  const { root, pi } = await mountSubagent({
+    client: {
+      // Not listed, so session recovery arms no watch: the pane is read only through `getTerminal`.
+      listTerminals: async () => [],
+      getTerminal: async (id) => terminalInfo({ id, status: 'idle', labels: { [HRESUME_LABEL]: hresumeLabel(otherSession) } }),
+      // A core restart reopened the same address for a different task (S26's own premise).
+      docGet: async (name) => (name === 'piher.rep.t9'
+        ? { value: { taskId: 'cccc3333-4444-4555-8666-777777777777', turn: 2, stopReason: 'stop', session: otherSession, text: 'someone else', at: 3_000 }, version: 1 }
+        : { value: null, version: 0 }),
+    },
+    deps: {
+      getSessionId: () => '44444444-4444-4444-8444-444444444444',
+      getSessionFile: () => viewFile,
+      getCwd: () => cwd,
+    },
+  });
+  try {
+    await fire(pi, 'session_start', { reason: 'reload' }, {});
+    const refused = await runSubagentRejects(pi, { action: 'resume', taskId }, cwd);
+    assert.match(refused, /cannot be resumed at its address t9/);
+    assert.match(refused, /another task's settlement document/, 'the established fact is named');
+    assert.doesNotMatch(refused, /has no session to resume/, 'nothing about this task\'s session was established');
+    assert.equal(readTaskRecord(cwd, taskId)?.gen.sessionFile, null, 'the other conversation is never adopted');
+  } finally {
+    await root.fiber.dispose();
+    home.dispose();
+  }
+});
+
+test('resume: a core that does not answer is not reported as a task with no session', async () => {
+  const home = new TempHome('piher-resume-unreadable-');
+  const cwd = mkdtempSync(join(tmpdir(), 'piher-resume-unreadable-cwd-'));
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const viewFile = join(home.dir('views'), '2026-09-20T07-50-00-000Z_22222222-2222-4222-8222-222222222223.jsonl');
+  const taskId = 'eeee5555-6666-4777-8888-999999999999';
+  seedTaskDocuments(viewFile, [{
+    taskId, paneId: 'paway', tabId: 't0', tabName: 'main',
+    cwd, description: 'core outage', sessionFile: null, createdAt: Date.now() - 60_000,
+  }]);
+  const { root, pi } = await mountSubagent({
+    client: {
+      listTerminals: async () => [],
+      getTerminal: async () => { throw new Error('core unreachable'); },
+      docGet: async () => { throw new Error('core unreachable'); },
+    },
+    deps: {
+      getSessionId: () => '22222222-2222-4222-8222-222222222223',
+      getSessionFile: () => viewFile,
+      getCwd: () => cwd,
+    },
+  });
+  try {
+    await fire(pi, 'session_start', { reason: 'reload' }, {});
+    const refused = await runSubagentRejects(pi, { action: 'resume', taskId }, cwd);
+    assert.match(refused, /the core did not answer for its terminal paway or its settlement document/);
+    assert.match(refused, /Try action "resume" again once the core answers\./);
+    assert.doesNotMatch(refused, /has no session to resume/, 'an unanswered read establishes nothing');
+  } finally {
+    await root.fiber.dispose();
+    home.dispose();
+  }
+});
+
+test('resume: a label that is not a pi report is not this task\'s session', async () => {
+  const home = new TempHome('piher-resume-agent-');
+  const cwd = mkdtempSync(join(tmpdir(), 'piher-resume-agent-cwd-'));
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const foreign = join(home.dir('sessions'), '2026-09-20T07-40-00-000Z_33333333-3333-4333-8333-333333333333.jsonl');
+  writeFileSync(foreign, '{}\n');
+  const viewFile = join(home.dir('views'), '2026-09-20T07-40-00-000Z_33333333-3333-4333-8333-333333333334.jsonl');
+  const taskId = 'dddd4444-5555-4666-8777-888888888888';
+  seedTaskDocuments(viewFile, [{
+    taskId, paneId: 'pa', tabId: 't0', tabName: 'main',
+    cwd, description: 'another agent', sessionFile: null, createdAt: Date.now() - 60_000,
+  }]);
+  const label = JSON.stringify({ agent: 'claude', session: 'x', file: foreign, cwd: '/w', pid: 1, boot: 'b' });
+  const { root, pi } = await mountSubagent({
+    client: {
+      listTerminals: async () => [],
+      getTerminal: async (id) => terminalInfo({ id, status: 'idle', labels: { [HRESUME_LABEL]: label } }),
+    },
+    deps: {
+      getSessionId: () => '33333333-3333-4333-8333-333333333334',
+      getSessionFile: () => viewFile,
+      getCwd: () => cwd,
+    },
+  });
+  try {
+    await fire(pi, 'session_start', { reason: 'reload' }, {});
+    const refused = await runSubagentRejects(pi, { action: 'resume', taskId }, cwd);
+    assert.match(refused, /is not its own \(its label was written by claude, not pi\)/);
+    assert.equal(readTaskRecord(cwd, taskId)?.gen.sessionFile, null);
   } finally {
     await root.fiber.dispose();
     home.dispose();

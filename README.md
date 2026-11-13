@@ -43,9 +43,12 @@ its own rules.
   from the core's own `hresume` label, written by the worker's Herdr extension — piher writes no
   session label of its own.
 - Machine-to-machine messages use **the core's documents** (`piher.rep.<address>`,
-  `piher.cmd.<address>`), never PTY injection and never a socket of piher's: PTY input belongs to the
-  human at that pane, and the extension opens no listener. Core's parent notes are disabled for worker
-  terminals (`noNotify: true`).
+  `piher.cmd.<address>`), never a socket of piher's, and the extension opens no listener: a report, a
+  steer and a replacement request all travel as document values. Two keystrokes are piher's and only
+  two: the worker's first task (`terminal.send`, then `enter` when the brief stayed in the composer,
+  gated on the core's `idle`) and `interrupt` (`terminal.interrupt` presses the pane's own stop key,
+  `esc` or `ctrl+c`). Everything else leaves the pane's keyboard to the person at it, and core's
+  parent notes are disabled for worker terminals (`noNotify: true`).
 - State arrives through core's `events.subscribe` (`status` / `turn` / `finished` / `labels`); a
   snapshot is pulled only when an event fires or a `missed` event says to resync.
 

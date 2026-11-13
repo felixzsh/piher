@@ -13,10 +13,7 @@ import { runtimePolicy, type RuntimePolicy } from './runtime-policy.ts';
 import { formatFailureNotice, formatSettlementNotice } from './vocab.ts';
 import { settlementCard, type SettlementCard, type SettlementOutcome } from './settlement-card.ts';
 import { buildBlockedGateNotice, reportFingerprint } from './subagent-core.ts';
-import {
-  isReportDocumentValue, planReportDelivery, reportDeliveryKey, reportDocName,
-  type ReportDocumentValue,
-} from './report-documents.ts';
+import { planReportDelivery, readReportDocument, reportDeliveryKey } from './report-documents.ts';
 import { retirePane } from './subagent-gc.ts';
 import type { SessionIo } from './subagent-session.ts';
 
@@ -171,7 +168,7 @@ export interface PollerHost {
 
 export interface Poller {
   /** Resolves to whether the watch is armed; the loop itself runs detached. */
-  startPoller(paneId: string, cwd: string, injectTs: number, description: string, requestId: string): Promise<boolean>;
+  startPoller(paneId: string, cwd: string, injectTs: number, description: string): Promise<boolean>;
   readonly pollers: Set<string>;
 }
 
@@ -180,7 +177,10 @@ export function createPoller(h: PollerHost): Poller {
   const subScopes = new Map<string, { dispose: () => Promise<void> }>();
   /** Current tracked request per pane. startPoller refreshes it even while a poller runs: a
    * follow_up must judge settlement against its own injectTs, not the original request's. */
-  const requestByPane = new Map<string, { injectTs: number; description: string; requestId: string }>();
+  /** The request a pane's settle is judged against — its boundary and the description that labels
+   *  the notice. There is no request id: the settlement's identity is the document instance
+   *  (`address`, `at`), so an id here would be carried and never read (D50). */
+  const requestByPane = new Map<string, { injectTs: number; description: string }>();
   /** Settlements already handed over from a report document, keyed by (`address`, `at`) — the
    *  document instance (spec S7). The address identifies the generation and `at` identifies the
    *  settle, so a re-read of the same document is a repeat while a revived worker's own settlement
@@ -205,22 +205,6 @@ export function createPoller(h: PollerHost): Poller {
     outcome,
     now: now(),
   });
-
-  /** One `doc.get` for the worker's report document (spec S23): the `turn`/`status` event above
-   *  is the trigger, this read is the settlement. Null when no document was written, when it is
-   *  not a report, or when the document store cannot answer — then there is nothing to settle, and
-   *  the silence budget (not a guess) owns the wait. */
-  async function readReportDocument(paneId: string): Promise<ReportDocumentValue | null> {
-    const name = reportDocName(paneId);
-    if (!name) return null;
-    try {
-      const got = await h.client.docGet(name);
-      if (got && isReportDocumentValue(got.value)) return got.value;
-    } catch {
-      /* a blind document store must not kill the loop */
-    }
-    return null;
-  }
 
   /** The worker as the watch sees it. A blind watch (disconnected) never settles or fails anything. */
   async function observe(paneId: string): Promise<{
@@ -248,7 +232,6 @@ export function createPoller(h: PollerHost): Poller {
     cwd: string,
     injectTs: number,
     description: string,
-    requestId: string,
   ): Promise<void> {
     const startedAt = now();
     let lastActivityAt = now();
@@ -259,8 +242,8 @@ export function createPoller(h: PollerHost): Poller {
       if (!row) return;
       row.gen.consumedAt = at;
       h.writeRecord(row);
-      // S54: a one-shot worker exits after pushing its report, so its pane is reclaimed here — the
-      // notice already carries the text, and the pane must not linger for the GC TTL.
+      // S54: a one-shot worker exits once its report document is written, so its pane is reclaimed
+      // here — the notice already carries the text, and the pane must not linger for the GC TTL.
       if (row.lifecycle === 'one-shot') {
         if (h.reclaim) h.reclaim(row);
         else void retirePane(h.client, paneId);
@@ -278,7 +261,7 @@ export function createPoller(h: PollerHost): Poller {
     async function handOver(
       entry: TaskEntry,
       closing: string | null,
-      request: { injectTs: number; description: string; requestId: string },
+      request: { injectTs: number; description: string },
       /** The report states a reason instead of a text (an error, a refused tool). A settlement
        *  notice over it would read as success. */
       failure: string | null = null,
@@ -318,9 +301,10 @@ export function createPoller(h: PollerHost): Poller {
      *  - `absent` no report document yet: nothing to settle, the silence budget owns the wait. */
     async function deliverDocument(
       entry: TaskEntry,
-      request: { injectTs: number; description: string; requestId: string },
+      request: { injectTs: number; description: string },
     ): Promise<'delivered' | 'retry' | 'duplicate' | 'stale' | 'foreign' | 'absent'> {
-      const value = await readReportDocument(paneId);
+      const read = await readReportDocument(h.client, paneId);
+      const value = read.kind === 'read' ? read.value : null;
       if (!value) return 'absent';
       const plan = planReportDelivery({
         value,
@@ -372,7 +356,7 @@ export function createPoller(h: PollerHost): Poller {
     };
     try {
       while (true) {
-        const current = requestByPane.get(paneId) ?? { injectTs, description, requestId };
+        const current = requestByPane.get(paneId) ?? { injectTs, description };
         const entry = taskForPane(h.tasks, h.panes, paneId);
         if (!entry || isClosed(entry) || isSpent(entry)) return;
         if (armedConsumed) return;
@@ -507,12 +491,11 @@ export function createPoller(h: PollerHost): Poller {
     cwd: string,
     injectTs: number,
     description: string,
-    requestId: string,
   ): Promise<boolean> {
     // Always refresh first: a follow_up arriving while the spawn poller still runs must move
     // settlement judgment to the new request instead of being dropped by the has() guard.
     const sinceTs = Math.max(0, injectTs - REQUEST_BOUNDARY_SLACK_MS);
-    requestByPane.set(paneId, { injectTs: sinceTs, description, requestId });
+    requestByPane.set(paneId, { injectTs: sinceTs, description });
     if (pollers.has(paneId)) return true; // an armed watch already reads this pane
     pollers.add(paneId);
     try {
@@ -529,7 +512,7 @@ export function createPoller(h: PollerHost): Poller {
     }
     void (async () => {
       try {
-        await pollLoop(paneId, cwd, sinceTs, description, requestId);
+        await pollLoop(paneId, cwd, sinceTs, description);
       } catch (err) {
         console.error(`piher: subagent poller ${paneId} crashed: ${(err as Error)?.message ?? err}`);
       } finally {
