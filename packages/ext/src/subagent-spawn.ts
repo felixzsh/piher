@@ -35,6 +35,7 @@ import {
 } from './subagent-core.ts';
 import { allocateTaskSlug, taskRef, type TaskEntry } from './task-row.ts';
 import type { Poller } from './subagent-poller.ts';
+import { formatWatchNotArmedNotice } from './subagent-poller.ts';
 import type { SessionIo } from './subagent-session.ts';
 import { HRESUME_LABEL, TASK_LABEL, hresumeSessionFile, hresumeReport } from './subagent-session.ts';
 
@@ -691,6 +692,21 @@ export function createSpawnAction(h: SpawnActionHost) {
   const { spawnPaneInTaskTab, launchParts, waitReady, deliverFirstTask, readinessTimeoutMs } = h.spawn;
   const { startPoller } = h.poller;
 
+  /** Arm this pane's settlement watch and answer whether one took it. A worker no watch reads
+   *  settles into silence: its outcome never arrives by itself, so the caller must say so now. */
+  const armSettlementWatch = async (
+    paneId: string,
+    cwd: string,
+    injectTs: number,
+    description: string,
+  ): Promise<boolean> => {
+    try {
+      return await startPoller(paneId, cwd, injectTs, description);
+    } catch {
+      return false; // startPoller reports its own failure; a throwing host is the same fact
+    }
+  };
+
   return async function executeSubagentSpawn(
     params: Record<string, unknown> | undefined,
     toolCtx: unknown,
@@ -865,13 +881,21 @@ export function createSpawnAction(h: SpawnActionHost) {
           budgetMs: Math.max(0, deadline - Date.now()),
           statusAtReady: ready.status,
         });
-        void startPoller(paneId, cwd, injectTs, spec.description);
+        // S6: the report document is the settlement channel, and only an armed watch reads it. A
+        // watch that could not arm is said out loud here, while the master can still act on it.
+        if (!await armSettlementWatch(paneId, cwd, injectTs, spec.description)) {
+          try {
+            await h.notifySpawnFailed(formatWatchNotArmedNotice({ paneId, taskId, description: spec.description }));
+          } catch { /* a missed notice must not break the session */ }
+        }
         h.writeRecord(entry);
       })();
       h.boots.set(paneId, boot);
       void boot.catch(async (err: unknown) => {
         const reason = (err as Error)?.message ?? String(err);
         const keep = err instanceof BootFailure && err.keepPane;
+        /** Whether a watch took this pane: only a kept row arms one, and the notice says which. */
+        let armed = false;
         // A pane that is gone leaves nothing behind: retire the terminal, drop the row and its record.
         // A pane that is alive is kept with its row, because the failure text tells the master to read
         // it, answer its dialog or retry — advice a kill would make impossible.
@@ -888,12 +912,15 @@ export function createSpawnAction(h: SpawnActionHost) {
           // poller is what sets it here: its silence budget is the watchdog that ends a worker which
           // never took its task, and it also owns the blocked-gate notice for a pane a person must
           // answer. Without it the pane, row, record and any checkout would live out the session.
-          void startPoller(paneId, cwd, Date.now(), spec.description);
+          // A watch that cannot arm leaves no watchdog: the notice below must not promise one.
+          armed = await armSettlementWatch(paneId, cwd, Date.now(), spec.description);
         }
         try {
           await h.notifySpawnFailed(
             keep
-              ? `Subagent "${spec.description}" (pane ${paneId}, task ${taskId}) is up but did not take its first message: ${reason} The pane and the task are still there — read it with action "output" (agentId ${paneId}), then retry task ${taskId} or close it. If nothing answers, its silence budget ends it.`
+              ? `Subagent "${spec.description}" (pane ${paneId}, task ${taskId}) is up but did not take its first message: ${reason} The pane and the task are still there — read it with action "output" (agentId ${paneId}), then retry task ${taskId} or close it. ${armed
+                ? 'If nothing answers, its silence budget ends it.'
+                : 'No settlement watch could be armed for it, so its outcome will not arrive on its own — check it with action "output", then retry or close it.'}`
               : `Subagent "${spec.description}" (pane ${paneId}, task ${taskId}) failed to start: ${reason} Nothing is running there; spawn it again if the task still matters.`,
           );
         } catch { /* a missed notice must not break the session */ }

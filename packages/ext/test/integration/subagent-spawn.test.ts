@@ -687,6 +687,22 @@ test('spawn action: an acknowledgement now, the prompt later, the report as a no
   });
 });
 
+test('spawn action: a settlement watch that cannot arm is told to the master, not left silent', async () => {
+  // The promise is that the outcome arrives without asking. A spawn whose watch never armed has no
+  // such path, so silence here is a lie the master only discovers by polling.
+  await withWorkerEnv(async (env) => {
+    const spawned = await runSubagent(env.pi, { description: 'no watch probe', prompt: PROMPT }, env.cwd);
+    assert.match(spawned.content[0]!.text, /^started subagent/, 'the worker still starts');
+    const taskId = spawned.details?.taskId as string;
+    await waitFor(() => env.pi.userSent.some((m) => /settlement watch could not be armed/.test(m.content)));
+    const notice = env.pi.userSent.map((m) => m.content).find((c) => /settlement watch could not be armed/.test(c));
+    assert.ok(notice, `the master is told in the moment: ${JSON.stringify(env.pi.userSent)}`);
+    assert.match(notice!, /no notice will arrive by itself/i);
+    assert.match(notice!, /action "output"/, 'it names the way to watch the worker by hand');
+    assert.ok(readTaskRecord(env.cwd, taskId) !== null, 'the row is kept: the worker itself is running');
+  }, { brokenSessionRoot: true });
+});
+
 test('spawn env: the worker gets the spawn contract on top of the caller environment', async () => {
   await withWorkerEnv(async (env) => {
     await runSubagent(env.pi, { description: 'probe', prompt: PROMPT }, env.cwd);
