@@ -12,6 +12,7 @@ import {
 import { runtimePolicy, type RuntimePolicy } from './runtime-policy.ts';
 import { formatFailureNotice, formatSettlementNotice } from './vocab.ts';
 import { settlementCard, type SettlementCard, type SettlementOutcome } from './settlement-card.ts';
+import type { NoticeRow } from './index-notices.ts';
 import { buildBlockedGateNotice, reportFingerprint } from './subagent-core.ts';
 import { planReportDelivery, readReportDocument, reportDeliveryKey, reportDocName } from './report-documents.ts';
 import { planLedgerReplay, type SettlementEvent, type SettlementEventKind, type SettlementLedger } from './settlement-ledger.ts';
@@ -227,6 +228,7 @@ export interface PollerHost {
     paneId?: string,
     card?: SettlementCard | null,
     onAccepted?: () => void,
+    row?: NoticeRow,
   ): Promise<void>;
   /** This session's append-only settlement ledger (E1): every fact is written before it is announced,
    *  and the cursor advances only after pi accepted. */
@@ -354,6 +356,8 @@ export function createPoller(h: PollerHost): Poller {
       turn: number | null;
       notice: string;
       card: SettlementCard;
+      /** The identity a batch keeps when it becomes rows (E1): pane, description, outcome, report. */
+      row: NoticeRow;
       payloadRef?: string;
     }): Promise<'done' | 'retry'> {
       const event = h.ledger.append({
@@ -371,7 +375,7 @@ export function createPoller(h: PollerHost): Poller {
         await h.injectNotice(input.notice, paneId, input.card, () => {
           awaitingAccept = false;
           acceptSettlement(h, { taskId: input.entry.taskId, pane: paneId, at: event.at, seq: event.seq });
-        });
+        }, input.row);
       } catch {
         awaitingAccept = false;
         return 'retry';
@@ -411,6 +415,25 @@ export function createPoller(h: PollerHost): Poller {
       const notice = failure !== null
         ? formatFailureNotice(`${paneId} (${request.description})`, failure)
         : buildSettlementNoticeText(`${paneId} (${request.description})`, closing, delivered);
+      // What the batch keeps of this settlement when it becomes a row: the identity, and the report
+      // text a byte budget may withhold. A report `output` already returned is not repeated here.
+      const row: NoticeRow = delivered !== null
+        ? {
+            id: paneId, description: request.description, outcome: 'settled', body: null,
+            note: `its report was already returned by subagent(action:"output") at `
+              + `${new Date(delivered).toTimeString().slice(0, 8)}, so it is not repeated here`,
+          }
+        : failure !== null
+          ? {
+              id: paneId, description: request.description, outcome: 'failed', body: null,
+              note: `no report — ${failure}; retry it with subagent(action:"retry")`,
+            }
+          : closing !== null
+            ? { id: paneId, description: request.description, outcome: 'settled', body: closing }
+            : {
+                id: paneId, description: request.description, outcome: 'settled', body: null,
+                note: 'it left no closing message',
+              };
       return announce({
         entry,
         at: settledAt,
@@ -418,6 +441,7 @@ export function createPoller(h: PollerHost): Poller {
         turn,
         notice,
         card: cardFor(entry, paneId, request.description, failure !== null ? 'failed' : 'settled'),
+        row,
         payloadRef: reportDocName(paneId) ?? undefined,
       });
     }
@@ -607,6 +631,10 @@ export function createPoller(h: PollerHost): Poller {
             turn,
             notice: formatPaneClosedNotice(paneId, current.description),
             card: cardFor(entry, paneId, current.description, 'failed'),
+            row: {
+              id: paneId, description: current.description, outcome: 'closed', body: null,
+              note: 'stopped before settling: its pane closed',
+            },
           });
           return;
         }
@@ -641,6 +669,16 @@ export function createPoller(h: PollerHost): Poller {
             turn,
             notice,
             card: cardFor(entry, paneId, current.description, 'failed'),
+            // The budget's two endings are not settlements, so the row must not read as one.
+            row: {
+              id: paneId,
+              description: current.description,
+              outcome: tick.action === 'silence-timeout' ? 'no-progress' : 'no-report',
+              body: null,
+              note: tick.action === 'silence-timeout'
+                ? `silent for ${Math.round((now() - lastActivityAt) / 1000)}s; it may still be working`
+                : `turn ${turn ?? 0} ran and no report document reached piher`,
+            },
           });
           continue;
         }
@@ -778,7 +816,13 @@ export async function replaySettlements(h: PollerHost): Promise<number> {
       now: now(),
     });
     try {
-      await h.injectNotice(notice, event.pane, card, () => acceptReplay(h, event));
+      await h.injectNotice(notice, event.pane, card, () => acceptReplay(h, event), {
+        id: event.pane,
+        description: row?.description ?? '',
+        outcome: event.kind === 'settled' ? 'settled' : 'failed',
+        body: report,
+        note: `re-delivered from the piher ledger (seq ${event.seq}): this is its first delivery`,
+      });
       handed += 1;
     } catch {
       // The cursor stays below this seq: the next start re-delivers instead of dropping it.

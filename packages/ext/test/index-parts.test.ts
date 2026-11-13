@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { collapseNotices, createNoticeBuffer } from '../src/index-notices.ts';
+import { createNoticeBuffer, planNoticeBatch, type NoticeDelivery } from '../src/index-notices.ts';
 import { planIndexMode, type IndexMode } from '../src/index-runtime.ts';
 import { installWriteLocks } from '../src/index-locks.ts';
 import { lockTokenKey, lockTokenValue } from '../src/lock-core.ts';
@@ -141,19 +141,39 @@ test('createNoticeBuffer: a host with no send method records no delivery', async
   assert.deepEqual([...buf.noticePending()], ['p1'], 'and the pane stays exempt for the retry');
 });
 
-test('collapseNotices: empty → null; ≤3 verbatim; >3 → first three + count/pointer tail', () => {
-  assert.equal(collapseNotices([]), null, 'an empty batch is not injected');
-  const three = [5, 6, 7].map((n) => `Background subagent w8:p${n} (task) finished.`);
-  // At or below the cap the panes' own wording survives byte-identical: no wrapper, no tail line.
-  for (const batch of [[three[0]!], three]) assert.equal(collapseNotices(batch), batch.join('\n\n'));
+test('planNoticeBatch: empty → null; a lone notice keeps its own text, byte for byte', () => {
+  assert.equal(planNoticeBatch([]), null, 'an empty batch is not injected');
+  // One settlement is not a batch: the notice the master has always read is the delivery.
+  const only = { content: 'Background subagent w8:p5 (task) finished.', row: { id: 'w8:p5', description: 'task', outcome: 'settled' as const, body: 'done' } };
+  const plan = planNoticeBatch([only])!;
+  assert.equal(plan.text, only.content);
+  assert.deepEqual(plan.inline, ['w8:p5']);
+  assert.deepEqual(plan.withheld, [], 'a lone settlement is never withheld');
+});
 
-  const over = collapseNotices([...three, 'n4', 'n5'])!;
-  assert.ok(over.startsWith(`${three.join('\n\n')}\n\n`));
-  const tail = over.split('\n\n').pop()!;
-  assert.match(tail, /2 more settlement\(s\) not shown individually/);
-  assert.match(tail, /worker's own transcript/);
-  assert.match(tail, /subagent list for running agents/);
-  assert.ok(!over.includes('\n\nn4') && !over.includes('\n\nn5'));
+test('planNoticeBatch: every settlement is a row, however many arrive — identity is not budgeted', () => {
+  const rows: NoticeDelivery[] = Array.from({ length: 40 }, (_, i) => ({
+    content: `notice ${i}`,
+    row: { id: `w${i}`, description: `task ${i}`, outcome: 'settled' as const, body: 'x'.repeat(9000) },
+  }));
+  const plan = planNoticeBatch(rows, 4096)!;
+  for (const { row } of rows) {
+    assert.ok(plan.text.includes(`${row!.id} · ${row!.description} · settled`), `${row!.id} has its own row`);
+  }
+  assert.equal(plan.inline.length + plan.withheld.length, rows.length, 'every settlement is accounted for');
+  assert.equal(plan.withheld.length, rows.length, 'no 9 KB body fits a 4 KB budget');
+});
+
+test('planNoticeBatch: the budget spends report bodies, and one call reads what it withheld', () => {
+  const rows: NoticeDelivery[] = [
+    { content: 'a', row: { id: 'w1', description: 'one', outcome: 'settled', body: 'a'.repeat(3000) } },
+    { content: 'b', row: { id: 'w2', description: 'two', outcome: 'settled', body: 'b'.repeat(3000) } },
+  ];
+  const plan = planNoticeBatch(rows, 4096)!;
+  assert.deepEqual(plan.inline, ['w1'], 'first fit wins, in arrival order');
+  assert.deepEqual(plan.withheld, ['w2']);
+  assert.match(plan.text, /full report: subagent\(action:"output", agentId:"w2"\)/);
+  assert.match(plan.text, /1 report withheld above, in one call: subagent\(action:"reports", ids:\["w2"\]\)/);
 });
 
 /** Busy buffer whose send is observable: the batch is only visible through the collapsed send. */

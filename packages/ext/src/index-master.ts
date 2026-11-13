@@ -11,6 +11,7 @@ import subagentPlugin from './plugins/subagent.ts';
 import type { CoreClientLike, CoreEnv } from './core-client.ts';
 import type { SubagentPortBox } from './subagent-core.ts';
 import type { SettlementCard } from './settlement-card.ts';
+import type { NoticeRow } from './index-notices.ts';
 
 export interface MasterPluginMount {
   pi: ExtensionAPI;
@@ -25,6 +26,7 @@ export interface MasterPluginMount {
     paneId?: string,
     card?: SettlementCard | null,
     onAccepted?: () => void,
+    row?: NoticeRow,
   ) => Promise<void>;
   noticePending: () => ReadonlySet<string>;
   getSessionId: () => string;

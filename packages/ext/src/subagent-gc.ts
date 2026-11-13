@@ -13,6 +13,7 @@ import {
   type CheckoutRowLike,
 } from './gc-core.ts';
 import type { SettlementCard } from './settlement-card.ts';
+import type { NoticeRow } from './index-notices.ts';
 import { checkoutSpaceId, type CheckoutSpace } from './worktree.ts';
 import { sessionStatePath } from './session-state.ts';
 import { runtimePolicy } from './runtime-policy.ts';
@@ -114,6 +115,7 @@ interface GcHost {
     paneId?: string,
     card?: SettlementCard | null,
     onAccepted?: () => void,
+    row?: NoticeRow,
   ) => Promise<void>;
 }
 

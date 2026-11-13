@@ -38,6 +38,7 @@ export const OPTION_SPECS: readonly OptionSpec[] = [
   { name: 'PIHER_COMMAND_PICKUP_MS', fallback: '1500', min: 0, policy: 'commandPickupMs', description: 'how long a send waits for the worker to pick its steering command out of the core (0 reports the write alone)' },
   { name: 'PIHER_GC_TICK_MS', fallback: '30000', min: 1000, policy: 'gcTickMs', description: 'idle GC sweep cadence (panes)' },
   { name: 'PIHER_SESSION_TTL_SECONDS', fallback: '600', min: 0, policy: 'sessionTtlSeconds', description: 'session retention after a subagent exits, before GC' },
+  { name: 'PIHER_NOTICE_BODY_BUDGET_BYTES', fallback: '4096', min: 0, description: 'report bytes one settlement delivery carries inline; every report over it arrives as a row with a pointer, and one call to action reports reads them all' },
   { name: 'PIHER_WRITE_LOCK', fallback: '', description: '1 makes a conflicting write/edit block instead of warn (read by the lock layer)' },
   { name: 'PIHER_JOBS_DIR', fallback: '(system temp)/piher-jobs', description: 'directory receiving one log file per background job' },
   { name: 'PIHER_HMR', fallback: '', description: 'dev: enable the cordis HMR boundary (requires --expose-internals)' },
@@ -50,6 +51,23 @@ export function optionValue(
 ): string | undefined {
   const raw = env[name];
   return typeof raw === 'string' && raw.trim() !== '' ? raw : undefined;
+}
+
+/** An integer option read through the registry: its fallback when unset, and the same fallback plus
+ *  a warning when the value is not an integer or below its bound. `runtimePolicy` applies this rule to
+ *  its own fields; knobs with no policy field are read here. */
+export function integerOption(name: string, env: NodeJS.ProcessEnv = process.env): number {
+  const spec = OPTION_SPECS.find((o) => o.name === name);
+  if (!spec) throw new Error(`${name} is not in OPTION_SPECS`);
+  const fallback = Number(spec.fallback);
+  const raw = optionValue(name, env);
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < (spec.min ?? 0)) {
+    console.warn(`Invalid ${name}="${raw}", using default ${spec.fallback}`);
+    return fallback;
+  }
+  return parsed;
 }
 
 export function optionRows(env: NodeJS.ProcessEnv = process.env): Array<{
