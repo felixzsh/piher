@@ -18,7 +18,7 @@ import {
 import { sessionStatePath } from '../../src/session-state.ts';
 import type { SubagentPortBox } from '../../src/subagent-core.ts';
 import type { TaskRow } from '../../src/task-row.ts';
-import { BootFailure, NodeGitAdapter, createSpawner, planTaskSend, type GitExecFile } from '../../src/subagent-spawn.ts';
+import { BootFailure, NodeGitAdapter, createSpawner, planTaskSend, taskNotStartedText, type GitExecFile } from '../../src/subagent-spawn.ts';
 import {
   TempHome, fakeCore, fakeWatch, fire, jsonl, mountSubagent, readTaskView, runSubagent, runSubagentRejects,
   seedTaskDocuments, terminalInfo, transcriptMessage, type FakePi,
@@ -86,15 +86,14 @@ test('waitReady/planTaskSend: the core decides readiness, and the turn proves de
     assert.ok(Date.now() - started < 2_000, 'no waiting out a budget a person has to answer');
   });
 
-  await t.test('planTaskSend: a null result is delivery only when a turn says so, else the composer is submitted', () => {
+  await t.test('planTaskSend: S25 — `started: true` or a turn that began where none had', () => {
     const facts = (over: Partial<Parameters<typeof planTaskSend>[0]>) => planTaskSend({
-      refusedNotIdle: false, started: null, turnBefore: 0, sendTurn: 0, turnAfter: 0, statusAfter: 'idle',
+      refusedNotIdle: false, started: null, turnBefore: 0, turnAfter: 0, statusAfter: 'idle',
       elapsedMs: 5, timeoutMs: 1000, ...over,
     });
     assert.deepEqual(facts({ started: true }), { kind: 'delivered' });
-    // `started: null` is "nobody can tell", not "not delivered": a turn that moved proves delivery.
+    // `started: null` proves nothing in either direction (S25): the turn decides.
     assert.deepEqual(facts({ turnAfter: 1 }), { kind: 'delivered' }, 'a new turn is the proof the core could not give');
-    assert.deepEqual(facts({ sendTurn: 1 }), { kind: 'delivered' }, "the send's own turn names it");
     assert.deepEqual(facts({ statusAfter: 'working' }), { kind: 'delivered' }, 'a turn in flight is delivery');
     // No turn and no status: the text went in, so only the submit is missing.
     assert.deepEqual(facts({}), { kind: 'resubmit', delayMs: 500 });
@@ -103,7 +102,19 @@ test('waitReady/planTaskSend: the core decides readiness, and the turn proves de
     assert.deepEqual(facts({ refusedNotIdle: true }), { kind: 'repaste', delayMs: 500 });
     // No evidence either side (a core that would not answer) is not delivery.
     assert.deepEqual(facts({ turnBefore: null, turnAfter: null }), { kind: 'resubmit', delayMs: 500 });
+    assert.deepEqual(facts({ started: false, statusAfter: 'idle' }), { kind: 'resubmit', delayMs: 500 }, 'null-ish alone is not a delivery');
     assert.deepEqual(facts({ elapsedMs: 1000 }), { kind: 'give-up' });
+  });
+
+  await t.test('taskNotStartedText promises only what the delivery loop knows', () => {
+    const text = taskNotStartedText({
+      paneId: 'p2', attempts: 3, elapsedMs: 4_000, last: { started: null, status: 'idle', turn: 0 },
+    });
+    assert.match(text, /took no turn from its first message after 3 attempts/);
+    assert.match(text, /read it with action "output"/);
+    assert.match(text, /retry this task or close it/);
+    // The loop cannot know whether the core swallowed the text or the composer took it.
+    assert.doesNotMatch(text, /holds the text/);
   });
 
   await t.test('deliverFirstTask: a send that started no turn is submitted, never pasted twice', async () => {
@@ -245,6 +256,24 @@ test('waitReady/planTaskSend: the core decides readiness, and the turn proves de
       (err: unknown) => err instanceof BootFailure && err.keepPane && /could not take its first message: blocked:/.test(err.message),
     );
   });
+
+  await t.test('deliverFirstTask: a pane that dies mid-delivery is not kept', async () => {
+    let probes = 0;
+    const spawner = spawnerFor({
+      // Alive for the `before` probe, finished from then on: the worker died between readiness and
+      // the delivery, so the row must not be kept for a terminal that is not there.
+      getTerminal: async (id) => {
+        probes += 1;
+        return terminalInfo({ id, state: probes > 1 ? 'finished' : 'live', status: 'idle' });
+      },
+      send: async () => ({ started: null, status: 'idle', turn: 0 }),
+      keys: async () => {},
+    }, { readinessTimeoutMs: 1_000 });
+    await assert.rejects(
+      () => spawner.deliverFirstTask('t2', 'x', { budgetMs: 400, statusAtReady: 'idle' }),
+      (err: unknown) => err instanceof BootFailure && err.keepPane === false,
+    );
+  });
 });
 
 /* ── spawn tool: loopback pipe harness ──────────────────────────── */
@@ -288,6 +317,8 @@ interface PipeEnv {
   parkPollers(): void;
   /** Flipped per subtest: the core refuses the next send (a blocked program, say). */
   rejectSend: boolean;
+  /** A core error kind that every send throws instead (a pane the core says is gone, say). */
+  sendError: string | null;
   /** Milliseconds the core takes to answer one `send`: a spawn must not sit through it. */
   sendDelayMs: number;
   /** Answers the fake core gives its next sends, one per send; empty means "went working at once".
@@ -342,7 +373,7 @@ async function withPipeEnv(
   let wake = false;
   const env: PipeEnv = {
     cwd, home, pi: undefined as never, port: undefined as never, frames: [], retired: [], spawnEnvs: [], spawnLabels: [],
-    parkPollers: () => { parked = true; }, rejectSend: false, sendDelayMs: 0, paneGone: false, paneFinished: false, deadPipes: 0,
+    parkPollers: () => { parked = true; }, rejectSend: false, sendError: null, sendDelayMs: 0, paneGone: false, paneFinished: false, deadPipes: 0,
     sendResults: [], notReady: new Set<string>(), statuses: {},
     pastes: [], composer: {}, statusMismatches: 0, refuseSend: 0,
     turns: {}, wakeWorker: () => { wake = true; }, gated: false, transcript: SUB_TEXT,
@@ -405,6 +436,7 @@ async function withPipeEnv(
     // the turn never started — the measured loss, where a second paste would put the brief in the turn
     // twice.
     send: async (id: string, text: string, o?: { if?: 'idle' | 'working' }) => {
+      if (env.sendError) throw new CoreError('terminal.send', env.sendError, `the core says ${env.sendError}`, null);
       if (env.rejectSend) throw new Error('blocked: the program is waiting on a dialog');
       if (env.sendDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, env.sendDelayMs));
       const status = env.notReady.has(id) ? 'unknown' : env.statuses[id] ?? 'idle';
@@ -1382,4 +1414,67 @@ test('P2: readiness does not depend on the program reporting, and the paste is g
       delete env.statuses.p2;
     });
   }, { pipes: false, policy: { readinessTimeoutMs: 800 } });
+});
+
+test('P2: a kept boot failure ends on its own, and a pane the core says is gone is not kept', async (t) => {
+  await withPipeEnv(async (env) => {
+    // A short silence budget: this is the watchdog that makes a kept row reclaimable (its
+    // `gen.consumedAt` is what the tab, pane and checkout sweeps all wait on).
+    await t.test('a kept failure is reclaimed by its silence budget, not left for the session', async () => {
+      env.rejectSend = true;
+      const text = (await runSubagent(env.pi, { description: 'kept probe', prompt: PROMPT }, env.cwd)).content[0]!.text;
+      const taskId = /\(task ([0-9a-f-]+),/.exec(text)![1];
+      await waitFor(() => env.pi.userSent.length > 0);
+      assert.ok(readTaskRecord(env.cwd, taskId) !== null, 'the kept row is there (and so is its pane)');
+      // The poller armed by the kept boot is the only thing that can set `consumedAt` here: no
+      // settlement is coming, and the tab, pane and checkout sweeps all wait on that field.
+      await waitFor(() => (readTaskRecord(env.cwd, taskId)?.gen.consumedAt ?? null) !== null, 8_000);
+      const row = readTaskRecord(env.cwd, taskId);
+      assert.ok((row?.gen.consumedAt ?? null) !== null, 'the silence budget consumed the kept row');
+      assert.match(
+        env.pi.userSent.map((m) => m.content).join('\n'),
+        /has shown no progress/,
+        'and the master was told the worker went silent',
+      );
+      assert.deepEqual(env.retired, [], 'the pane itself was not killed by the watchdog');
+      env.rejectSend = false;
+    });
+
+    await t.test('a core error that says the pane is gone retires it, and the notice stops claiming it', async () => {
+      env.sendError = 'not_found';
+      const text = (await runSubagent(env.pi, { description: 'gone probe', prompt: PROMPT }, env.cwd)).content[0]!.text;
+      const taskId = /\(task ([0-9a-f-]+),/.exec(text)![1];
+      await waitFor(() => env.retired.length === 1 && env.pi.userSent.length > 0);
+      assert.deepEqual(env.retired, ['p2'], 'a pane the core cannot find is retired');
+      const notice = env.pi.userSent.at(-1)?.content ?? '';
+      assert.match(notice, /failed to start/);
+      assert.match(notice, /not_found/);
+      assert.doesNotMatch(notice, /still there/, 'the advice must not name a terminal that is gone');
+      assert.equal(readTaskRecord(env.cwd, taskId), null, 'and the row goes with it');
+      env.sendError = null;
+    });
+  }, { pipes: false, policy: { readinessTimeoutMs: 2_000, subagentTimeoutMs: 250, pollIntervalMs: 30, settleWindowMs: 0 } });
+});
+
+test('P2: a revive that cannot come up retires the pane no row will ever point at', async () => {
+  await withPipeEnv(async (env) => {
+    env.parkPollers();
+    const spawned = await runSubagent(env.pi, { description: 'revive probe', prompt: PROMPT }, env.cwd);
+    const paneId = spawned.details?.paneId as string;
+    const taskId = spawned.details?.taskId as string;
+    await waitFor(() => env.frames.length === 1);
+    // Settled and collected: the row is now revivable, and the swap that would adopt the new pane
+    // runs only after readiness.
+    env.port.current!.consumeReply(paneId, 'REPORT: done');
+    env.statuses[paneId] = 'blocked';
+    const error = await runSubagentRejects(env.pi, { action: 'resume', taskId }, env.cwd);
+    assert.match(error, /blocked on a dialog/);
+    assert.match(error, /pane it created was retired/, 'the text must not promise a pane it does not keep');
+    assert.doesNotMatch(error, /answer that dialog in the pane, then retry/);
+    assert.ok(error.includes(taskId), 'and it names the task that still points where it did');
+    assert.deepEqual(env.retired, [paneId], 'the fresh pane is retired, not orphaned');
+    // The row keeps the generation it had: no pane id it never adopted.
+    assert.equal(readTaskRecord(env.cwd, taskId)?.gen.paneId, paneId);
+    delete env.statuses[paneId];
+  });
 });

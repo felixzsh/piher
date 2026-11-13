@@ -165,6 +165,9 @@ interface ReadyFailure {
   readonly timeoutMs: number;
   readonly lastStatus?: string | null;
   readonly tail?: string | null;
+  /** Whether the caller really keeps the pane it names. The text must not promise `output`/retry
+   *  on a pane the caller is about to retire (the revive path: no row will ever point at it). */
+  readonly kept?: boolean;
 }
 
 type ReadyAttemptPlan =
@@ -231,10 +234,12 @@ export function keepsPane(reason: ReadyFailure['reason']): boolean {
   return reason !== 'pane-gone';
 }
 
-/** Failure text for the model. Every live-pane case names the action that follows from it: the pane
- *  is kept, so `output` reads it and the task can be retried or closed. */
+/** Failure text for the model. Every live-pane case names the action that follows from it: when the
+ *  caller keeps the pane, `output` reads it and the task can be retried or closed; when it does not
+ *  (`kept: false`), the text says the pane was retired instead of promising actions on nothing. */
 export function readyFailureText(failure: ReadyFailure): string {
   const seconds = Math.round(failure.elapsedMs / 1000);
+  const kept = failure.kept !== false && failure.reason !== 'pane-gone';
   const head = failure.reason === 'pane-gone'
     ? `subagent pane ${failure.paneId} exited before its agent reported ready (waited ${seconds}s)`
     : failure.reason === 'blocked'
@@ -244,29 +249,36 @@ export function readyFailureText(failure: ReadyFailure): string {
         : `subagent pane ${failure.paneId} was not ready within ${seconds}s (limit ${Math.round(failure.timeoutMs / 1000)}s)`;
   const why = failure.reason === 'pane-gone'
     ? 'The child process is gone — its last output below usually carries the reason.'
-    : failure.reason === 'blocked'
-      ? 'Nothing was pasted. The pane is kept: answer that dialog in the pane, then retry this task.'
-      : failure.reason === 'error'
-        ? 'Nothing was pasted. The pane is kept so its last output can be read; retry the task or close it.'
-        : failure.lastStatus === 'working'
-          ? 'Nothing was pasted: the pane is alive and already running a turn of its own. The pane is kept — give it time, read it with action "output", then retry this task.'
-          : `The pane is alive but its agent never reported \`idle\` (last status: ${failure.lastStatus ?? 'none'}). The pane is kept: the child pi process may still be starting, or the program reports no status at all (piher's status comes from the program's own OSC 7501 report; \`PI_PROGRAM_STATUS=0\` turns that off).`;
+    : !kept
+      ? 'Nothing was pasted, and the pane it created was retired: no task points at it, so it is not left behind.'
+      : failure.reason === 'blocked'
+        ? 'Nothing was pasted. The pane is kept: answer that dialog in the pane, then retry this task.'
+        : failure.reason === 'error'
+          ? 'Nothing was pasted. The pane is kept so its last output can be read; retry the task or close it.'
+          : failure.lastStatus === 'working'
+            ? 'Nothing was pasted: the pane is alive and already running a turn of its own. The pane is kept — give it time, read it with action "output", then retry this task.'
+            : `The pane is alive but its agent never reported \`idle\` (last status: ${failure.lastStatus ?? 'none'}). The pane is kept: the child pi process may still be starting, or the program reports no status at all (piher's status comes from the program's own OSC 7501 report; \`PI_PROGRAM_STATUS=0\` turns that off).`;
   const tail = failure.tail ? `\nlast output of ${failure.paneId}:\n${failure.tail}` : '';
   return `${head}\n${why}${tail}`;
 }
 
-/** What one delivery attempt proved, from the core's own answer plus the pane's turn. The core's
- *  `started` is the primary claim (spec S22) but it cannot say "no": `null` means "the program does
- *  not report status, so nobody can tell". A turn that did not exist before the attempt is the proof
- *  it did start one, which is why the turn is read on both sides of the send. */
+/** Whether a core error about the pane means nothing is there any more: the row and the advice must
+ *  not claim a terminal the core says is gone (`not_found`, `finished`). Every other kind — a dialog,
+ *  a status mismatch, a transient transport failure — leaves a pane a person or the master can act on. */
+export function keepsPaneForCoreError(err: unknown): boolean {
+  return !(isCoreErrorKind(err, 'not_found') || isCoreErrorKind(err, 'finished'));
+}
+
+/** What one delivery attempt proved (spec S25): `started: true`, or a turn that began where none had
+ *  begun before. The core's `started` cannot say "no" — `null` means "the program does not report
+ *  status, so nobody can tell" — so `null` alone proves nothing in either direction, and the turn is
+ *  read on both sides of the send to decide it. */
 export interface TaskAttemptFacts {
   /** The core refused the send with `status_mismatch`: nothing was typed, so a fresh send is safe. */
   refusedNotIdle: boolean;
   started: boolean | null;
   /** The pane's turn before the attempt. */
   turnBefore: number | null;
-  /** The turn on the send's own result: "the turn when the text went in". */
-  sendTurn: number | null;
   /** The pane's turn and status right after the attempt. */
   turnAfter: number | null;
   statusAfter: string | null;
@@ -283,22 +295,18 @@ export type TaskSendPlan =
   | { readonly kind: 'give-up' };
 
 export function planTaskSend(f: TaskAttemptFacts): TaskSendPlan {
+  // Spec S25: delivery is `started: true`, or a turn that began where none had begun before.
   if (f.started === true) return { kind: 'delivered' };
-  // The turn is the fact that survives `started: null`: a turn that was not there before, or the same
-  // turn still in flight, means the text became a task even though the core could not confirm in time.
-  // Two reads with no turn (a core that would not answer) prove nothing either way.
   if (f.statusAfter === 'working') return { kind: 'delivered' };
-  const turnUp = f.turnAfter !== null && f.turnBefore !== null && f.turnAfter > f.turnBefore;
-  const sentIntoNewTurn = f.sendTurn !== null && f.turnBefore !== null && f.sendTurn > f.turnBefore;
-  if (turnUp || sentIntoNewTurn) return { kind: 'delivered' };
+  if (f.turnAfter !== null && f.turnBefore !== null && f.turnAfter > f.turnBefore) return { kind: 'delivered' };
   if (f.elapsedMs >= f.timeoutMs) return { kind: 'give-up' };
   return f.refusedNotIdle
     ? { kind: 'repaste', delayMs: readyBackoffMs(0) }
     : { kind: 'resubmit', delayMs: readyBackoffMs(0) };
 }
 
-/** The send never became a turn: name what the core answered, and keep the advice actionable — the
- *  pane is alive and holds the text, so it is not thrown away. */
+/** The send never became a turn: name what the core answered, and keep the advice to what is known —
+ *  the pane is alive and was not retired, which is all the delivery loop can prove. */
 export function taskNotStartedText(opts: {
   paneId: string;
   attempts: number;
@@ -309,7 +317,7 @@ export function taskNotStartedText(opts: {
   const started = opts.last.started === null ? 'null (the agent never reported status)' : String(opts.last.started);
   return `subagent pane ${opts.paneId} took no turn from its first message after ${opts.attempts} attempts in ${seconds}s `
     + `(last result: started ${started}, status ${opts.last.status ?? 'none'}, turn ${opts.last.turn}). `
-    + 'The pane is kept and holds the text: read it with action "output", then retry this task or close it.';
+    + 'The pane is kept: read it with action "output", then retry this task or close it.';
 }
 
 /* ── spawner ────────────────────────────────────────────────────── */
@@ -354,8 +362,9 @@ export interface Spawner {
   launchParts(resumeFile?: string | null, roleModel?: string | null, roleThinking?: string | null, approve?: boolean): string[];
   approveFor(cwd: string, masterCwd: string): Promise<boolean>;
   /** Wait for the core to say the worker's agent is up and idle (never a ping on a private socket),
-   *  spending at most `budgetMs` of the caller's budget. */
-  waitReady(paneId: string, budgetMs?: number): Promise<ReadyOutcome>;
+   *  spending at most `budgetMs` of the caller's budget. `keepPane: false` is for a caller that cannot
+   *  keep the pane it names (a revive): the outcome and the text both say it is retired. */
+  waitReady(paneId: string, budgetMs?: number, opts?: { keepPane?: boolean }): Promise<ReadyOutcome>;
   /** Send the first task through the core and believe only the core's own result or a new turn. */
   deliverFirstTask(
     paneId: string,
@@ -379,8 +388,13 @@ export function createSpawner(h: SpawnerHost): Spawner {
   /** Wait for the core's readiness with backoff; give up early when the pane is gone, blocked or in
    * error. The screen tail is sampled while the pane exists so a crash that leaves a shell still
    * explains itself. `budgetMs` is what the caller has left: one budget per boot, never a fresh one per
-   * attempt. */
-  async function waitReady(paneId: string, budgetMs: number = readyTimeoutMs): Promise<ReadyOutcome> {
+   * attempt. `opts.keepPane: false` is for a caller that cannot keep the pane it names (a revive), so
+   * both the outcome and the text say the pane is retired instead of promising actions on it. */
+  async function waitReady(
+    paneId: string,
+    budgetMs: number = readyTimeoutMs,
+    opts: { keepPane?: boolean } = {},
+  ): Promise<ReadyOutcome> {
     const startedAt = Date.now();
     let attempt = 0;
     let lastTailAt = 0;
@@ -400,6 +414,7 @@ export function createSpawner(h: SpawnerHost): Spawner {
       });
       if (plan.kind === 'ready') return { ok: true, status: probe.status };
       if (plan.kind === 'give-up') {
+        const keepPane = opts.keepPane === false ? false : keepsPane(plan.reason);
         const failure: ReadyFailure = {
           paneId,
           reason: plan.reason,
@@ -407,8 +422,9 @@ export function createSpawner(h: SpawnerHost): Spawner {
           timeoutMs: budgetMs,
           lastStatus: probe.status,
           tail,
+          kept: keepPane,
         };
-        return { ok: false, message: readyFailureText(failure), keepPane: keepsPane(plan.reason) };
+        return { ok: false, message: readyFailureText(failure), keepPane };
       }
       attempt += 1;
       // Never sleep past the budget: a retry may not overshoot the deadline the caller is waiting on.
@@ -459,7 +475,7 @@ export function createSpawner(h: SpawnerHost): Spawner {
         } else {
           throw new BootFailure(
             `subagent pane ${paneId} could not take its first message: ${(err as Error)?.message ?? String(err)}`,
-            true,
+            keepsPaneForCoreError(err),
           );
         }
       }
@@ -469,7 +485,6 @@ export function createSpawner(h: SpawnerHost): Spawner {
         refusedNotIdle,
         started: result?.started ?? null,
         turnBefore: before.turn,
-        sendTurn: result?.turn ?? null,
         turnAfter: after.turn,
         statusAfter: after.status,
         elapsedMs: Date.now() - startedAt,
@@ -482,7 +497,7 @@ export function createSpawner(h: SpawnerHost): Spawner {
           attempts,
           elapsedMs: Date.now() - startedAt,
           last: result ?? { started: null, status: after.status, turn: after.turn ?? 0 },
-        }), true);
+        }), after.alive !== false);
       }
       pending = plan.kind === 'resubmit' ? 'enter' : 'send';
       await sleep(plan.delayMs);
@@ -858,11 +873,19 @@ export function createSpawnAction(h: SpawnActionHost) {
           discardCheckout();
           try { await client.kill(paneId); } catch { /* already gone */ }
           try { await client.remove(paneId); } catch { /* core reaps finished terminals */ }
+        } else {
+          // A kept row has no settlement to come, and every reclaim path (the tab sweep, the pane
+          // sweep, the checkout sweep) waits on `gen.consumedAt`, which only a settlement sets. The
+          // poller is what sets it here: its silence budget is the watchdog that ends a worker which
+          // never took its task, and it also owns the blocked-gate notice for a pane a person must
+          // answer. Without it the pane, row, record and any checkout would live out the session.
+          h.lastRequestIdByPane.set(paneId, `boot-failed-${taskId}`);
+          void startPoller(paneId, cwd, Date.now(), spec.description, `boot-failed-${taskId}`);
         }
         try {
           await h.notifySpawnFailed(
             keep
-              ? `Subagent "${spec.description}" (pane ${paneId}, task ${taskId}) is up but did not take its first message: ${reason} The pane and the task are still there — read it with action "output" (agentId ${paneId}), then retry task ${taskId} or close it.`
+              ? `Subagent "${spec.description}" (pane ${paneId}, task ${taskId}) is up but did not take its first message: ${reason} The pane and the task are still there — read it with action "output" (agentId ${paneId}), then retry task ${taskId} or close it. If nothing answers, its silence budget ends it.`
               : `Subagent "${spec.description}" (pane ${paneId}, task ${taskId}) failed to start: ${reason} Nothing is running there; spawn it again if the task still matters.`,
           );
         } catch { /* a missed notice must not break the session */ }

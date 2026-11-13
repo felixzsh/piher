@@ -551,8 +551,15 @@ export default function subagentPlugin(ctx: Context): void {
       },
       argv,
     ));
-    const ready = await waitReady(spawned.paneId);
-    if (!ready.ok) throw new Error(ready.message);
+    // A revive that cannot come up has no row to give its pane: the generation swap below never runs,
+    // so this terminal would exist with no record and no reaper. Ask waitReady for the retired wording
+    // and retire it here — the row keeps pointing at the generation it had.
+    const ready = await waitReady(spawned.paneId, undefined, { keepPane: false });
+    if (!ready.ok) {
+      try { await client.kill(spawned.paneId); } catch { /* already gone */ }
+      try { await client.remove(spawned.paneId); } catch { /* core reaps finished terminals */ }
+      throw new Error(`${ready.message} Task ${entry.taskId} still points at pane ${entry.gen.paneId}.`);
+    }
     const previousPaneId = entry.gen.paneId;
     Object.assign(entry.gen, {
       paneId: spawned.paneId,

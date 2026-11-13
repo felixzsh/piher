@@ -20,7 +20,8 @@ import {
 import {
   allocateTaskSlug, parseTaskDocument, slugifyTask, taskRef, type TaskEntry,
 } from '../src/task-row.ts';
-import { keepsPane, planReadyAttempt, readyBackoffMs, readyFailureText, unreportedGraceMs } from '../src/subagent-spawn.ts';
+import { CoreError } from '../src/core-client.ts';
+import { keepsPane, keepsPaneForCoreError, planReadyAttempt, readyBackoffMs, readyFailureText, unreportedGraceMs } from '../src/subagent-spawn.ts';
 
 const RT = { nodePath: '/usr/local/bin/node', cliPath: '/opt/pi/dist/cli.js', extPath: '/ext/index.ts' };
 
@@ -319,6 +320,22 @@ test('readyFailureText: crash, blocked, error, working-but-slow and never-report
 test('keepsPane: only a gone pane is retired; every live failure keeps its terminal and row', () => {
   assert.equal(keepsPane('pane-gone'), false);
   for (const reason of ['timeout', 'blocked', 'error'] as const) assert.equal(keepsPane(reason), true, reason);
+});
+
+test('readyFailureText: a caller that cannot keep the pane says so instead of promising actions on it', () => {
+  const retired = readyFailureText({ paneId: 'pX', reason: 'blocked', elapsedMs: 5, timeoutMs: 1000, kept: false });
+  assert.match(retired, /pane it created was retired/);
+  assert.match(retired, /not left behind/);
+  assert.doesNotMatch(retired, /answer that dialog in the pane, then retry this task/);
+  assert.doesNotMatch(retired, /read it with action "output"/);
+});
+
+test('keepsPaneForCoreError: a pane the core cannot find is not kept; a refusal is', () => {
+  assert.equal(keepsPaneForCoreError(new CoreError('terminal.send', 'not_found', 'no t2', null)), false);
+  assert.equal(keepsPaneForCoreError(new CoreError('terminal.send', 'finished', 'over', null)), false);
+  assert.equal(keepsPaneForCoreError(new CoreError('terminal.send', 'blocked', 'dialog', null)), true);
+  assert.equal(keepsPaneForCoreError(new CoreError('terminal.send', 'unavailable', 'blip', null)), true);
+  assert.equal(keepsPaneForCoreError(new Error('socket timeout')), true, 'an unknown failure is not a death');
 });
 
 test('resolveTaskIdPrefix: exact beats length, prefixes need four chars and report ambiguity', () => {
