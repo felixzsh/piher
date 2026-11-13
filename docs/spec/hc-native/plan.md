@@ -75,3 +75,12 @@ next request; the consumed-row reader does not survive a master restart (P4's ev
 it); a `522810b`-era document with `text: null` still renders "Reason: stop"; a document-write failure is
 logged worker-side only. The suite failure the P1 worker called pre-existing was mine: the role switch to
 deepseek left `~/.config/herdr-core/templates/*.md` stale, regenerated outside the repo.
+L4. **P2 done**: `c54328c` (two correction commits over `d0f5735`; `0e0d22d` is the docs-only S25
+commit), Risk: item 3 (`CoreClientLike.send` changed its return contract), `tsc` clean + `npm test`
+**518/518** on `0e0d22d` (docs-only delta over the code commit), Route: delegated. Two reviews, both
+REJECT: 8 findings then 6; 12 corrected, and two triaged out — the paste for a `done` worker stays
+ungated (the core's gate has no `done`; low impact) and S22's older wording was superseded rather than
+edited. The spec gained **S25** (delivery believed by `started: true` **or** a turn that began where none
+had), with S22 kept visible as superseded. Residuals: the gate, the reclaim and the retire/keep split are
+proven against the fake core at the plugin seam, not against a live `hc`; a kept failure on a `blocked`
+pane waits for a person by design (its silence budget does not consume it).
