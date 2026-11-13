@@ -191,3 +191,19 @@ fan-out first. With 3 of 10 delivered, a wrong decision is explained by lost inf
 attention, so layer 3 (same 10 rows in one message vs ten spaced messages, scored against two planted
 blockers) waits for S27 to land. Layer 2 — ten real explorers settling while the master is busy — also
 pending, and it does not need new code.
+L11. **Benchmark, layer 2 (ten real spawns) and the invariants list**: `(this commit)` (parent
+`516402f`), Risk: none — no behaviour touched, suite green with nine **skipped** invariant tests,
+Route: parent. Ten `explorer` spawns in one batch, each a one-line question, plus a 75 s blocking call
+as the master's "busy" control — the user's normal case: spawn, then keep working. Facts: ten events
+(eight settlements, two boot failures) reached the master as **one** delivery of **2.194 B** carrying
+**3 of 10 verbatim** and **7 withheld reports**, for **one** turn spent learning that. Layer 1 had
+predicted 1.739 B and 3 of 10 for median bodies, so the pure function models the channel faithfully.
+The surprise is not the channel: **2 of 10 spawns were reported as "failed to start"**, and one of them
+(`t1hr`) had already answered correctly — `packages/ext/src/session-tail.ts` has 217 lines, visible in
+its own pane buffer — so the readiness gate lost a child that finished before it was observed ("exited
+before its agent reported ready (waited 0s)"). In a ten-worker wave that is a **20% false failure
+rate**, and it is worse than the collapse: the notice says "spawn it again" over completed work. Both
+defects are now written as criteria rather than intentions — `docs/spec/hc-native/invariants.md`
+(E1-E12, with E3/E4/E7 recorded as closed and why) and `test/open-invariants.test.ts`, where a skipped
+test is an open invariant carrying its evidence, so the definition of done exists before the fixes.
+Not measured: attention still needs the fan-out, because 7 of 10 reports never arrived.
