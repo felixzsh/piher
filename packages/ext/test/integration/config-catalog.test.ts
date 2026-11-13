@@ -65,6 +65,17 @@ test('checkEnvKnobs flags only unparsable/out-of-range registered values', () =>
   assert.ok(issues.some((i) => i.includes('PIHER_GIT_TIMEOUT_MS'))); assert.deepEqual(checkEnvKnobs({ PIHER_GC_TICK_MS: '30000' }), []);
 });
 
+test('checkEnvKnobs names a removed knob instead of leaving it a silent no-op', () => {
+  // A knob this build no longer reads is the one setting the runtime cannot report on: the value is
+  // simply ignored, so the check names it rather than letting the export be believed.
+  const issues = checkEnvKnobs({ PIHER_SETTLE_WINDOW_MS: '4000', PIHER_POLL_INTERVAL_MS: '5000', PIHER_GC_TICK_MS: '5000' });
+  assert.equal(issues.length, 2, issues.join(' | '));
+  assert.match(issues.join(' | '), /PIHER_SETTLE_WINDOW_MS="4000" is set but no code reads it/);
+  assert.match(issues.join(' | '), /PIHER_POLL_INTERVAL_MS/);
+  // The spawn contracts are read by the code and are not knobs: they are never "removed".
+  assert.deepEqual(checkEnvKnobs({ PIHER_SUBAGENT: '1', PIHER_DELEGATION: '{}', PIHER_ROLE_MANIFEST: '{}', PIHER_ROLE_BASE: '/r' }), []);
+});
+
 test('secret-shaped keys are redacted and never rendered verbatim', () => {
   // Deliberately narrower than a bare `token` match, so a key that merely carries token-shaped
   // vocabulary is still shown verbatim.

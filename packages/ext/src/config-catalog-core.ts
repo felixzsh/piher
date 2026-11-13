@@ -59,6 +59,15 @@ const ENV_KNOBS: readonly ConfigKnob[] = OPTION_SPECS.map((option) => ({
   impact: option.description,
 }));
 
+/** The `PIHER_*` namespace itself (any other prefix is somebody else's environment). */
+const PIHER_KEY = /^PIHER_[A-Z0-9_]+$/;
+
+/** Contracts handed to a child at spawn (named in `options.ts`): the code reads them, but they are
+ *  not knobs a person sets, so the catalog must not report them as removed. */
+const SPAWN_CONTRACT_KEYS: readonly string[] = [
+  'PIHER_SUBAGENT', 'PIHER_DELEGATION', 'PIHER_ROLE_MANIFEST', 'PIHER_ROLE_BASE',
+];
+
 /** Every knob the catalog can resolve (roles is a per-file plane: its schema is the reference). */
 export const CONFIG_KNOBS: readonly ConfigKnob[] = Object.freeze([...ENV_KNOBS]);
 
@@ -116,6 +125,15 @@ export function checkEnvKnobs(env: Record<string, string | undefined> = {}): str
     if (!Number.isFinite(parsed) || parsed < min) {
       issues.push(`${knob.key}="${raw}" is not a valid integer >= ${min} (runtime falls back to ${formatValue(knob.defaultValue)})`);
     }
+  }
+  // A removed knob is the one setting the runtime cannot tell you about: nothing reads it, so the
+  // value silently does nothing. Name it instead of leaving the export in place to be believed.
+  const registered = new Set(ENV_KNOBS.map((knob) => knob.key));
+  for (const [key, raw] of Object.entries(env)) {
+    if (raw === undefined || raw === '') continue;
+    if (!PIHER_KEY.test(key)) continue;
+    if (registered.has(key) || SPAWN_CONTRACT_KEYS.includes(key)) continue;
+    issues.push(`${key}="${raw}" is set but no code reads it (a removed knob): unset it, or run \`piher config\` for the current names`);
   }
   return issues;
 }
