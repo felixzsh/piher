@@ -73,12 +73,22 @@ task's state comes from.
 - **S14.** The first task is handed over through the core (`terminal.run` with the task, or
   `terminal.send`); readiness is the core's `status` / `first_message.sent`, never a ping on a private
   socket.
-- **S22.** A `send` counts as delivered only when its own result says `started: true`. (Measured: a send
+- **S22.** *(superseded by S25 for delivery; kept visible as the record of what was agreed first.)* A
+  `send` counts as delivered only when its own result says `started: true`. (Measured: a send
   issued right after `run --bg`, before the worker reported `idle`, returned
   `{"started":null,"status":null,"turn":0}` and the text stayed in the worker's composer unsubmitted —
   `turn` stayed 0 and `status` stayed `idle`; the identical send after `status: idle` returned
   `started: true` and the run ended `status:"done", turn:1`. Three of three immediate sends were lost as
   tasks this way.)
+- **S25.** A first task counts as delivered when the send's own result says `started: true` **or** when the
+  same result carries evidence that a turn began that had not begun before: `status` `working`, or a
+  `turn` above the one read before the send. A result with no such evidence is not delivery: the text may
+  still be sitting in the worker's input, so the retry submits it (`enter`) instead of pasting it again,
+  and only a refusal that typed nothing (`status_mismatch`) is followed by a new paste. The core's
+  `started` is `null` when the program does not report status, so `null` alone proves nothing in either
+  direction; discarding a worker that did run its task is the failure this rule exists to prevent.
+  (Adopted after the P2 review: the `turn` field the core returns is the fact that separates "never
+  started" from "started and the status sample missed it".)
 - **S15.** `send` keeps its steering semantics — delivered between tool calls, not behind the whole turn —
   through `piher.cmd.<address>` and the worker's own `events.subscribe` applying
   `pi.sendUserMessage(text, {deliverAs})`. `terminal.send` alone is not the steering channel: it pastes
