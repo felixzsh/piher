@@ -623,6 +623,62 @@ test('output action: the transcript report replaces the pane copy and the delive
   rmSync(repo, { recursive: true, force: true });
 });
 
+/* ── output after the pane is gone ─────────────────────────────── */
+
+const RECLAIMED_REPORT = 'FINAL REPORT: the migration is applied and verified; two tests green.';
+const reclaimedDoc = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+  taskId: 'task-pworker', turn: 2, stopReason: 'stop', session: null,
+  text: RECLAIMED_REPORT, at: 1_750_000_000_000, ...over,
+});
+
+/** A worker whose pane is gone: `terminal.read` is what fails, exactly as the core answers a
+ *  reclaimed address. `pworker` is a legal address (S9 wants lowercase), so it can name a report. */
+const gonePane = (doc: Record<string, unknown> | null) => ({
+  getTerminal: async (id: string) => terminalInfo({ id, state: 'finished' }),
+  read: async (): Promise<never> => { throw new Error('terminal pworker is gone'); },
+  docGet: async () => (doc ? { value: doc, version: 3 } : { value: null, version: 0 }),
+});
+
+async function withGonePane(
+  body: (pi: FakePi) => Promise<void>,
+  doc: Record<string, unknown> | null,
+): Promise<void> {
+  const { root, pi } = await mountSubagent({
+    client: { ...NO_TERMINALS, ...gonePane(doc) },
+    tasks: [taskRow({ paneId: 'pworker', taskId: 'task-pworker', consumedAt: 1_750_000_000_000 })],
+  });
+  try {
+    await body(pi);
+  } finally {
+    await root.fiber.dispose();
+  }
+}
+
+test('output action: a reclaimed pane answers from its report document and says so', async () => {
+  // A one-shot's pane is reclaimed the moment its settlement is handed over (S54), and the GC
+  // removes stale ones. The report document outlives both; without this fallback, a master that lost
+  // the notice had no tool path to the text at all.
+  await withGonePane(async (pi) => {
+    const res = await runSubagent(pi, { action: 'output', agentId: 'pworker' });
+    const text = res.content[0]!.text;
+    assert.equal(res.details!.source, 'report-document');
+    assert.equal(res.details!.status, 'settled');
+    assert.match(text, /source: report document \(its pane is gone/);
+    assert.match(text, /piher\.rep\.pworker/, 'it names the document it read');
+    assert.ok(text.includes(RECLAIMED_REPORT), `the report text is returned: ${text}`);
+    assert.doesNotMatch(text, /terminal pworker is gone/, 'the pane failure is not the answer');
+  }, reclaimedDoc());
+});
+
+test('output action: a gone pane with no report document names both facts', async () => {
+  await withGonePane(async (pi) => {
+    await assert.rejects(
+      runSubagent(pi, { action: 'output', agentId: 'pworker' }),
+      /Its pane is gone and no report document is stored at piher\.rep\.pworker/,
+    );
+  }, null);
+});
+
 /* ── reply-session healing ──────────────────────────────────────── */
 
 test('resume: a record pointing at the master session is refused; another pane is reused', async () => {

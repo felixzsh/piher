@@ -18,6 +18,7 @@ import {
   type TurnClosing,
 } from './session-tail.ts';
 import { idParam, reportFingerprint, type AliveProbe } from './subagent-core.ts';
+import { readReportDocument } from './report-documents.ts';
 import { isClosed, type ResolvedTaskEntry, type TaskEntry } from './task-row.ts';
 import { toolError } from './tool-error.ts';
 
@@ -583,6 +584,104 @@ async function readBlockedQuestion(client: CoreClientLike, paneId: string): Prom
   }
 }
 
+/** The requested output cap: `max_chars`, with `maxChars` accepted for older calls. */
+function outputMaxChars(params: Record<string, unknown> | undefined): number {
+  const requested = typeof params?.max_chars === 'number'
+    ? params.max_chars
+    : typeof params?.maxChars === 'number' ? params.maxChars : undefined;
+  return Math.max(1, Math.min(requested ?? OUTPUT_DEFAULT_MAX_CHARS, OUTPUT_HARD_CAP_CHARS));
+}
+
+/** `output` after the pane is gone: the report document is the only text left, and the header must
+ *  say which channel answered — a header that read like a pane read would point a master at a
+ *  terminal that no longer exists. */
+export function formatReportDocumentOutput(input: {
+  paneId: string;
+  status: SubagentStatus;
+  revision: number;
+  text: string | null;
+  stopReason: string | null;
+  writtenAt: number;
+  truncated: boolean;
+}): string {
+  const meta = [
+    `pane: ${input.paneId}`,
+    `status: ${input.status}`,
+    `revision: ${input.revision}`,
+    `source: report document (its pane is gone: this is what piher.rep.${input.paneId} holds, not a pane read)`,
+    `written: ${new Date(input.writtenAt).toISOString()}`,
+  ];
+  if (input.truncated) meta.push('truncated: true');
+  const body = input.text !== null
+    ? input.text
+    : `(no report text) ${input.stopReason ?? 'the worker left no closing message'}`;
+  return `[Subagent Report | ${meta.join(' | ')}]\n${body}`;
+}
+
+/** The read the pane no longer answers: the worker's own report document, which outlives both the
+ *  pane and the record (spec S12). Returns the `output` result, or an error naming which of the
+ *  document's own states left nothing to read. */
+async function outputFromReportDocument(input: {
+  entry: TaskEntry;
+  status: SubagentStatus;
+  foreign: boolean;
+  client: CoreClientLike;
+  params: Record<string, unknown> | undefined;
+  paneError: unknown;
+  nextRevision: (paneId: string) => number;
+  writeRecord?: (entry: TaskEntry) => void;
+}) {
+  const { entry } = input;
+  const paneId = entry.gen.paneId;
+  const name = `piher.rep.${paneId}`;
+  const read = await readReportDocument(input.client, paneId);
+  const unavailable = read.kind === 'read'
+    ? read.value.taskId === entry.taskId
+      ? null
+      : `the report document ${name} belongs to task ${read.value.taskId}, not this one`
+    : read.kind === 'absent' ? `no report document is stored at ${name}`
+      : read.kind === 'not-a-report' ? `the value stored at ${name} is not a report piher can read`
+        : `the core did not answer, so ${name} could not be read`;
+  if (read.kind !== 'read' || unavailable !== null) {
+    const cause = input.paneError instanceof Error ? input.paneError.message : String(input.paneError);
+    return toolError(`Error: failed to read output for subagent ${paneId}: ${cause}. Its pane is gone and ${unavailable}.`);
+  }
+  const value = read.value;
+  const bounded = value.text === null
+    ? { text: null as string | null, truncated: false }
+    : boundText(value.text, outputMaxChars(input.params));
+  // The report is delivered once `output` returned it, exactly as the transcript fallback records it.
+  if (value.text !== null && !input.foreign) {
+    entry.gen.reportDelivered = { fingerprint: reportFingerprint(value.text), at: Date.now() };
+    input.writeRecord?.(entry);
+  }
+  const revision = input.nextRevision(paneId);
+  return {
+    content: [{
+      type: 'text' as const,
+      text: formatReportDocumentOutput({
+        paneId,
+        status: input.status,
+        revision,
+        text: bounded.text,
+        stopReason: value.stopReason,
+        writtenAt: value.at,
+        truncated: bounded.truncated,
+      }),
+    }],
+    details: {
+      paneId,
+      status: input.status,
+      revision,
+      source: 'report-document',
+      truncated: bounded.truncated,
+      restart: false,
+      deltaLength: bounded.text?.length ?? 0,
+      reportDelivered: true,
+    },
+  };
+}
+
 export async function executeSubagentOutput(
   params: Record<string, unknown> | undefined,
   toolCtx: unknown,
@@ -627,13 +726,22 @@ export async function executeSubagentOutput(
     const read = await deps.client.read(entry.gen.paneId);
     rawRead = { text: read.text, complete: read.complete };
   } catch (err) {
-    return toolError(`Error: failed to read output for subagent ${entry.gen.paneId}: ${(err as Error).message}`);
+    // The pane is gone: a one-shot's pane is reclaimed at settlement and the GC removes stale ones.
+    // The document is what outlives it, so answer from it and say which channel answered.
+    return outputFromReportDocument({
+      entry,
+      status,
+      foreign,
+      client: deps.client,
+      params,
+      paneError: err,
+      nextRevision: deps.nextRevision,
+      ...(deps.writeRecord ? { writeRecord: deps.writeRecord } : {}),
+    });
   }
 
   const prevCursor = deps.outputCursors.get(entry.gen.paneId);
-  const maxChars = typeof params?.max_chars === 'number'
-    ? params.max_chars
-    : typeof params?.maxChars === 'number' ? params.maxChars : undefined;
+  const maxChars = outputMaxChars(params);
   const deltaResult = computeSubagentOutputDelta(prevCursor, cleanPaneChrome(rawRead.text), { maxChars });
   // A resumed process has no cursor; the durable delivery record keeps the report from repeating.
   deltaResult.nextCursor.reportTail ??= prevCursor?.reportTail ?? entry.gen.reportDelivered?.fingerprint;
@@ -646,7 +754,7 @@ export async function executeSubagentOutput(
       const report = await deps.readFinalReport(entry.gen.paneId, entry.cwd, entry.gen.sessionFile);
       const fingerprint = report ? reportFingerprint(report) : '';
       if (report && fingerprint && fingerprint !== deltaResult.nextCursor.reportTail) {
-        const bounded = boundText(report, Math.max(1, Math.min(maxChars ?? OUTPUT_DEFAULT_MAX_CHARS, OUTPUT_HARD_CAP_CHARS)));
+        const bounded = boundText(report, maxChars);
         reportSection = `[Subagent Report | latest finalized message from session transcript${bounded.truncated ? ' | truncated' : ''}]\n${bounded.text}`;
         deltaResult.nextCursor.reportTail = fingerprint;
         deltaResult.delta = cutPaneReportCopy(deltaResult.delta, report) ?? deltaResult.delta;
