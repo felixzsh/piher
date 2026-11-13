@@ -97,3 +97,22 @@ empty or oversized message is refused before any write). Residuals: the steer or
 `deliverAs:'steer'` contract, not on a live `hc` run; `unsettled` does not re-arm, deliberately. The P3
 worker rewrote the branch so my uncommitted S26 edit fell out of history; I re-committed it as `4286801`
 and the text is byte-identical.
+L6. **P4 done**: `0cb7779` (`5b8a4ae`+`8344d22`, then `e5d36b1` and `0cb7779` for the corrections;
+`3fcf959`, `adf1438` ride along), Risk: item 3 (two documented `PIHER_*` knobs removed — a
+config-contract change), `tsc` clean + `npm test` **545/545** on `0cb7779`, Route: delegated. Two
+reviews: REJECT (8 findings, none triaged out) then **APPROVE** with 5 new ones, of which the two this
+phase's own fixes introduced were corrected and three were triaged out with reasons (dead latch plumbing —
+P5 deletes `index-pipe`; a 30 s lag on a buffered notice; `list` still reading `idle` for a channel-less
+row, which needs a new durable field and would open S10's fact set in the last phase). Deleted:
+`planSettleWindowTick`, `isSettlementCandidate` (with the `terminalIdle` concession), the master-side
+transcript derivation, the blocked-gate dedupe, the settle-claim latch in the poller, and both knobs;
+`session-tail.ts` now answers only "what did the turn say". Restored after the review: every settle with a
+channel writes a document (S6/S8, including `text:null, stopReason:null`), the two silence-budget endings
+`settled-without-report` vs `silence-timeout`, a reader that survives a budget-ended row, and
+`reattributeStaleSessionFile`. The docs guard was narrowed to the two phase-log files, so
+`docs/spec/contracts.md` is guarded again. **Q1 answered from pi's documents**, not from code:
+`agent_settled` means no remaining automatic work, and queued steering counts as remaining work, so an
+empty interim settle cannot fire between a finished turn and a steer's turn (`docs/json.md:48`,
+`docs/extensions.md:336`); recorded where the empty settle is written. Residuals: the seam is the fake
+core, not a live `hc`; a channel-less worker's row still reads `idle` in `list`; `config-catalog` now
+names any unregistered `PIHER_*` and sweeps the whole source tree.
