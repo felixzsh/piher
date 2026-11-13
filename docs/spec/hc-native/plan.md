@@ -336,3 +336,24 @@ capacity line should print when it becomes visible (P9), and it is the fact behi
 piher's to fix, only to make visible". Not measured: the core's own event fan-out at N=30 — the code
 holds one unfiltered `events.subscribe` per worker, so the cost is O(N) per element event by
 construction, but no instrumented run has counted it yet.
+L19. **The review's five cheap minors, closed**: `bc3094d` (parent `c577de8`), Risk: item 5 (the ledger's
+duplicate bound and the ownership of a cursor step), `tsc` clean + `npm test` **607 tests, 601 pass,
+6 skipped, 0 fail** on that SHA, verified by the parent. All five confirmed; one mechanism refuted.
+**#7**: the replay named only the pane, and a reused address resolves to whatever task owns it now — the
+notice and the batch row now name `task <taskId>` and flag a moved address. **#8**: the `pane-gone` and
+silence-budget facts carried no `payloadRef`, so a replay said "the report document is no longer
+readable" where the original said the pane was gone or that no report came; the replay now branches on
+the event's `kind`, and a replayed `pane-gone` row reports `closed`, as the live delivery does. **#9**: the
+review's mechanism was wrong — the cursor cannot exceed the new file's `lastSeq` — but the harm is real
+and worse to reason about: a stale seq is *equal* to a new-file seq, so `markDelivered(oldSeq)` marked a
+fresh fact accepted and crossed it without a delivery. Fixed with an `epoch()` bumped on every
+load/repoint and ignored when stale; the row's `consumedAt` is still written because pi did read the
+notice. **#10**: the buffer acknowledged a collapsed batch notice by notice, so a crash between handlers
+re-delivered the rest of a message pi had read as one; `openBatch()` now defers the cursor write to the
+end of the batch, so one delivery is one step and the documented bound is the real one. **#11**: the
+fallback without a send method acknowledged unconditionally; now it returns early, while a host that
+does send still records acceptance. Two existing replay assertions were tightened for the new header,
+none loosened. Residual: the wiring line in `index.ts`
+(`subagentPort.current?.openDeliveryBatch?.() ?? null`) has no test of its own — if the port member were
+renamed, #10 would silently regress to per-notice marking — and the fork case (#6) remains out of scope
+by decision, so it is the only review finding still open.
