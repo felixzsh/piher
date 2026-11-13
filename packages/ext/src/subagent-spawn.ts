@@ -167,6 +167,9 @@ interface ReadyFailure {
   readonly elapsedMs: number;
   readonly timeoutMs: number;
   readonly lastStatus?: string | null;
+  /** The child's own turn count when the boot gave up: a turn that ran is proof the child took
+   *  something, so no text about it may say it never took its first message (plan L14). */
+  readonly turn?: number | null;
   readonly tail?: string | null;
   /** Whether the caller really keeps the pane it names. The text must not promise `output`/retry
    *  on a pane the caller is about to retire (the revive path: no row will ever point at it). */
@@ -181,7 +184,9 @@ type ReadyAttemptPlan =
 /** The status words that mean "this agent is not in a turn, so its composer takes input": `idle` is
  *  what a booted agent reports, `done` the same fact once its last turn finished (spec S2 words).
  *  `unknown` is not among them — it is the absence of a word — so a program that reports nothing is
- *  released by `planReadyAttempt`'s grace instead, never by this predicate. */
+ *  released by `planReadyAttempt`'s grace instead, never by this predicate. `working` is not among
+ *  them either: an agent inside a turn has already taken something, which is readiness for another
+ *  reason (see `tookTurn` and `planReadyAttempt`). */
 export function isReadyStatus(status: string | null | undefined): boolean {
   return status === 'idle' || status === 'done';
 }
@@ -192,6 +197,13 @@ export function isUnreportedStatus(status: string | null | undefined): boolean {
   return status == null || status === 'unknown';
 }
 
+/** Whether the child has run at least one turn: a fact from the core's own counter, not a word, so it
+ *  proves the agent is alive and working even when its status cannot be read. A turn of zero (or no
+ *  turn at all, when the core did not answer) is no evidence in either direction. */
+export function tookTurn(turn: number | null | undefined): boolean {
+  return typeof turn === 'number' && turn >= 1;
+}
+
 /** The budget left for an unreported program before it is treated as ready: a grace, never the whole
  *  budget, so a program that does report status is still waited for. */
 export function unreportedGraceMs(timeoutMs: number): number {
@@ -199,26 +211,40 @@ export function unreportedGraceMs(timeoutMs: number): number {
 }
 
 /** Decide one readiness attempt. `alive` is tri-state on purpose: an unavailable liveness probe
- * (`null`) must not be read as death, or a slow herdr socket fails spawns that are merely slow. */
+ * (`null`) must not be read as death, or a slow herdr socket fails spawns that are merely slow.
+ *
+ * `turn` is the core's own turn count for the pane: readiness is a question about whether the child
+ * has taken something and is running, and an agent inside a turn has taken something — waiting for an
+ * idle window it may never show is how a working child was reported as a failed start (plan L14).
+ * The task is typed into the busy agent instead, which holds it for its next turn, so accepting
+ * `working` cannot lose the brief. */
 export function planReadyAttempt(opts: {
   elapsedMs: number;
   attempt: number;
   timeoutMs: number;
   alive: boolean | null;
   status: string | null | undefined;
+  turn?: number | null;
 }): ReadyAttemptPlan {
   // A finished terminal is never ready, whatever word it last reported.
   if (opts.alive === false) return { kind: 'give-up', reason: 'pane-gone' };
-  if (isReadyStatus(opts.status)) return { kind: 'ready' };
   // A dialog or a reported error needs a person, not more waiting: saying so at once is the only
-  // advice that can still be acted on, because the boot keeps the pane it is talking about.
+  // advice that can still be acted on, because the boot keeps the pane it is talking about. Both are
+  // decided before the running facts below: a blocked agent that ran a turn is still blocked.
   if (opts.status === 'blocked') return { kind: 'give-up', reason: 'blocked' };
   if (opts.status === 'error') return { kind: 'give-up', reason: 'error' };
+  if (isReadyStatus(opts.status)) return { kind: 'ready' };
+  // The child has taken something and is running: `working` says so, and so does a turn the core
+  // counted. Either is readiness, because a worker that is already busy takes its first message as a
+  // queued one (the composer is where the core types) rather than being read as one that never came up.
+  if (opts.status === 'working' || tookTurn(opts.turn)) return { kind: 'ready' };
   // Nobody can tell: the program never reported. Hand the task over after the grace and let the
   // send's own result and the pane's turn decide, instead of failing a worker that cannot answer.
   if (isUnreportedStatus(opts.status) && opts.elapsedMs >= unreportedGraceMs(opts.timeoutMs)) {
     return { kind: 'ready' };
   }
+  // With `working` accepted above, no word in the core's vocabulary reaches this line any more: it is
+  // the loop's own terminator, kept so the wait cannot spin forever if a status word is ever added.
   if (opts.elapsedMs >= opts.timeoutMs) return { kind: 'give-up', reason: 'timeout' };
   return { kind: 'retry', delayMs: readyBackoffMs(opts.attempt) };
 }
@@ -258,11 +284,39 @@ export function readyFailureText(failure: ReadyFailure): string {
         ? 'Nothing was pasted. The pane is kept: answer that dialog in the pane, then retry this task.'
         : failure.reason === 'error'
           ? 'Nothing was pasted. The pane is kept so its last output can be read; retry the task or close it.'
-          : failure.lastStatus === 'working'
-            ? 'Nothing was pasted: the pane is alive and already running a turn of its own. The pane is kept — give it time, read it with action "output", then retry this task.'
+          : tookTurn(failure.turn)
+            ? `Nothing was pasted: the pane is alive and already running a turn of its own (turn ${failure.turn}). The pane is kept — give it time, read it with action "output", then retry this task.`
             : `The pane is alive but its agent never reported \`idle\` (last status: ${failure.lastStatus ?? 'none'}). The pane is kept: the child pi process may still be starting, or the program reports no status at all (piher's status comes from the program's own OSC 7501 report; \`PI_PROGRAM_STATUS=0\` turns that off).`;
   const tail = failure.tail ? `\nlast output of ${failure.paneId}:\n${failure.tail}` : '';
   return `${head}\n${why}${tail}`;
+}
+
+/** The notice a failed boot sends the master. `kept` says whether the pane it names survives, and
+ *  `turn` is the child's own turn count when the boot gave up: a turn that ran is a fact the text may
+ *  not deny, so a child that ran one is described as running (with `output` as the way to watch it)
+ *  instead of as one that never took its first message — the lie the live run caught (plan L14). */
+export function formatBootFailureNotice(f: {
+  description: string;
+  paneId: string;
+  taskId: string;
+  /** The boot's own failure text, verbatim: it carries the cause and the advice that follows. */
+  reason: string;
+  kept: boolean;
+  turn?: number | null;
+  /** Whether a settlement watch reads this pane. A notice may not promise a silence budget without one. */
+  armed: boolean;
+}): string {
+  const head = `Subagent "${f.description}" (pane ${f.paneId}, task ${f.taskId})`;
+  if (!f.kept) {
+    return `${head} failed to start: ${f.reason} Nothing is running there; spawn it again if the task still matters.`;
+  }
+  const state = tookTurn(f.turn)
+    ? `is running (turn ${f.turn}) and its first message was not confirmed: ${f.reason}`
+    : `is up but did not take its first message: ${f.reason}`;
+  const watch = f.armed
+    ? 'If nothing answers, its silence budget ends it.'
+    : 'No settlement watch could be armed for it, so its outcome will not arrive on its own — check it with action "output", then retry or close it.';
+  return `${head} ${state} The pane and the task are still there — read it with action "output" (agentId ${f.paneId}), then retry task ${f.taskId} or close it. ${watch}`;
 }
 
 /** Whether a core error about the pane means nothing is there any more: the row and the advice must
@@ -335,19 +389,22 @@ interface SpawnerHost {
 }
 
 /** A boot failure, and whether the pane it names is worth keeping: a live pane that never took its
- *  task is not the same thing as a pane that died (see `keepsPane`). */
+ *  task is not the same thing as a pane that died (see `keepsPane`). `turn` is the child's own turn
+ *  count at the moment the boot gave up, so the notice can say "running" when that is the fact. */
 export class BootFailure extends Error {
   readonly keepPane: boolean;
-  constructor(message: string, keepPane: boolean) {
+  readonly turn: number | null;
+  constructor(message: string, keepPane: boolean, turn: number | null = null) {
     super(message);
     this.name = 'BootFailure';
     this.keepPane = keepPane;
+    this.turn = turn;
   }
 }
 
 type ReadyOutcome =
   | { ok: true; status: string | null }
-  | { ok: false; message: string; keepPane: boolean };
+  | { ok: false; message: string; keepPane: boolean; turn: number | null };
 
 export interface Spawner {
   spawnPaneInTaskTab(
@@ -416,7 +473,7 @@ export function createSpawner(h: SpawnerHost): Spawner {
         if (sampled) tail = sampled;
       }
       const plan = planReadyAttempt({
-        elapsedMs, attempt, timeoutMs: budgetMs, alive: probe.alive, status: probe.status,
+        elapsedMs, attempt, timeoutMs: budgetMs, alive: probe.alive, status: probe.status, turn: probe.turn,
       });
       if (plan.kind === 'ready') return { ok: true, status: probe.status };
       if (plan.kind === 'give-up') {
@@ -429,8 +486,9 @@ export function createSpawner(h: SpawnerHost): Spawner {
           lastStatus: probe.status,
           tail,
           kept: keepPane,
+          turn: probe.turn,
         };
-        return { ok: false, message: readyFailureText(failure), keepPane };
+        return { ok: false, message: readyFailureText(failure), keepPane, turn: probe.turn };
       }
       attempt += 1;
       // Never sleep past the budget: a retry may not overshoot the deadline the caller is waiting on.
@@ -482,6 +540,7 @@ export function createSpawner(h: SpawnerHost): Spawner {
           throw new BootFailure(
             `subagent pane ${paneId} could not take its first message: ${(err as Error)?.message ?? String(err)}`,
             keepsPaneForCoreError(err),
+            before.turn,
           );
         }
       }
@@ -503,14 +562,14 @@ export function createSpawner(h: SpawnerHost): Spawner {
           attempts,
           elapsedMs: Date.now() - startedAt,
           last: result ?? { started: null, status: after.status, turn: after.turn ?? 0 },
-        }), after.alive !== false);
+        }), after.alive !== false, after.turn);
       }
       pending = plan.kind === 'resubmit' ? 'enter' : 'send';
       await sleep(plan.delayMs);
       // Readiness again, on the same budget and before every retry: the measured failure is a send
       // issued before the agent reports `idle`, and the identical send after it starts the turn.
       const ready = await waitReady(paneId, Math.max(0, timeoutMs - (Date.now() - startedAt)));
-      if (!ready.ok) throw new BootFailure(ready.message, ready.keepPane);
+      if (!ready.ok) throw new BootFailure(ready.message, ready.keepPane, ready.turn);
       if (gateAllowed) gate = ready.status === 'idle' ? { if: 'idle' } : {};
       before = await probeChildPane(paneId);
     }
@@ -886,7 +945,7 @@ export function createSpawnAction(h: SpawnActionHost) {
         // clock the first attempt already spent, since a `send`/`retry` action waits on this boot.
         const deadline = Date.now() + readinessTimeoutMs;
         const ready = await waitReady(paneId, readinessTimeoutMs);
-        if (!ready.ok) throw new BootFailure(ready.message, ready.keepPane);
+        if (!ready.ok) throw new BootFailure(ready.message, ready.keepPane, ready.turn);
         // The worker's `hresume` report lags right after spawn (its own Herdr extension writes it a
         // moment later), so the mtime fallback would otherwise adopt the newest PRE-EXISTING session in
         // cwd; only a file written after the terminal existed counts.
@@ -914,6 +973,9 @@ export function createSpawnAction(h: SpawnActionHost) {
       void boot.catch(async (err: unknown) => {
         const reason = (err as Error)?.message ?? String(err);
         const keep = err instanceof BootFailure && err.keepPane;
+        /** The child's own turn count when the boot gave up: a turn that ran is a fact, and the
+         *  notice below must not describe such a child as one that never took its first message. */
+        const turn = err instanceof BootFailure ? err.turn : null;
         /** Whether a watch took this pane: only a kept row arms one, and the notice says which. */
         let armed = false;
         // E2/E12: a child that took its task, answered and exited loses the probe race — the answer is
@@ -952,13 +1014,15 @@ export function createSpawnAction(h: SpawnActionHost) {
           armed = await armSettlementWatch(paneId, cwd, Date.now(), spec.description);
         }
         try {
-          await h.notifySpawnFailed(
-            keep
-              ? `Subagent "${spec.description}" (pane ${paneId}, task ${taskId}) is up but did not take its first message: ${reason} The pane and the task are still there — read it with action "output" (agentId ${paneId}), then retry task ${taskId} or close it. ${armed
-                ? 'If nothing answers, its silence budget ends it.'
-                : 'No settlement watch could be armed for it, so its outcome will not arrive on its own — check it with action "output", then retry or close it.'}`
-              : `Subagent "${spec.description}" (pane ${paneId}, task ${taskId}) failed to start: ${reason} Nothing is running there; spawn it again if the task still matters.`,
-          );
+          await h.notifySpawnFailed(formatBootFailureNotice({
+            description: spec.description,
+            paneId,
+            taskId,
+            reason,
+            kept: keep,
+            turn,
+            armed,
+          }));
         } catch { /* a missed notice must not break the session */ }
       }).finally(() => {
         if (h.boots.get(paneId) === boot) h.boots.delete(paneId);

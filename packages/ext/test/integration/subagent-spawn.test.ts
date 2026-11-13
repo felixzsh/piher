@@ -85,15 +85,32 @@ test('waitReady/planTaskSend: the core decides readiness, and the turn proves de
     assert.ok(Date.now() - started <= 500, 'the grace, not the whole budget');
   });
 
-  await t.test('a pane stuck in a turn of its own for the whole budget fails, keeping its pane', async () => {
+  await t.test('an agent already in a turn has taken something: ready at once, never a timeout', async () => {
+    // The measured defect (plan L14): a child that goes straight to `working` and never passes through
+    // `idle` was waited for until the budget ran out and then reported as a failed start.
     const spawner = spawnerFor({
-      getTerminal: async (id) => terminalInfo({ id, status: 'working' }),
-    }, { readinessTimeoutMs: 300 });
+      getTerminal: async (id) => terminalInfo({ id, status: 'working', turn: 1 }),
+    }, { readinessTimeoutMs: 5_000 });
+    const started = Date.now();
     const out = await spawner.waitReady('tW');
+    assert.deepEqual(out, { ok: true, status: 'working' }, 'a working child is running, which is ready');
+    assert.ok(Date.now() - started < 2_000, 'the budget is not spent waiting for an idle window that never comes');
+    // `working` alone says it, and so does a turn the core counted over a status it cannot read.
+    const turned = spawnerFor({
+      getTerminal: async (id) => terminalInfo({ id, status: 'unknown', turn: 2 }),
+    }, { readinessTimeoutMs: 5_000 });
+    assert.deepEqual(await turned.waitReady('tW'), { ok: true, status: 'unknown' });
+  });
+
+  await t.test('a gone pane outranks every running fact, and keeps nothing', async () => {
+    const spawner = spawnerFor({
+      getTerminal: async (id) => terminalInfo({ id, status: 'working', turn: 3, state: 'finished' }),
+    }, { readinessTimeoutMs: 90_000 });
+    const out = await spawner.waitReady('tG');
     assert.equal(out.ok, false);
     if (out.ok) return;
-    assert.match(out.message, /was not ready within/);
-    assert.equal(out.keepPane, true, 'a live pane is kept so its output can be read');
+    assert.match(out.message, /exited before its agent reported ready/);
+    assert.equal(out.keepPane, false, 'a finished terminal is not kept, whatever its last word was');
   });
 
   await t.test('an agent blocked on a dialog is reported at once, with advice the kept pane can honour', async () => {
@@ -365,6 +382,17 @@ interface WorkerEnv {
   /** What sits unsubmitted in each pane's composer: a send that did not start a turn leaves its text
    *  there, and Enter submits it (spec S22's measured loss). */
   composer: Record<string, string>;
+  /** Text pi holds for a busy child's next turn: typed while the child is in a turn, so it is queued
+   *  rather than typed again (the risk accepting `working` as ready creates, plan L14). */
+  queued: Record<string, string>;
+  /** Turns the child has already run when its pane is created: a child busy with work of its own, the
+   *  live case that went straight to `working` (plan L14). A fresh terminal has run none. */
+  ownTurns: number;
+  /** A child whose program is up but takes nothing: the text is typed and vanishes, so no turn ever
+   *  starts (the shape that must stay a boot failure). */
+  agentNeverTakes: boolean;
+  /** The child finishes the turn it was in: pi hands it whatever was queued, as its next turn. */
+  endOwnTurn(paneId: string): void;
   /** Sends the fake core refused with `status_mismatch`: nothing was typed. */
   statusMismatches: number;
   /** How many of the next sends are refused with `status_mismatch` (the status moved in the gap). */
@@ -424,10 +452,19 @@ async function withWorkerEnv(
     parkPollers: () => { parked = true; }, rejectSend: false, sendError: null, sendDelayMs: 0, paneGone: false, paneFinished: false,
     finishedPanes: new Set<string>(), answerAndExit: false,
     sendResults: [], notReady: new Set<string>(), statuses: {},
-    pastes: [], composer: {}, statusMismatches: 0, refuseSend: 0,
+    pastes: [], composer: {}, queued: {}, ownTurns: 0, agentNeverTakes: false, statusMismatches: 0, refuseSend: 0,
     turns: {}, wakeWorker: () => { wake = true; releaseGates(); }, gated: false, transcript: SUB_TEXT,
     client: undefined as never, workerSessionFile: sessionFile,
     commands: [], commandPickup: 'applied',
+    // A busy child takes its first message as a queued one: the turn it is in ends first, and the
+    // queued text is its next turn. Nothing is typed a second time to make that happen.
+    endOwnTurn: (paneId: string) => {
+      delete env.statuses[paneId];
+      const held = env.queued[paneId];
+      delete env.queued[paneId];
+      if (held !== undefined) env.composer[paneId] = (env.composer[paneId] ?? '') + held;
+      submit(paneId);
+    },
     settle: async (paneId: string, taskId: string, text: string) => {
       // The worker's own report: what it writes on every settle (spec S6-S8). The master's poll loop
       // reads it — the only path a settlement has now that the private socket is gone. A settled
@@ -518,6 +555,16 @@ async function withWorkerEnv(
         throw new CoreError('terminal.send', 'status_mismatch', `status is ${status}`, null);
       }
       env.pastes.push({ paneId: id, text });
+      if (env.agentNeverTakes) {
+        // The program is up and reports nothing, and its TUI takes input and drops it: no turn can start.
+        return { started: false, status, turn: env.turns[id] ?? 0 };
+      }
+      if (status === 'working') {
+        // pi holds what is typed during a turn and hands it to the next one: a busy child receives its
+        // first message queued, and `status: working` is the delivery proof the caller relies on.
+        env.queued[id] = (env.queued[id] ?? '') + text;
+        return { started: false, status, turn: env.turns[id] ?? 0 };
+      }
       env.composer[id] = (env.composer[id] ?? '') + text;
       if (env.answerAndExit) {
         // The core's own Enter lands after the master's after-send probe (S22's measured late submit):
@@ -589,6 +636,8 @@ async function withWorkerEnv(
       // A new pane exists, so the old pane's disappearance no longer describes this worker.
       env.paneGone = false;
       const id = nextPaneId();
+      // A terminal is made fresh: it has run no turn of its own, whatever a pane reusing its id did.
+      env.turns[id] = env.ownTurns;
       env.paneLabels.set(id, o.labels ?? {});
       return terminalInfo({ id, cwd: o.cwd, labels: o.labels });
     },
@@ -1649,10 +1698,12 @@ test('P2: readiness does not depend on the program reporting, and the paste is g
       // The core refuses the paste because the agent is no longer idle: nothing went in, so a fresh
       // send is safe and the brief cannot be duplicated.
       const pastesBefore = env.pastes.length;
-      const turnsBefore = env.turns.p2 ?? 0;
       env.refuseSend = 1;
       const spawned = await runSubagent(env.pi, { description: 'status race', prompt: PROMPT }, env.cwd);
       const paneId = spawned.details?.paneId as string;
+      // A terminal is made fresh, so its turn count starts from zero: the harness reuses the pane id,
+      // and the count of the worker that held it before says nothing about this one.
+      const turnsBefore = env.turns[paneId] ?? 0;
       await waitFor(() => env.turns[paneId] === turnsBefore + 1);
       assert.equal(env.statusMismatches, 1, 'the core refused the first paste');
       assert.deepEqual(env.pastes.slice(pastesBefore).map((p) => p.text), [PROMPT], 'one paste, not two');
@@ -1831,4 +1882,87 @@ test('E2/E12: a child that finished with no report is still a real boot failure,
     assert.deepEqual(env.retired, [paneId], 'the pane is retired');
     assert.equal(readTaskRecord(env.cwd, taskId), null, 'and no row pretends the work is running');
   }, { policy: { readinessTimeoutMs: 2_000 } });
+});
+
+/* ── L14: a child that is already running is not a failed start ─────────────── */
+
+test('L14: a child that goes straight to working is ready, and its brief is queued rather than lost', async (t) => {
+  // The live defect (plan L14): a worker spawn was reported as "did not take its first message" while
+  // its buffer showed it reading files. It never passed through `idle`, so the readiness gate — which
+  // accepted only an idle word — timed out over a child that was demonstrably running.
+  await withWorkerEnv(async (env) => {
+    env.parkPollers();
+
+    await t.test('a boot whose status never leaves working, with a turn behind it, delivers its first message', async () => {
+      env.statuses.p2 = 'working'; // never idle
+      env.ownTurns = 1;            // the child is inside a turn it started itself
+      const spawned = await runSubagent(env.pi, { description: 'busy child', prompt: PROMPT }, env.cwd);
+      assert.match(spawned.content[0]!.text, /^started subagent/, 'the start is acknowledged');
+      const paneId = spawned.details?.paneId as string;
+      const taskId = spawned.details?.taskId as string;
+      await waitFor(() => env.pastes.length === 1);
+      assert.deepEqual(env.pastes.map((p) => p.text), [PROMPT], 'the whole brief is typed, once');
+      // The risk accepting `working` creates: the child is still inside its own startup turn when the
+      // brief arrives. A lost brief would be worse than the timeout this replaces, so the test proves
+      // it is queued: pi holds what is typed during a turn and hands it to the next one.
+      assert.equal(env.turns[paneId], 1, 'the brief did not interrupt the turn the child was in');
+      assert.equal(env.frames.length, 0, 'nothing was taken yet: the child was busy');
+      assert.equal(env.queued[paneId], PROMPT, 'the brief waits in the child, queued and not dropped');
+      assert.equal(env.pastes.length, 1, 'a send into a busy child is delivery, so it is never pasted again');
+      assert.ok(readTaskRecord(env.cwd, taskId) !== null, 'the task is recorded as running');
+      // The child finishes its own turn, and the queued brief becomes its next one.
+      env.endOwnTurn(paneId);
+      await waitFor(() => env.frames.length === 1);
+      assert.deepEqual(env.frames.map((f) => f.channel), ['core']);
+      assert.deepEqual(env.frames.map((f) => f.text), [PROMPT], 'delivered exactly once, and whole');
+      assert.equal(env.turns[paneId], 2, 'the queued message started the child\'s next turn');
+      assert.equal(env.queued[paneId], undefined, 'the queue is empty: nothing was left behind');
+      assert.deepEqual(env.retired, [], 'a running child is never retired');
+      delete env.statuses.p2;
+      env.ownTurns = 0;
+    });
+
+    await t.test('a child blocked after a turn is reported as running, never as one that missed its first message', async () => {
+      const noticesBefore = env.pi.userSent.length;
+      const pastesBefore = env.pastes.length;
+      env.statuses.p2 = 'blocked'; // a dialog needs a person
+      env.ownTurns = 1;            // and it has already run a turn of its own
+      const text = (await runSubagent(env.pi, { description: 'busy but blocked', prompt: PROMPT }, env.cwd)).content[0]!.text;
+      assert.match(text, /^started subagent/);
+      const taskId = /\(task ([0-9a-f-]+),/.exec(text)![1];
+      await waitFor(() => env.pi.userSent.length > noticesBefore);
+      const notice = env.pi.userSent.slice(noticesBefore).map((m) => m.content).join('\n');
+      assert.deepEqual(env.pastes.slice(pastesBefore), [], 'nothing is typed into a pane that needs an answer');
+      assert.match(notice, /blocked on a dialog/, 'the verdict for a dialog is unchanged');
+      // The lie the live run produced: the notice said the child never took its first message while the
+      // core itself reported a turn behind it.
+      assert.doesNotMatch(notice, /did not take its first message/);
+      assert.match(notice, /is running \(turn 1\)/, 'the turn the core counted is named, not denied');
+      assert.match(notice, /read it with action "output"/, 'and the action that follows from it is named');
+      assert.match(notice, /then retry task /);
+      assert.deepEqual(env.retired, [], 'a pane a person must answer is not retired');
+      assert.ok(readTaskRecord(env.cwd, taskId) !== null, 'the task survives so it can be retried');
+      delete env.statuses.p2;
+      env.ownTurns = 0;
+    });
+
+    await t.test('with no word and no turn the boot is still a failure, and says which proof is missing', async () => {
+      const noticesBefore = env.pi.userSent.length;
+      const framesBefore = env.frames.length;
+      env.notReady.add('p2');     // the program reports nothing at all
+      env.agentNeverTakes = true; // and its agent takes nothing, so no turn can ever start
+      const spawned = await runSubagent(env.pi, { description: 'silent and inert', prompt: PROMPT }, env.cwd);
+      const paneId = spawned.details?.paneId as string;
+      await waitFor(() => env.pi.userSent.length > noticesBefore, 10_000);
+      const notice = env.pi.userSent.slice(noticesBefore).map((m) => m.content).join('\n');
+      assert.equal(env.turns[paneId], 0, 'no turn ever started on that pane');
+      assert.equal(env.frames.length, framesBefore, 'and nothing was ever taken');
+      assert.match(notice, /took no turn from its first message/, 'the delivery, not readiness, is what failed');
+      assert.match(notice, /is up but did not take its first message/, 'with no turn there is nothing to claim');
+      assert.doesNotMatch(notice, /is running/, 'an inert child is never described as running');
+      assert.match(notice, /read it with action "output"/);
+      env.agentNeverTakes = false;
+      env.notReady.delete('p2');
+    });
+  }, { policy: { readinessTimeoutMs: 800 } });
 });

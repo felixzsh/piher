@@ -22,7 +22,10 @@ import {
 } from '../src/task-row.ts';
 import { CoreError } from '../src/core-client.ts';
 import { writeTaskRecord } from '../src/task-store.ts';
-import { keepsPane, keepsPaneForCoreError, planReadyAttempt, readyBackoffMs, readyFailureText, unreportedGraceMs } from '../src/subagent-spawn.ts';
+import {
+  formatBootFailureNotice, keepsPane, keepsPaneForCoreError, planReadyAttempt, readyBackoffMs, readyFailureText,
+  tookTurn, unreportedGraceMs,
+} from '../src/subagent-spawn.ts';
 
 const RT = { nodePath: '/usr/local/bin/node', cliPath: '/opt/pi/dist/cli.js', extPath: '/ext/index.ts' };
 
@@ -258,14 +261,37 @@ test('planReadyAttempt: ready wins; a gone pane fails fast; a dialog and an erro
   assert.deepEqual(plan({ status: 'done' }), { kind: 'ready' }, 'done is not working: the composer takes input');
   assert.deepEqual(plan({ alive: false }), { kind: 'give-up', reason: 'pane-gone' });
   assert.deepEqual(plan({ alive: null }), { kind: 'retry', delayMs: 500 });
-  assert.deepEqual(plan({ status: 'working' }), { kind: 'retry', delayMs: 500 });
-  assert.deepEqual(plan({ elapsedMs: 89_999, attempt: 7, status: 'working' }), { kind: 'retry', delayMs: 4000 });
-  assert.deepEqual(plan({ elapsedMs: 90_000, attempt: 8, status: 'working' }), { kind: 'give-up', reason: 'timeout' });
   // A dialog or a reported error is not "wait longer": the boot says so at once and keeps the pane.
   assert.deepEqual(plan({ status: 'blocked' }), { kind: 'give-up', reason: 'blocked' });
   assert.deepEqual(plan({ status: 'error' }), { kind: 'give-up', reason: 'error' });
   // A dead pane outranks the timeout: the more accurate reason wins.
   assert.deepEqual(plan({ elapsedMs: 120_000, attempt: 9, alive: false }), { kind: 'give-up', reason: 'pane-gone' });
+});
+
+test('planReadyAttempt: an agent that is working has taken something and is ready (plan L14)', () => {
+  const plan = (over: Partial<Parameters<typeof planReadyAttempt>[0]>) =>
+    planReadyAttempt({ elapsedMs: 10, attempt: 0, timeoutMs: 90_000, alive: true, status: 'unknown', ...over });
+  // The measured defect: a child that went straight to `working` and never passed through `idle` was
+  // waited for until the budget ran out and then called a failed start.
+  assert.deepEqual(plan({ status: 'working' }), { kind: 'ready' });
+  assert.deepEqual(plan({ status: 'working', turn: 1 }), { kind: 'ready' });
+  assert.deepEqual(plan({ status: 'working', attempt: 7, elapsedMs: 1_000 }), { kind: 'ready' }, 'ready at the first look, not at the deadline');
+  // The core's own turn count is a fact, not a word: it proves the agent is running even when the
+  // status cannot be read.
+  assert.deepEqual(plan({ status: 'unknown', turn: 1 }), { kind: 'ready' });
+  assert.deepEqual(plan({ status: null, turn: 3, elapsedMs: 0 }), { kind: 'ready' });
+  // A turn of zero, or no turn at all, is no evidence in either direction: the same shape stays on the
+  // grace/timeout path, and a boot that never takes a turn is still a failure (pinned end to end).
+  assert.deepEqual(plan({ status: 'unknown', turn: 0 }), { kind: 'retry', delayMs: 500 });
+  assert.deepEqual(plan({ status: null, turn: 0 }), { kind: 'retry', delayMs: 500 });
+  assert.equal(tookTurn(0), false);
+  assert.equal(tookTurn(null), false);
+  assert.equal(tookTurn(undefined), false);
+  assert.equal(tookTurn(1), true);
+  // What needs a person stays what needs a person, however many turns the child has run.
+  assert.deepEqual(plan({ status: 'blocked', turn: 4 }), { kind: 'give-up', reason: 'blocked' });
+  assert.deepEqual(plan({ status: 'error', turn: 4 }), { kind: 'give-up', reason: 'error' });
+  assert.deepEqual(plan({ alive: false, status: 'working', turn: 4 }), { kind: 'give-up', reason: 'pane-gone' });
 });
 
 test('planReadyAttempt: a program that never reports status is handed its task after the grace', () => {
@@ -277,7 +303,7 @@ test('planReadyAttempt: a program that never reports status is handed its task a
   assert.deepEqual(plan({ elapsedMs: 3_000 }), { kind: 'ready' }, 'nobody can tell, so the delivery decides');
   assert.deepEqual(plan({ status: null, elapsedMs: 3_000 }), { kind: 'ready' });
   // A program that does report status is still waited for: the grace is not a release from readiness.
-  assert.deepEqual(plan({ status: 'working', elapsedMs: 3_000 }), { kind: 'retry', delayMs: 1000 });
+  assert.deepEqual(plan({ status: 'unknown', turn: 0, elapsedMs: 2_999 }), { kind: 'retry', delayMs: 1000 }, 'a turn of zero is no evidence');
 });
 
 test('readyFailureText: crash, blocked, error, working-but-slow and never-reported are distinguishable', () => {
@@ -292,11 +318,12 @@ test('readyFailureText: crash, blocked, error, working-but-slow and never-report
   assert.match(crashed, /last output of wX:p9/);
 
   const slow = readyFailureText({
-    paneId: 'wX:p9', reason: 'timeout', elapsedMs: 90_000, timeoutMs: 90_000, lastStatus: 'working',
+    paneId: 'wX:p9', reason: 'timeout', elapsedMs: 90_000, timeoutMs: 90_000, lastStatus: 'unknown', turn: 2,
   });
   assert.match(slow, /was not ready within 90s/);
-  assert.match(slow, /alive and already running a turn/);
+  assert.match(slow, /alive and already running a turn of its own \(turn 2\)/);
   assert.match(slow, /pane is kept/, 'the advice must survive the boot keeping the pane');
+  assert.doesNotMatch(slow, /never reported/, 'a pane that ran a turn is not described as one that reported nothing');
 
   const blocked = readyFailureText({
     paneId: 'wX:p9', reason: 'blocked', elapsedMs: 10, timeoutMs: 90_000, lastStatus: 'blocked',
@@ -321,6 +348,38 @@ test('readyFailureText: crash, blocked, error, working-but-slow and never-report
 test('keepsPane: only a gone pane is retired; every live failure keeps its terminal and row', () => {
   assert.equal(keepsPane('pane-gone'), false);
   for (const reason of ['timeout', 'blocked', 'error'] as const) assert.equal(keepsPane(reason), true, reason);
+});
+
+test('formatBootFailureNotice: a child that ran a turn is never said to have missed its first message', () => {
+  const notice = (over: Partial<Parameters<typeof formatBootFailureNotice>[0]>) => formatBootFailureNotice({
+    description: 'survey the fee table',
+    paneId: 'wX:p9',
+    taskId: 'task-1',
+    reason: 'subagent pane wX:p9 is blocked on a dialog (trust, auth or a question)',
+    kept: true,
+    turn: null,
+    armed: true,
+    ...over,
+  });
+  // The measured lie (plan L14): the pane was reading files while the notice said its turn never began.
+  const running = notice({ turn: 2 });
+  assert.doesNotMatch(running, /did not take its first message/);
+  assert.match(running, /is running \(turn 2\)/);
+  assert.match(running, /read it with action "output" \(agentId wX:p9\)/, 'the way to watch it is named');
+  assert.match(running, /then retry task task-1 or close it/);
+  assert.match(running, /silence budget/, 'and the watchdog the kept row has');
+  // No turn is no evidence: the old text is still right there, and so is the unarmed-watch variant.
+  for (const turn of [null, 0] as const) {
+    const idle = notice({ turn });
+    assert.match(idle, /is up but did not take its first message/);
+    assert.doesNotMatch(idle, /is running/);
+    assert.match(notice({ turn, armed: false }), /No settlement watch could be armed for it/);
+  }
+  // A pane nobody keeps is not described as a place to read, whatever it did before it went.
+  const gone = notice({ kept: false, turn: 5 });
+  assert.match(gone, /failed to start/);
+  assert.match(gone, /Nothing is running there/);
+  assert.doesNotMatch(gone, /read it with action "output"/);
 });
 
 test('readyFailureText: a caller that cannot keep the pane says so instead of promising actions on it', () => {
