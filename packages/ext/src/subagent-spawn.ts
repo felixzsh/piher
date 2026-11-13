@@ -35,7 +35,8 @@ import {
 } from './subagent-core.ts';
 import { allocateTaskSlug, taskRef, type TaskEntry } from './task-row.ts';
 import type { Poller } from './subagent-poller.ts';
-import { formatWatchNotArmedNotice } from './subagent-poller.ts';
+import { formatWatchNotArmedNotice, REQUEST_BOUNDARY_SLACK_MS } from './subagent-poller.ts';
+import { planReportDelivery, readReportDocument } from './report-documents.ts';
 import type { SessionIo } from './subagent-session.ts';
 import { HRESUME_LABEL, TASK_LABEL, hresumeSessionFile, hresumeReport } from './subagent-session.ts';
 
@@ -692,6 +693,25 @@ export function createSpawnAction(h: SpawnActionHost) {
   const { spawnPaneInTaskTab, launchParts, waitReady, deliverFirstTask, readinessTimeoutMs } = h.spawn;
   const { startPoller } = h.poller;
 
+  /** E2/E12: what a boot that never confirmed its delivery asks before it may be called a failure.
+   *  The report document is the one fact that outlives the pane (S12), and it names the task, so a
+   *  report here is proof that the child took its task and answered — the case the live probes lose
+   *  when the core's own Enter lands after the send result and the worker answers and exits inside
+   *  the delivery retry's wait. The boundary is the spawn's own, with the same slack the settlement
+   *  watch uses, so a document from an earlier generation at a reused address stays `stale` here too. */
+  const reportedSettlement = async (taskId: string, paneId: string, sinceTs: number): Promise<boolean> => {
+    const read = await readReportDocument(client, paneId);
+    if (read.kind !== 'read') return false;
+    return planReportDelivery({
+      value: read.value,
+      taskId,
+      address: paneId,
+      sinceTs: Math.max(0, sinceTs - REQUEST_BOUNDARY_SLACK_MS),
+      delivered: null,
+      deliveredKeys: new Set(),
+    }).kind === 'deliver';
+  };
+
   /** Arm this pane's settlement watch and answer whether one took it. A worker no watch reads
    *  settles into silence: its outcome never arrives by itself, so the caller must say so now. */
   const armSettlementWatch = async (
@@ -896,6 +916,22 @@ export function createSpawnAction(h: SpawnActionHost) {
         const keep = err instanceof BootFailure && err.keepPane;
         /** Whether a watch took this pane: only a kept row arms one, and the notice says which. */
         let armed = false;
+        // E2/E12: a child that took its task, answered and exited loses the probe race — the answer is
+        // written, the pane is gone, and the delivery retry reads that as "never started". Judged
+        // against its own report document it settled, so this spawn is not a failure: the settlement
+        // watch reads the document and announces it as the settle it is, and nothing tells the master
+        // to spawn again work whose report exists.
+        if (await reportedSettlement(taskId, paneId, spawnedAt)) {
+          armed = await armSettlementWatch(paneId, cwd, spawnedAt, spec.description);
+          if (!armed) {
+            try {
+              await h.notifySpawnFailed(
+                `Subagent "${spec.description}" (pane ${paneId}, task ${taskId}) settled before its start could be confirmed — its report is in the core — and no settlement watch could be armed for it, so the report will not arrive on its own: read it with action "output" (agentId ${paneId}). Do not spawn it again.`,
+              );
+            } catch { /* a missed notice must not break the session */ }
+          }
+          return;
+        }
         // A pane that is gone leaves nothing behind: retire the terminal, drop the row and its record.
         // A pane that is alive is kept with its row, because the failure text tells the master to read
         // it, answer its dialog or retry — advice a kill would make impossible.

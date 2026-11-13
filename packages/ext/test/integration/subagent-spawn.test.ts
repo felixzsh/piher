@@ -304,6 +304,10 @@ test('waitReady/planTaskSend: the core decides readiness, and the turn proves de
 
 const SUB_TEXT = 'REPORT: all channel-fee contact points mapped';
 const PROMPT = 'Read-only survey: in the apnv3-backend repository, map where channel fees are touched. Write the full report.';
+/** Every pane the harness hands out (`nextPaneId`): a fake core reports them like real children, in
+ *  `terminal.get` and in the children watch, up to a burst larger than any test spawns in one go. */
+const PANE_ID = /^p\d+$/;
+const PANES = Array.from({ length: 12 }, (_, i) => `p${i + 2}`);
 
 /** One task or follow-up as the worker received it, with the channel that carried it: the core's own
  *  `terminal.send` (every first task since P2) or the private pipe (still the follow-up channel until
@@ -337,6 +341,13 @@ interface WorkerEnv {
   paneGone: boolean;
   /** Report a pane as finished the moment it is created: a child that died before it was ready. */
   paneFinished: boolean;
+  /** Panes whose child has finished: `terminal.get` reports `finished` and no status, as the core
+   *  does for a terminal that exited (measured: `hc ls --all` shows `state: finished`, `status: null`). */
+  finishedPanes: Set<string>;
+  /** A one-shot child: after its task is pasted it answers, writes its report document and exits,
+   *  all after the master's after-send probe — S22's late submit, where the send result shows no
+   *  delivery while the answer already exists. */
+  answerAndExit: boolean;
   /** Uncancellable poll loop: make the children watch's `changed` never resolve, so a row it holds
    *  stays `running` for the rest of the test. */
   parkPollers(): void;
@@ -411,6 +422,7 @@ async function withWorkerEnv(
     cwd, home, pi: undefined as never, port: undefined as never, frames: [], retired: [], spawnEnvs: [], spawnLabels: [],
     paneLabels: new Map(),
     parkPollers: () => { parked = true; }, rejectSend: false, sendError: null, sendDelayMs: 0, paneGone: false, paneFinished: false,
+    finishedPanes: new Set<string>(), answerAndExit: false,
     sendResults: [], notReady: new Set<string>(), statuses: {},
     pastes: [], composer: {}, statusMismatches: 0, refuseSend: 0,
     turns: {}, wakeWorker: () => { wake = true; releaseGates(); }, gated: false, transcript: SUB_TEXT,
@@ -476,13 +488,15 @@ async function withWorkerEnv(
     getTerminal: async (id: string) => env.paneGone ? null : terminalInfo({
       id,
       // S14: the core's status word is the readiness gate, so an agent that has not said `idle` yet is
-      // reported as never having reported — what `run --bg` shows before the worker boots.
-      status: env.notReady.has(id) ? 'unknown' : env.statuses[id] ?? 'idle',
-      state: env.paneFinished ? 'finished' : 'live',
+      // reported as never having reported — what `run --bg` shows before the worker boots. A finished
+      // terminal carries no status word (measured `hc ls --all`: `state: finished`, `status: null`,
+      // which the client decodes as `unknown`), so it can never pass for ready.
+      status: env.finishedPanes.has(id) ? 'unknown' : env.notReady.has(id) ? 'unknown' : env.statuses[id] ?? 'idle',
+      state: env.paneFinished || env.finishedPanes.has(id) ? 'finished' : 'live',
       turn: env.turns[id] ?? 0,
       labels: {
         ...(env.paneLabels.get(id) ?? {}),
-        ...(['p2', 'p3', 'p4', 'p5', 'p6'].includes(id) ? { [HRESUME_LABEL]: hresumeLabel(sessionFile) } : {}),
+        ...(PANE_ID.test(id) ? { [HRESUME_LABEL]: hresumeLabel(sessionFile) } : {}),
       },
     }),
     // S14/S22: the first task rides the core's own `send`, and its result is the only delivery proof.
@@ -505,6 +519,24 @@ async function withWorkerEnv(
       }
       env.pastes.push({ paneId: id, text });
       env.composer[id] = (env.composer[id] ?? '') + text;
+      if (env.answerAndExit) {
+        // The core's own Enter lands after the master's after-send probe (S22's measured late submit):
+        // by the time the delivery retry asks again, the child has answered, written its report
+        // document and gone. `started: null` and turn 0 are exactly what the core answers then.
+        setTimeout(() => {
+          submit(id);
+          env.finishedPanes.add(id);
+          void env.client.docSet(`piher.rep.${id}`, {
+            taskId: env.paneLabels.get(id)?.[TASK_LABEL] ?? '',
+            turn: env.turns[id] ?? 1,
+            stopReason: 'stop',
+            session: null,
+            text: `${SUB_TEXT} from ${id}`,
+            at: Date.now(),
+          }, 0);
+        }, 20).unref?.();
+        return { started: null, status, turn: env.turns[id] ?? 0 };
+      }
       const scripted = env.sendResults.shift();
       const started = scripted ? scripted.started : true;
       if (started === true) submit(id);
@@ -523,9 +555,10 @@ async function withWorkerEnv(
     // and the snapshot reports the worker's own status (or `working` when it has none), so the row
     // stays running with no polling.
     watchChildren: () => fakeWatch({
-      terminals: () => ['p2', 'p3', 'p4', 'p5', 'p6'].map((id) => terminalInfo({
+      terminals: () => PANES.map((id) => terminalInfo({
         id,
-        status: parked ? env.statuses[id] ?? 'working' : 'idle',
+        status: env.finishedPanes.has(id) ? 'unknown' : parked ? env.statuses[id] ?? 'working' : 'idle',
+        state: env.finishedPanes.has(id) ? 'finished' : 'live',
         turn: env.turns[id] ?? 0,
         labels: { [HRESUME_LABEL]: hresumeLabel(sessionFile) },
       })),
@@ -1705,4 +1738,97 @@ test('P2: a revive that cannot come up retires the pane no row will ever point a
     assert.equal(readTaskRecord(env.cwd, taskId)?.gen.paneId, paneId);
     delete env.statuses[paneId];
   });
+});
+
+/* ── E2/E9/E12: a child that finished is a settle, never a failed start ───────── */
+
+test('E2: a child that answers and exits before it is seen ready settles with its report', async () => {
+  // The measured defect (plan L11): the core's own Enter lands after the send result, the child answers
+  // and exits inside the delivery retry's wait, and the retry's readiness probe finds a finished pane.
+  // The boot then declared "exited before its agent reported ready (waited 0s)" over a worker whose
+  // report document already existed, and told the master to spawn that work again.
+  await withWorkerEnv(async (env) => {
+    env.answerAndExit = true;
+    const spawned = await runSubagent(env.pi, { description: 'fast explorer', prompt: PROMPT }, env.cwd);
+    assert.match(spawned.content[0]!.text, /^started subagent/, 'the start is acknowledged before the child answers');
+    const paneId = spawned.details?.paneId as string;
+    const taskId = spawned.details?.taskId as string;
+    await waitFor(() => env.pi.userSent.length > 0, 10_000);
+    const notices = env.pi.userSent.map((m) => m.content);
+    assert.ok(
+      !notices.some((n) => /failed to start|did not take its first message|spawn it again/.test(n)),
+      `a child that did its work is never a failed start: ${JSON.stringify(notices)}`,
+    );
+    const settlement = notices.find((n) => n.includes(`${SUB_TEXT} from ${paneId}`));
+    assert.ok(settlement, `the settlement carries the report the child wrote: ${JSON.stringify(notices)}`);
+    assert.match(settlement!, /finished and will do no further work/, 'it reads as a settle, not a failure');
+    await waitFor(() => (readTaskRecord(env.cwd, taskId)?.gen.consumedAt ?? null) !== null, 8_000);
+    assert.ok((readTaskRecord(env.cwd, taskId)?.gen.consumedAt ?? null) !== null, 'the settlement consumed the row');
+    assert.equal(env.pastes.length, 1, 'the brief went in once: a settled child is never pasted again');
+  }, { policy: { readinessTimeoutMs: 5_000 } });
+});
+
+test('E2/E12: a settled child whose watch cannot arm is still never told to spawn again', async () => {
+  // The corner that keeps E12 true everywhere: the child settled, no watch can read its document, so
+  // the report will not arrive on its own. Saying "failed to start" here would send the master to redo
+  // work that exists — the notice names the settle and the way to read it instead.
+  await withWorkerEnv(async (env) => {
+    env.answerAndExit = true;
+    const spawned = await runSubagent(env.pi, { description: 'watched by nobody', prompt: PROMPT }, env.cwd);
+    const taskId = spawned.details?.taskId as string;
+    await waitFor(() => env.pi.userSent.length > 0, 10_000);
+    const notice = env.pi.userSent.map((m) => m.content).join('\n');
+    assert.doesNotMatch(notice, /failed to start|did not take its first message|spawn it again if/, 'no retry is invited');
+    assert.match(notice, /settled before its start could be confirmed/, 'the settle is what happened');
+    assert.match(notice, /Do not spawn it again/, 'and the master is told not to redo it');
+    assert.match(notice, /action "output"/, 'its report stays reachable without the pane (E4)');
+    assert.ok(readTaskRecord(env.cwd, taskId) !== null, 'the row is kept: its report is the result');
+  }, { brokenSessionRoot: true, policy: { readinessTimeoutMs: 5_000 } });
+});
+
+test('E9: ten spawns in one batch produce ten settlements and no false boot failure', async () => {
+  await withWorkerEnv(async (env) => {
+    env.answerAndExit = true;
+    const batch = await Promise.all(Array.from({ length: 10 }, (_, i) => runSubagent(
+      env.pi,
+      { description: `burst probe ${i}`, prompt: `${PROMPT} (#${i})` },
+      env.cwd,
+    )));
+    const paneIds = batch.map((row) => row.details?.paneId as string);
+    const taskIds = batch.map((row) => row.details?.taskId as string);
+    assert.equal(new Set(paneIds).size, 10, 'ten distinct panes');
+    assert.equal(new Set(taskIds).size, 10, 'ten distinct tasks');
+    await waitFor(() => env.pi.userSent.length >= 10, 20_000);
+    const notices = env.pi.userSent.map((m) => m.content);
+    assert.ok(
+      !notices.some((n) => /failed to start|did not take its first message|spawn it again/.test(n)),
+      `no false boot failure in a ten-spawn burst: ${JSON.stringify(notices)}`,
+    );
+    for (const paneId of paneIds) {
+      assert.ok(notices.some((n) => n.includes(`${SUB_TEXT} from ${paneId}`)), `${paneId}'s own report arrived`);
+    }
+    for (const taskId of taskIds) {
+      assert.ok((readTaskRecord(env.cwd, taskId)?.gen.consumedAt ?? null) !== null, `task ${taskId} settled`);
+    }
+  }, { paneSeq: true, policy: { readinessTimeoutMs: 5_000 } });
+});
+
+test('E2/E12: a child that finished with no report is still a real boot failure, with its cause and the way out', async () => {
+  // The other side of the decision: nothing was ever pasted and no report document exists, so there is
+  // no result to preserve. A start that never happened must still be reported as one — with its cause
+  // and with the one action that follows from it.
+  await withWorkerEnv(async (env) => {
+    env.paneFinished = true; // a child that died before it was ever ready
+    const spawned = await runSubagent(env.pi, { description: 'stillborn probe', prompt: PROMPT }, env.cwd);
+    const paneId = spawned.details?.paneId as string;
+    const taskId = spawned.details?.taskId as string;
+    await waitFor(() => env.pi.userSent.length > 0, 8_000);
+    assert.equal(env.pastes.length, 0, 'nothing was pasted into a child that never came up');
+    const notice = env.pi.userSent.map((m) => m.content).join('\n');
+    assert.match(notice, /failed to start/, 'a start that never happened is still a failure');
+    assert.match(notice, /exited before its agent reported ready/, 'with its cause');
+    assert.match(notice, /spawn it again if the task still matters/, 'and what the master can do about it');
+    assert.deepEqual(env.retired, [paneId], 'the pane is retired');
+    assert.equal(readTaskRecord(env.cwd, taskId), null, 'and no row pretends the work is running');
+  }, { policy: { readinessTimeoutMs: 2_000 } });
 });

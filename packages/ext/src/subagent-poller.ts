@@ -138,8 +138,12 @@ const MAX_RECHECK_PARK_MS = 30_000;
 
 /** A revived pane can answer in the very second the poller starts, and a report written on that same
  *  second belongs to the new request. The boundary a document is judged against therefore carries a
- *  slack, so an answer landing exactly on it is news instead of a stale read. */
-const REQUEST_BOUNDARY_SLACK_MS = 2_000;
+ *  slack, so an answer landing exactly on it is news instead of a stale read.
+ *
+ * Exported because the spawn's boot judges a document against the same request boundary: a child that
+ * answered before its start could be confirmed (E2) must be a settle in both readers, or the watch
+ * would deliver what the boot called a failure. */
+export const REQUEST_BOUNDARY_SLACK_MS = 2_000;
 
 export interface ScopeHooks {
   onDispose?: () => void;

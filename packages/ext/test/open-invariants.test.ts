@@ -22,14 +22,6 @@ test('E1: every settlement in a delivery, with its identity', OPEN(
   assert.fail('E1 open: byte-budgeted delivery (row per settlement) is not implemented');
 });
 
-test('E2: a worker that did its work is never reported as a failed start', OPEN(
-  'E2',
-  'measured: 2 of 10 spawns reported "failed to start" while t1hr had already answered (plan L11)',
-  'a child that took its task and finished is a settle; only a child that never took it is a boot failure',
-), () => {
-  assert.fail('E2 open: the readiness gate loses a child that finishes before it is observed');
-});
-
 test('E5: a report stays reachable when its record was swept', OPEN(
   'E5',
   'G10 closed the pane case; a swept record leaves no path from an address to its document',
@@ -54,14 +46,6 @@ test('E8: piher state survives the master compacting its conversation', OPEN(
   assert.fail('E8 open: no session_before_compact/session_compact handling');
 });
 
-test('E9: a spawn burst produces no false boot failures', OPEN(
-  'E9',
-  'measured 20% false failures with 10 spawns in one batch (plan L11)',
-  'N spawns in one batch yield N starts, and any failure names a real cause',
-), () => {
-  assert.fail('E9 open: readiness budget is per spawn and the burst is not admitted');
-});
-
 test('E10: per-worker cost in the core does not grow with N', OPEN(
   'E10',
   'each worker holds an unfiltered events.subscribe, so every event is delivered N times',
@@ -76,12 +60,4 @@ test('E11: a terminal killed from outside reaches the master as a settlement', O
   'an externally ended worker settles with an exit fact, not with silence',
 ), () => {
   assert.fail('E11 open: external kills are not settlements');
-});
-
-test('E12: the master is never told to redo work that was done', OPEN(
-  'E12',
-  'consequence of E2: the failure notice says "spawn it again" over a completed child',
-  'no notice invites a retry of work whose report exists',
-), () => {
-  assert.fail('E12 open: a false boot failure makes the master re-run a completed task');
 });

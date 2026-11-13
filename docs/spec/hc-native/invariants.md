@@ -11,17 +11,17 @@ test se muda al fichero que posee ese comportamiento y este documento cambia de 
 | # | invariante | estado | qué lo mide |
 |---|---|---|---|
 | E1 | todo settlement se anuncia, exactamente una vez, con su identidad | **abierto** | `test/settlement-transport.test.ts` (3 de 10, medido) |
-| E2 | un worker que hizo su trabajo nunca se reporta como fallo | **abierto** | plan L11 (`t1hr`: 217 líneas entregadas, reportado como fallo) |
+| E2 | un worker que hizo su trabajo nunca se reporta como fallo | **cerrado** | `test/integration/subagent-spawn.test.ts`: un hijo que contesta y sale settlea con su informe; el fallo de arranque solo queda cuando no hay documento |
 | E3 | el estado que ves es el del core, nunca una conjetura | **cerrado** | settle = `turn` + documento; `test/subagent-poller.test.ts` |
 | E4 | el informe íntegro es alcanzable sin el pane | **cerrado** | `test/subagent-session.test.ts`; probado en vivo tras `/reload` (L9) |
 | E5 | un informe perdido es recuperable sin adivinar | **abierto** | G10 residual: si el registro se barrió, no hay camino |
 | E6 | el coste por evento en el master está acotado | **abierto** | cap de 16 KB por aviso existe; no hay presupuesto de sesión |
 | E7 | el master no necesita preguntar para enterarse | **cerrado** | `triggerTurn` en cada settlement; `test/index-parts.test.ts` |
 | E8 | el estado de piher sobrevive a la compactación del master | **abierto** | el buffer no se pausa; el roster no se re-inyecta |
-| E9 | una ráfaga de N spawns no produce falsos fallos | **abierto** | medido 2/10 con una tanda (L11) |
+| E9 | una ráfaga de N spawns no produce falsos fallos | **cerrado** | `test/integration/subagent-spawn.test.ts`: diez spawns en una tanda, diez settlements, cero fallos de arranque |
 | E10 | el coste por worker no crece con N en el core | **abierto** | una suscripción `events.subscribe` sin filtro por worker |
 | E11 | el roster refleja la realidad, incluido un pane matado por fuera | **abierto** | un pane muerto por fuera no es un settle |
-| E12 | el master nunca re-hace trabajo ya hecho | **abierto** | consecuencia de E2: el aviso invita a relanzar |
+| E12 | el master nunca re-hace trabajo ya hecho | **cerrado** | `test/integration/subagent-spawn.test.ts`: el aviso de un hijo que settleó no invita a relanzar; uno que nunca arrancó sí |
 
 ## Por qué estos y no otros
 
