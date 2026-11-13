@@ -366,3 +366,24 @@ its body inline and **no collapse and no withheld report**. Compared with the sa
 `73cc5af`, which delivered **3 of 10 in 889 B** with two false failures: ten complete reports now cost
 157 B more than three truncated ones did. The eleventh spawn stayed silent because it had not settled,
 which is the behaviour the channel promises. Measured in the session transcript, not only observed.
+L21. **E1 and E5 closed — `inbox`, the ledger's read side**: `3afbb21` + `5dd2f63` (the invariants), parent
+`d8a3bfa`, Risk: item 5 (a new verb, and the cursor becomes something the master can move), `tsc` clean +
+`npm test` **627 tests, 623 pass, 4 skipped, 0 fail** on `5dd2f63`, verified by the parent. `subagent(
+action:"inbox", since?, limit?)` answers from the ledger alone: `since` defaults to the delivered cursor,
+the text is the live delivery's own row vocabulary with `#<seq>` in front, bodies travel first-fit against
+the same 4 KB budget, and every withheld body gets the exact `reports` call. The body counts only when
+`piher.rep.<pane>` still holds *(taskId, at)*; otherwise the row says which of `no-text`, `other-task`, and
+`address reused`, `absent`, `not-a-report` or `unavailable` it is — never silence, and a record swept from
+disk does not stop the answer because the ledger, not the record, is the source. The cursor advances
+**after** rendering, only over the seqs actually returned, through `openBatch` (one write per call, not
+one per fact), and a `toolError` or a foreign ledger returns before marking anything. Decisions worth
+keeping: `seq` rides `NoticeRow` instead of a bespoke inbox renderer (a second format would drift from the
+delivery it mirrors); only settlement facts are rendered, the others are counted in the header (`N
+recorded facts with nothing to deliver`) because `NoticeRow.outcome` has no honest word for a `spawned`;
+an `unavailable` core still advances the cursor, since re-asking a silent core would spin forever; the
+header carries no cursor value so two identical `since` calls are byte-identical, with the before/after in
+`details.deliveredSeq`; and the description and manual prose were **trimmed** to pay for the new words
+rather than raising their pinned budgets. Two invariants closed: E1 and E5, leaving **E6, E8, E10 and E11**
+open. Unproven: no live master run of `inbox` (the end-to-end test mounts the real action against a fake
+core), and a pointer whose pane address was reused can only read what the current document holds — the
+row says so instead of pretending.
