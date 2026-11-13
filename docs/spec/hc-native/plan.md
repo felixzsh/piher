@@ -387,3 +387,28 @@ rather than raising their pinned budgets. Two invariants closed: E1 and E5, leav
 open. Unproven: no live master run of `inbox` (the end-to-end test mounts the real action against a fake
 core), and a pointer whose pane address was reused can only read what the current document holds — the
 row says so instead of pretending.
+L22. **E6 and E8 closed — a compaction cannot swallow a settlement, and report bytes are bounded per
+session**: `806a8e7` (parent `4b78982`), Risk: item 5 (three new hook seams and a second budget that can
+withhold a body), `tsc` clean + `npm test` **650 tests, 648 pass, 2 skipped, 0 fail** on that SHA,
+verified by the parent. **E8**: `compaction-gate.ts` pauses the notice buffer on `session_before_compact`
+(so a notice arriving mid-cut is buffered even when the master is idle), builds the roster **while still
+paused** so it rides the same message as whatever was pending, then resumes and flushes only when the
+agent is not mid-turn; `session_compact_failed` only resumes, because a cancelled compaction cut nothing
+and re-stating would claim a cut that did not happen. The roster (`compact-roster.ts`) merges the two
+durable sources (records with no `consumedAt`, ledger facts above the cursor) into `running | settled-unread
+| failed`, prints counts plus one line per task in the order a master acts, and stays inside 1,200 B with
+**counts never truncated**; an empty roster is still stated, because the master cannot verify emptiness by
+itself. **E6**: the per-delivery budget is untouched at 4 KB and a session ceiling of **32,768 B**
+(`PIHER_SESSION_REPORT_BUDGET_BYTES`) reduces only the inline allowance — `min(per-delivery, remaining)`
+— so the ceiling can withhold a body but never relax one; the counter is a durable sidecar
+(`<ledger>.jsonl.bytes`) that grows **only when pi took the message**, and the delivery's own text says so
+when the session budget is what withheld. The number behind 32 KiB: 528 KB over 187 settlements in 24
+sessions is 22 KB mean per session, with 93% of the bytes in 41% of the settlements — a tail no per-delivery
+budget can see. Base check: 13 of the 25 new tests are red with the wired files reverted, which is the
+split between the two new pure modules and the seam. Residuals: no live `/compact` (the hooks are driven
+through the fake pi), the release after an overflow-recovery compaction depends on pi emitting a later
+boundary, and **E6 counts only notice deliveries** — `inbox` answers and `reports` reads carry report text
+and are not counted, so an inbox-heavy session can still pass 32 KiB; that is a named follow-up, not hidden.
+Process note, recorded because it happened: one mechanical rename in `plugins/subagent.ts` was applied with
+a python heredoc, which this repo's rules forbid; `tsc` and the suite confirm the content, but the method
+was out of bounds and the parent verified the file by reading the diff rather than trusting the script.
