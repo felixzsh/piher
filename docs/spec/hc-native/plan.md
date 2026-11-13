@@ -147,3 +147,32 @@ no end-to-end path reaches it); an undecided address may not borrow the newest s
 from an older build still loses its live `hresume` report because the ownership gate needs the
 `piher.task` label only a spawn writes — that needs a label rewritten on adopt/restore, which was
 explicitly out of scope here.
+L9. **Post-run correction (the settlement promise)**: `bbb5cd0` + `e58db82` + `73cc5af` (parent
+`c68846d`), Risk: item 6 (three states where a worker's outcome never reached the master, with no
+public contract changed), `tsc` clean + `npm test` **541/541** on `73cc5af`, Route: delegated. Not part
+of the accepted run: a read-only audit of the token mechanics — spawned to answer "is piher cheaper for
+the master, and where does the saving not fire" — enumerated twelve gaps by `path:line`; the three that
+defeat S5-S8 were fixed here and the rest are listed below rather than kept quietly. **G1** — a
+disconnected watch counted as a heartbeat: `observe()` returned `state:null` and `planSilenceTick`
+refreshed `lastActivityAt` on every tick, so the silence budget never expired and no notice ever fired;
+`observe()` now reports `blind` separately, blindness never refreshes activity, and an expired budget
+under it is its own action with its own notice (`formatBlindWatchNotice`: the core did not answer, so
+this is not the task's result), said once per blind episode and **without consuming the row**, because
+blindness establishes nothing about the worker. **G2** — an unarmed watch was a `console.error`:
+`startPoller`'s boolean was discarded, so a spawn whose settlement watch never took its pane produced no
+settlement ever; the spawn now arms through one helper and says so when it fails
+(`formatWatchNotArmedNotice`, folded into the kept-failure notice, whose promise of a silence budget now
+depends on whether a watch armed). **G10** — a report was unreachable once its pane was gone: `output`
+read only the pane, so a consumed one-shot's report could not be read through the tool at all; on a pane
+read failure it now answers from `piher.rep.<address>`, headed `source: report document (… not a pane
+read)`, and records the delivery exactly as the transcript path does. Each fix is pinned by a test that
+fails on `c68846d` (verified by stashing the source): the poller's old "a disconnected watch never
+settles" test pinned the very behaviour G1 fixed and now asserts more, not less. Residuals: the blind
+path is proven against a fake watch and a virtual clock, not a real socket drop; a watch that goes blind
+after its row was consumed still gets no blind notice. The gone pane is not a residual any more: after a
+`/reload`, `output` on a one-shot whose terminal had been reclaimed (absent from `hc ls --all`) answered
+`source: report-document`, `status: settled`, `reportDelivered: true` and the child's 52-byte closing
+message — the document read live, not the scripted error the tests use. Open from the same audit, not this unit: settlements collapse to
+three notices and point the master at transcripts (`NOTICE_MAX_SHOWN`), settlement is suppressed until
+the master's next turn after an abort, a settle that writes no document waits out the whole budget,
+`output` cannot read a document whose record was swept, and a per-notice cap is no session-wide budget.
