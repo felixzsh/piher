@@ -47,8 +47,16 @@ task's state comes from.
   `[a-z0-9._-]`, starting with a letter or digit, never shaped like an id. (Measured refusal:
   `bad name "probe.a.b_Upper": use 1-32 of a-z 0-9 - _ . starting with a letter or digit, not shaped like
   an id (t7)`.)
-- **S10.** `piher.rep` value: `{taskId, turn, stopReason, session, text, at}`. `piher.cmd` value:
+- **S10.** *(extended by S26 for the command value.)* `piher.rep` value:
+  `{taskId, turn, stopReason, session, text, at}`. `piher.cmd` value:
   `{id, type: 'prompt'|'follow_up'|'interrupt', text, deliverAs}`.
+- **S26.** The `piher.cmd` value also carries the `taskId` it is addressed to, and a worker refuses a
+  command whose task id is not its own. A command document outlives a core restart and core terminal ids
+  restart with the core, so address alone cannot identify the reader; without this, a leftover steer could
+  be applied by an unrelated worker that later holds the same address. A send is also refused before any
+  write when the text is empty or whitespace, or when its serialized value would exceed the core's 1 MiB
+  ceiling (the size is named, nothing is written) — an oversized steer is refused, never fitted down to
+  half an instruction.
 - **S11.** Writes are compare-and-swap by `version`: a `conflict` is answered by `doc.get` and a retry,
   never by an unconditional overwrite. (Measured: `kind:"conflict"`,
   hint `read doc.get and retry with its version`.)
