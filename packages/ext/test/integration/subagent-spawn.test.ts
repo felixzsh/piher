@@ -10,6 +10,7 @@ import type { Server, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { CoreError, type CoreClientLike, type CoreStatus, type SendResult } from '../../src/core-client.ts';
+import type { CommandDocumentValue } from '../../src/command-documents.ts';
 import type { RuntimePolicy } from '../../src/runtime-policy.ts';
 import { pipeNameFor, pipePathFor, startPipeServer } from '../../src/pipe-channel.ts';
 import {
@@ -348,6 +349,15 @@ interface PipeEnv {
   transcript: string | null;
   /** The fake core client, with its document store: the worker's report documents live here. */
   client: CoreClientLike;
+  /** Pipe connections accepted per pane. Steering goes through the core (spec S15), so a `send`
+   *  leaves this at zero — that is the test's evidence the private channel is not in the path. */
+  pipeConnections: Record<string, number>;
+  /** Every command document the master wrote, as the worker's own watch would read it (spec S10). */
+  commands: Array<{ paneId: string; value: CommandDocumentValue }>;
+  /** What the stand-in worker does with a command: apply it (hands the text to `frames` as a core
+   *  delivery and clears the document, the way the real watch does) or leave it sitting in the core,
+   *  which is a worker whose extension is not watching. */
+  commandPickup: 'applied' | 'silent';
   /** The worker session file the pipe server appends to. */
   workerSessionFile: string;
   /** Simulate a master restart: dispose the session, mount fresh, and restore from the documents. */
@@ -378,6 +388,7 @@ async function withPipeEnv(
     pastes: [], composer: {}, statusMismatches: 0, refuseSend: 0,
     turns: {}, wakeWorker: () => { wake = true; }, gated: false, transcript: SUB_TEXT,
     client: undefined as never, workerSessionFile: sessionFile,
+    pipeConnections: {}, commands: [], commandPickup: 'applied',
   };
   let paneCounter = 0;
   const nextPaneId = (): string => (opts.paneSeq ? `p${2 + paneCounter++}` : 'p2');
@@ -394,6 +405,9 @@ async function withPipeEnv(
     });
     servers.push(server);
     server.on('connection', (sock) => {
+      // P3 (spec S15): steering never comes this way, so a connection here is the test's own evidence
+      // that the send channel is still the private pipe.
+      env.pipeConnections[paneId] = (env.pipeConnections[paneId] ?? 0) + 1;
       // A reclaimed pane's pipe dies mid-request: the client must fall back to liveness, not hang.
       if (env.deadPipes > 0) {
         env.deadPipes -= 1;
@@ -421,7 +435,35 @@ async function withPipeEnv(
       writeFileSync(sessionFile, jsonl(transcriptMessage('assistant', env.transcript, Date.now())));
     }
   };
+  /** The core's documents, with the compare-and-swap versions `doc.set` enforces (spec S11). */
+  const docs = new Map<string, { value: unknown; version: number }>();
+  /** The worker's own command watch (spec S15): record the command, hand its text to pi, clear the
+   *  document at the version it was read at — a newer command written meanwhile stays where it is. */
+  const deliverCommand = (name: string, value: unknown, version: number): void => {
+    const paneId = name.slice('piher.cmd.'.length);
+    env.commands.push({ paneId, value: value as CommandDocumentValue });
+    if (env.commandPickup !== 'applied') return;
+    setTimeout(() => {
+      const command = value as CommandDocumentValue;
+      env.frames.push({ channel: 'core', type: command.type, id: command.id, text: command.text, from: '' });
+      if (docs.get(name)?.version === version) docs.set(name, { value: null, version: version + 1 });
+    }, 0);
+  };
   const clientOpts: Partial<CoreClientLike> = {
+    // The document store stands in for the core's, and for the worker's own command watch: a command
+    // the master writes is read and cleared by the worker's extension (spec S15), asynchronously, the
+    // way the real one is. `commandPickup: 'silent'` is a worker whose extension is not watching.
+    docGet: async (name: string) => docs.get(name) ?? { value: null, version: 0 },
+    docSet: async (name: string, value: unknown, version: number) => {
+      const current = docs.get(name)?.version ?? 0;
+      if (current !== version) {
+        throw new CoreError('doc.set', 'conflict', `version ${version} is stale (now ${current})`, 'read doc.get and retry with its version');
+      }
+      const next = version + 1;
+      docs.set(name, { value, version: next });
+      if (value !== null && name.startsWith('piher.cmd.')) deliverCommand(name, value, next);
+      return next;
+    },
     getTerminal: async (id: string) => env.paneGone ? null : terminalInfo({
       id,
       // S14: the core's status word is the readiness gate, so an agent that has not said `idle` yet is
@@ -639,7 +681,7 @@ test('spawn env: the worker gets the spawn contract on top of the caller environ
   });
 });
 
-test('spawn/send: the reply pipe is scoped by the master session cwd, not the worker cwd', async () => {
+test('send: a follow-up to a worker in another checkout rides the core, and opens no pipe', async () => {
   const other = mkdtempSync(join(tmpdir(), 'piher-spawn-other-'));
   await withPipeEnv(async (env) => {
     env.parkPollers();
@@ -651,10 +693,15 @@ test('spawn/send: the reply pipe is scoped by the master session cwd, not the wo
 
     const sent = await runSubagent(env.pi, { action: 'send', agentId: 'p2', message: 'wrap up and report' }, env.cwd);
     assert.match(sent.content[0]!.text, /Message sent to subagent [a-z0-9-]+@p2/);
-    // The follow-up still names the master session pipe — the worker's own cwd would name a dead one.
-    const expected = pipeNameFor(env.cwd, 't0');
-    assert.equal(env.frames[1]!.from, expected, 'follow_up replies to the same master pipe');
-    assert.notEqual(env.frames[1]!.from, pipeNameFor(other, 't0'));
+    // P3 (spec S15): a follow-up is a command document named by the worker's core address, so neither
+    // the worker's checkout nor the master's enters its name — and no socket is opened for it.
+    assert.deepEqual(env.commands.map((c) => c.paneId), ['p2'], 'one command, named by the worker address');
+    assert.equal(env.commands[0]!.value.type, 'follow_up');
+    assert.equal(env.commands[0]!.value.deliverAs, 'steer', 'a follow-up is steered into the running turn');
+    assert.equal(env.commands[0]!.value.text, 'wrap up and report');
+    assert.equal(env.frames[1]!.channel, 'core', 'the worker took it through the core, not the private pipe');
+    assert.equal(env.frames[1]!.text, 'wrap up and report');
+    assert.equal(env.pipeConnections.p2 ?? 0, 0, 'the send opened no connection to a pipe name');
   }, { childCwd: other });
 });
 
@@ -692,14 +739,57 @@ test('send: a persistent worker whose pane was reclaimed is revived, not refused
     // the send's, not the boot's.
     await waitFor(() => env.frames.length === 1);
     env.port.current!.consumeReply(paneId, 'REPORT: hola');
-    // Housekeeping reclaims the pane of a settled worker; the task itself was never closed. The pane's
-    // pipe goes with it, which is what a `send` sees first — no liveness RPC answers for it.
+    // Housekeeping reclaims the pane of a settled worker; the task itself was never closed. The core
+    // no longer lists the terminal, which is what a `send` sees first (spec S3).
     env.paneGone = true;
-    env.deadPipes = 1;
     const sent = await runSubagent(env.pi, { action: 'send', agentId: paneId, message: 'sigue aqui' }, env.cwd);
     assert.match(sent.content[0]!.text, /Message sent to subagent/);
     assert.equal(env.spawnEnvs.length, 2, 'a second terminal carries the follow-up on the same session');
+    assert.equal(env.pipeConnections.p2 ?? 0, 0, 'the revive opened no pipe either');
   });
+});
+
+test('P3: a send steers a worker that is mid-turn, and the result reports the delivery', async (t) => {
+  await withPipeEnv(async (env) => {
+    env.parkPollers();
+
+    await t.test('a steer to a working worker is applied, and its tool result says so', async () => {
+      const spawned = await runSubagent(env.pi, { description: 'steer probe', prompt: PROMPT }, env.cwd);
+      const paneId = spawned.details?.paneId as string;
+      await waitFor(() => env.frames.length === 1);
+      // The worker is mid-tool-call: the core reports it working, which is the state this channel
+      // exists for (`terminal.send --if idle` refuses exactly here).
+      env.statuses[paneId] = 'working';
+      const sent = await runSubagent(env.pi, { action: 'send', agentId: paneId, message: 'wrap up and report' }, env.cwd);
+      // S15: the contract's wording, used only because the worker read the command (spec contracts.md).
+      assert.match(sent.content[0]!.text, /^Message sent to subagent [a-z0-9-]+@p2\.$/);
+      assert.equal(env.commands.length, 1, 'one command document carried the send');
+      assert.equal(env.commands[0]!.paneId, 'p2', 'named by the worker address (S9)');
+      assert.equal(env.commands[0]!.value.deliverAs, 'steer', 'delivered as pi’s steer, not queued behind the turn');
+      assert.equal(env.commands[0]!.value.text, 'wrap up and report');
+      assert.equal(env.frames.at(-1)!.channel, 'core');
+      assert.equal(env.frames.at(-1)!.text, 'wrap up and report', 'the worker received the text itself');
+      assert.equal(env.pipeConnections.p2 ?? 0, 0, 'the send opened no connection to a pipe name');
+      // Applying it is not the same as being read: the worker cleared the document it applied (S11).
+      assert.equal((await env.client.docGet('piher.cmd.p2'))?.value, null, 'the applied command is cleared');
+      delete env.statuses[paneId];
+    });
+
+    await t.test('a worker that never reads its command is not reported as delivered', async () => {
+      env.commandPickup = 'silent';
+      const panesBefore = env.commands.length;
+      const sent = await runSubagent(env.pi, { action: 'send', agentId: 'p2', message: 'anyone there?' }, env.cwd);
+      const text = sent.content[0]!.text;
+      assert.doesNotMatch(text, /^Message sent/, 'a command nobody read is not a delivered message');
+      assert.match(text, /Message written for subagent/);
+      assert.match(text, /has not applied it yet/);
+      assert.match(text, /piher\.cmd\.p2/, 'the result names the document that holds it');
+      assert.equal(env.commands.length, panesBefore + 1, 'the write did land in the core');
+      const held = await env.client.docGet('piher.cmd.p2');
+      assert.equal((held?.value as { text?: string } | null)?.text, 'anyone there?', 'the command stays queued (S12)');
+      env.commandPickup = 'applied';
+    });
+  }, { policy: { commandPickupMs: 300 } });
 });
 
 test('send/resume: short prefixes resolve at four characters and report ambiguity or misses', async () => {

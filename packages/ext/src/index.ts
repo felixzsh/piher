@@ -16,6 +16,7 @@ import {
 import { installRenderers } from './renderers.ts';
 import { SETTLEMENT_CUSTOM_TYPE, sendSettlementNotice } from './settlement-card.ts';
 import { createCoreClient } from './core-client.ts';
+import type { DocWatch } from './core-client.ts';
 import { bareSessionId, deriveSubSessionState, readSessionFile, resolveSessionFileValue } from './session-tail.ts';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
@@ -24,6 +25,8 @@ import { platformPaths } from './platform-paths.ts';
 import { WRITE_LOCK_ENV } from './lock-core.ts';
 import { ABORT_STOP_REASON, planSettleWake, shouldPushSettleReply } from './settle-wake-core.ts';
 import { writeReportDocument } from './report-documents.ts';
+import { commandDocName } from './report-documents.ts';
+import { clearCommandDocument, planCommandApplication } from './command-documents.ts';
 import { parseRuntimeManifest } from './tool-gate.ts';
 import { planIndexMode } from './index-runtime.ts';
 import { emptySubagentPortBox, sleepWhileSubsRunningNote } from './subagent-core.ts';
@@ -387,6 +390,62 @@ export default async function (pi: ExtensionAPI) {
     return true;
   }
 
+  /* ── P3 (spec S15, S24): how a `send` reaches this worker ── */
+  /** The command subscription. A second connection, because `events.subscribe` takes over the one it
+   *  is sent on, and unfiltered, because a `doc` event is core-global (spec S24, S23). */
+  let commandWatch: DocWatch | null = null;
+  /** The id of the last command applied, so a re-read never applies the same one twice. */
+  let appliedCommandId: string | null = null;
+  /** Applies run one at a time: two notifications for one document must not both read it before it
+   *  is cleared. */
+  let commandApply: Promise<void> = Promise.resolve();
+
+  /**
+   * Read `piher.cmd.<address>` and apply what it holds (spec S15): pi's own
+   * `sendUserMessage(text, {deliverAs})` is what keeps a steer delivered between tool calls instead
+   * of behind the whole turn — `terminal.send` would only paste into the TUI.
+   *
+   * The value is cleared after it is applied, guarded by the version it was read at (spec S11): a
+   * command left behind would be applied again by a restarted worker, which has no memory of ids.
+   */
+  async function applyCommandDocument(): Promise<void> {
+    const address = env?.terminalId;
+    const name = address ? commandDocName(address) : null;
+    if (!name) return;
+    const read = await client.docGet(name);
+    if (read === null) return;
+    const plan = planCommandApplication({ value: read.value, appliedId: appliedCommandId });
+    if (plan.kind === 'none') return;
+    appliedCommandId = plan.value.id;
+    if (plan.kind === 'apply') await sendUserMessageAs(plan.value.text, plan.value.deliverAs);
+    await clearCommandDocument(client, name, read.version);
+  }
+
+  function requestCommandApply(): void {
+    commandApply = commandApply
+      .then(() => applyCommandDocument())
+      .catch((err: unknown) => {
+        console.error(`piher: steering command for ${env?.terminalId ?? 'this worker'} could not be applied: ${(err as Error)?.message ?? err}`);
+      });
+  }
+
+  /** Watch the core for this worker's commands. Workers only: a master has no address of its own to
+   *  be steered at, and holds no subscription of its own (spec S24). */
+  function startCommandWatch(): void {
+    const address = env?.terminalId;
+    if (!isSubagent || !address || !client.available) return;
+    const name = commandDocName(address);
+    commandWatch?.close();
+    commandWatch = null;
+    if (!name) return;
+    commandWatch = client.watchDocuments((changed) => {
+      // `null` is a (re)subscription: a command written while disconnected is still in the core, so
+      // read once. A named event for anything else is not ours — documents are core-global.
+      if (changed !== null && changed !== name) return;
+      requestCommandApply();
+    });
+  }
+
   pi.on('session_start', async (event, ctx) => {
     sessionId = resolveSessionId(ctx);
     ownSessionPath = reportedSessionFile(ctx);
@@ -422,6 +481,7 @@ export default async function (pi: ExtensionAPI) {
     }
 
     await startPipeServerFor((ctx as { cwd?: string }).cwd ?? process.cwd());
+    startCommandWatch();
   });
 
   /* RFC rfc-delegation-identity §2.2: worker identity + delivery contract ride the prompt
@@ -548,6 +608,9 @@ export default async function (pi: ExtensionAPI) {
   installConfigCommand({ pi });
 
   pi.on('session_shutdown', async () => {
+    // Nothing outlives the session it serves: the command subscription is a connection of its own.
+    commandWatch?.close();
+    commandWatch = null;
     // Stop the watchdog first: a rebind during shutdown would outlive the session it serves.
     if (pipeWatchdog) clearInterval(pipeWatchdog);
     pipeWatchdog = null;

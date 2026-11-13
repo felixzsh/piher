@@ -125,7 +125,7 @@ test("createPlatformPaths: sessions live under pi's own agent dir, not XDG", { s
 
 const POLICY_FIELDS: ReadonlyArray<keyof RuntimePolicy> = [
   'subagentTimeoutMs', 'gcTickMs', 'pollIntervalMs', 'settleWindowMs',
-  'sessionTtlSeconds', 'gitTimeoutMs', 'readinessTimeoutMs',
+  'sessionTtlSeconds', 'gitTimeoutMs', 'readinessTimeoutMs', 'commandPickupMs',
 ];
 
 const OPTION_NAMES = OPTION_SPECS.map((o) => o.name);

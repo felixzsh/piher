@@ -761,22 +761,47 @@ test('subagent plugin: close reclaims a running row whose pane is already gone',
   }
 });
 
-test('subagent plugin: send to a live pane with a dead pipe fails fast and says nothing was delivered', async () => {
-  // The 90 s readiness wait is for a pane that was just made. A pane that was already alive has no
-  // listener, and waiting there turns a dead channel into a timeout that reads like a slow boot —
-  // while the message never arrived (a real session spent 92 s on it, twice).
+test('subagent plugin: a send whose command cannot be written fails fast and says nothing was delivered', async () => {
+  // P3 (spec S15): a live pane is reached through the core, so there is no pipe to open and no
+  // readiness budget to spend on it. What can fail is the write itself, and that failure must not
+  // read as "queued": the document is the delivery.
   const { root, pi } = await mountSubagent({
-    client: { getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'working' }) },
-    tasks: [taskRow({ paneId: 't-dead-pipe', taskId: 'task-dead-pipe', cwd: '/test/no-pipe' })],
+    client: {
+      getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'working' }),
+      docSet: async () => { throw new Error('connect ENOENT /run/user/0/herdr-core/default.sock'); },
+    },
+    tasks: [taskRow({ paneId: 't-no-store', taskId: 'task-no-store', cwd: '/test/no-pipe' })],
+    deps: { policy: { commandPickupMs: 0 } },
   });
   try {
     const startedAt = Date.now();
-    const text = await runSubagentRejects(pi, { action: 'send', agentId: 't-dead-pipe', message: 'hola' });
+    const text = await runSubagentRejects(pi, { action: 'send', agentId: 't-no-store', message: 'hola' });
     assert.ok(Date.now() - startedAt < 20_000, `no readiness budget for a live pane (took ${Date.now() - startedAt}ms)`);
-    assert.match(text, /its message channel is dead/);
-    assert.match(text, /NOTHING was delivered/);
-    assert.match(text, /action "resume"/);
-    assert.doesNotMatch(text, /pipe not ready within/, 'a dead pipe is not a slow boot');
+    assert.match(text, /nothing was delivered/);
+    assert.match(text, /doc\.set failed/, 'the reason the core refused the write is named');
+    assert.doesNotMatch(text, /its message channel is dead/, 'there is no private channel to blame any more');
+  } finally {
+    await root.fiber.dispose();
+  }
+});
+
+test('subagent plugin: a live pane whose worker never reads its command is reported as written, not delivered', async () => {
+  // The write is durable, so the two facts stay separate: the core holds the command (true here) and
+  // the worker applied it (false here — nothing in this stand-in reads documents). A master that read
+  // "Message sent" out of this would believe a steer that never happened.
+  const { root, pi } = await mountSubagent({
+    client: { getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'working' }) },
+    tasks: [taskRow({ paneId: 't-silent', taskId: 'task-silent', cwd: '/test/no-pipe' })],
+    deps: { policy: { commandPickupMs: 120 } },
+  });
+  try {
+    const startedAt = Date.now();
+    const res = await runSubagent(pi, { action: 'send', agentId: 't-silent', message: 'hola' });
+    const text = res.content[0]!.text;
+    assert.match(text, /^Message written for subagent /);
+    assert.match(text, /has not applied it yet/);
+    assert.match(text, /piher\.cmd\.t-silent/, 'the result names the document that holds it');
+    assert.ok(Date.now() - startedAt < 5_000, 'the wait is the pickup budget, not a readiness budget');
   } finally {
     await root.fiber.dispose();
   }
@@ -790,16 +815,24 @@ test('subagent plugin: retry re-sends the stored prompt instead of asking the ma
     const taskId = 'task-retry-1';
     saveTaskPrompt(taskId, 'the original brief');
     assert.equal(readTaskPrompt(taskId), 'the original brief');
+    const written: Array<{ name: string; value: unknown }> = [];
     const { root, pi } = await mountSubagent({
-      client: { getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'idle' }) },
+      client: {
+        getTerminal: async (id: string) => terminalInfo({ id, state: 'live', status: 'idle' }),
+        docSet: async (name: string, value: unknown, version: number) => {
+          written.push({ name, value });
+          return version + 1;
+        },
+      },
       tasks: [taskRow({ paneId: 't-retry', taskId, cwd: '/test/no-pipe' })],
+      deps: { policy: { commandPickupMs: 0 } },
     });
     try {
-      // No pipe server behind that cwd: the send path reports the dead channel, which proves the stored
-      // text was what it tried to deliver.
-      const dead = await runSubagentRejects(pi, { action: 'retry', agentId: 't-retry' });
-      assert.match(dead, /message channel is dead/);
-      assert.doesNotMatch(dead, /no stored prompt/);
+      // The command document is what the retry carries, and its text is the stored brief: the row's
+      // own prompt, not a fresh one the master would have to pay for again (spec S15).
+      await runSubagent(pi, { action: 'retry', agentId: 't-retry' });
+      assert.deepEqual(written.map((w) => w.name), ['piher.cmd.t-retry'], 'one command, named by the address');
+      assert.equal((written[0]!.value as { text?: string }).text, 'the original brief');
 
       forgetTaskPrompt(taskId);
       const missing = await runSubagentRejects(pi, { action: 'retry', agentId: 't-retry' });

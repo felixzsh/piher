@@ -879,3 +879,196 @@ test('worker settle: a one-shot worker waits for its document write before shutt
     if (process.platform !== 'win32') rmSync(pipePathFor(masterPipe), { force: true });
   }
 }));
+
+/* ── P3: a send reaches the worker as a command document (spec S15, S23, S24) ── */
+
+interface DocCall { method: string; params: Record<string, unknown> }
+
+/** A core socket that answers a worker's calls and can notify it: documents live here, and a
+ *  successful write is announced to every `events.subscribe` connection, the way the core does. */
+async function withDocCore(
+  body: (core: {
+    socketPath: string;
+    calls: DocCall[];
+    /** Connections that subscribed, with their params and a way to notify them. */
+    subscriptions: Array<{ params: Record<string, unknown>; notify: (name: string, version: number) => void }>;
+    /** The master's side of a write: store the value and emit the `doc` event it causes (S23). */
+    write: (name: string, value: unknown) => number;
+    /** Read a document as the test sees it, version included. */
+    read: (name: string) => { value: unknown; version: number } | undefined;
+  }) => Promise<void>,
+): Promise<void> {
+  const socketPath = join(mkdtempSync(join(tmpdir(), 'piher-doc-core-')), 's.sock');
+  const calls: DocCall[] = [];
+  const docs = new Map<string, { value: unknown; version: number }>();
+  const subscriptions: Array<{ params: Record<string, unknown>; notify: (name: string, version: number) => void }> = [];
+  const live = new Set<(line: string) => void>();
+  const notifyAll = (name: string, version: number): void => {
+    for (const sub of subscriptions) sub.notify(name, version);
+  };
+  const server = createServer((sock) => {
+    let buf = '';
+    sock.setEncoding('utf8');
+    let seq = 0;
+    const subscription = (params: Record<string, unknown>): { params: Record<string, unknown>; notify: (name: string, version: number) => void } => {
+      const entry = {
+        params,
+        notify: (name: string, version: number): void => {
+          seq += 1;
+          // The measured notification payload (hc 0.1.20): the name and the version, never the value.
+          sock.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'event', params: { seq, type: 'doc', data: { name, version } } })}\n`);
+        },
+      };
+      subscriptions.push(entry);
+      // A subscriber that closed its connection (the worker's session_shutdown does) is gone: nothing
+      // is notified on a dead socket.
+      sock.on('close', () => {
+        const at = subscriptions.indexOf(entry);
+        if (at >= 0) subscriptions.splice(at, 1);
+      });
+      return entry;
+    };
+    sock.on('data', (chunk) => {
+      buf += chunk;
+      let idx: number;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const req = JSON.parse(buf.slice(0, idx)) as { id: number; method: string; params: Record<string, unknown> };
+        buf = buf.slice(idx + 1);
+        calls.push({ method: req.method, params: req.params });
+        if (req.method === 'events.subscribe') {
+          // No filters can be asserted here: only an unfiltered subscription carries `doc` events.
+          subscription(req.params);
+          // `channel: null` is plain mode: this connection now carries only notifications (S24).
+          sock.write(`${JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { channel: null, seq: 0, terminals: [] } })}\n`);
+          continue;
+        }
+        let result: Record<string, unknown> = {};
+        if (req.method === 'terminal.get') {
+          result = { address: 't2', turn: 1, state: 'live', cwd: '/w', labels: {} };
+        } else if (req.method === 'doc.get') {
+          const held = docs.get(String(req.params.name));
+          result = { value: held?.value ?? null, version: held?.version ?? 0 };
+        } else if (req.method === 'doc.set') {
+          const name = String(req.params.name);
+          const current = docs.get(name)?.version ?? 0;
+          if (current !== Number(req.params.version)) {
+            sock.write(`${JSON.stringify({ jsonrpc: '2.0', id: req.id, error: { code: -32000, message: 'conflict', data: { kind: 'conflict' } } })}\n`);
+            continue;
+          }
+          const version = current + 1;
+          docs.set(name, { value: req.params.value, version });
+          result = { version };
+          sock.end(`${JSON.stringify({ jsonrpc: '2.0', id: req.id, result })}\n`);
+          notifyAll(name, version);
+          continue;
+        }
+        sock.end(`${JSON.stringify({ jsonrpc: '2.0', id: req.id, result })}\n`);
+      }
+    });
+    live.add((line) => sock.write(line));
+  });
+  const { promise: listening, resolve } = Promise.withResolvers<void>();
+  server.listen(socketPath, resolve);
+  await listening;
+  try {
+    await body({
+      socketPath,
+      calls,
+      subscriptions,
+      write: (name, value) => {
+        const version = (docs.get(name)?.version ?? 0) + 1;
+        docs.set(name, { value, version });
+        notifyAll(name, version);
+        return version;
+      },
+      read: (name) => docs.get(name),
+    });
+  } finally {
+    server.close();
+    if (process.platform !== 'win32') rmSync(dirname(socketPath), { recursive: true, force: true });
+  }
+}
+
+test('P3: a send steers the worker while its tool call is in flight, through its own document watch', withCleanup(async (cleanup) => {
+  const agentDir = cleanup.tempDir('piher-steer-agent').path;
+  const cwd = cleanup.tempDir('piher-steer-cwd').path;
+  const sessionFile = join(agentDir, '2026-01-01T00-00-00-000Z_cccccccc-0000-4000-8000-000000000000.jsonl');
+  await withDocCore(async (core) => {
+    const pi = await mountIndex(cleanup, 'core-worker', {
+      HC_TERMINAL_SOCKET: core.socketPath,
+      HC_TERMINAL_ID: 't2',
+      PI_CODING_AGENT_DIR: agentDir,
+      PI_SESSION_FILE: sessionFile,
+      PIHER_DELEGATION: JSON.stringify({ taskId: 'task-steer', description: 'steer worker', role: 'worker' }),
+    });
+    const ctx = { cwd, sessionManager: { getBranch: () => [], getSessionFile: () => sessionFile } };
+    try {
+      await fire(pi, 'session_start', { reason: 'new' }, ctx);
+      await waitFor(() => core.subscriptions.length === 1);
+      assert.equal(core.subscriptions.length, 1, 'the worker holds one document subscription');
+      // S24/S23: the subscription is unfiltered, and it is a connection of its own — a scoped one
+      // never sees a `doc` event, and the subscription carries only notifications.
+      assert.deepEqual(core.subscriptions[0]!.params, {}, 'the subscription carries no filter');
+      assert.ok(core.calls.some((c) => c.method === 'events.subscribe'), 'subscribed over the core socket');
+
+      // The master sends while the worker is mid-tool-call.
+      await fire(pi, 'turn_start');
+      await fire(pi, 'tool_execution_start', { toolCallId: 'c1', toolName: 'bash' });
+      const version = core.write('piher.cmd.t2', {
+        id: 'cmd-1', type: 'follow_up', text: 'stop and report what you have', deliverAs: 'steer',
+      });
+      assert.equal(version, 1);
+
+      await waitFor(() => pi.userSent.length === 1);
+      assert.equal(pi.userSent.length, 1, 'the command reached pi while the tool call was in flight');
+      // S15: pi's own steering mode is what puts it at the next tool gap; the turn had not ended here
+      // (no tool_execution_end, no agent_settled), so nothing waited for the turn to finish.
+      assert.deepEqual(pi.userSent[0], {
+        content: 'stop and report what you have',
+        opts: { deliverAs: 'steer', triggerTurn: true },
+      });
+      // S11: the worker clears what it applied, guarded by the version it read — a command left
+      // behind would be applied again by a restarted worker, which has no memory of ids.
+      await waitFor(() => core.read('piher.cmd.t2')?.value === null);
+      assert.equal(core.read('piher.cmd.t2')?.value, null, 'the applied command is cleared');
+      assert.equal(core.read('piher.cmd.t2')?.version, 2, 'the clear is compare-and-swap, not an overwrite');
+      const clears = core.calls.filter((c) => c.method === 'doc.set' && c.params.value === null);
+      assert.equal(clears.length, 1, 'one CAS clear');
+      assert.equal(clears[0]!.params.version, 1, 'cleared against the version it read');
+
+      // A repeat notification for the same (now cleared) document applies nothing twice.
+      core.subscriptions[0]!.notify('piher.cmd.t2', 2);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      assert.equal(pi.userSent.length, 1, 'a re-read never applies the same command twice');
+
+      // Another document's event is not ours: documents are core-global, so the watch sees them all.
+      core.write('piher.cmd.t9', { id: 'cmd-other', type: 'follow_up', text: 'not for me', deliverAs: 'steer' });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      assert.equal(pi.userSent.length, 1, 'another worker’s command is ignored');
+
+      // A value that is not a command is never handed to pi (a foreign or half-written document).
+      core.write('piher.cmd.t2', { text: 'no id, no deliverAs' });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      assert.equal(pi.userSent.length, 1, 'a value that is not a command is not applied');
+
+      // A second command after the first is applied again — the id, not the position, is the identity.
+      core.write('piher.cmd.t2', {
+        id: 'cmd-2', type: 'follow_up', text: 'now summarize', deliverAs: 'followUp',
+      });
+      await waitFor(() => pi.userSent.length === 2);
+      assert.deepEqual(pi.userSent[1], { content: 'now summarize', opts: { deliverAs: 'followUp', triggerTurn: true } });
+
+      // The subscription dies with the session: nothing is left watching the core.
+      await fire(pi, 'session_shutdown');
+      await waitFor(() => core.subscriptions.length === 0);
+      assert.equal(core.subscriptions.length, 0, 'the session closed its subscription');
+      const before = core.calls.length;
+      core.write('piher.cmd.t2', { id: 'cmd-3', type: 'follow_up', text: 'after shutdown', deliverAs: 'steer' });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.equal(pi.userSent.length, 2, 'no command is applied after the session ends');
+      assert.equal(core.calls.length, before, 'the closed watch stops reading the core');
+    } finally {
+      await fire(pi, 'session_shutdown');
+    }
+  });
+}));

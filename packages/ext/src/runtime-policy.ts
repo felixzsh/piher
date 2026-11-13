@@ -14,6 +14,8 @@ export interface RuntimePolicy {
   readonly gitTimeoutMs: number
   /** Subagent pane pipe readiness wait */
   readonly readinessTimeoutMs: number
+  /** How long `send` waits for the worker to read the steering command it wrote (spec S15) */
+  readonly commandPickupMs: number
 }
 
 function policyValue(field: PolicyField): number {

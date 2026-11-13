@@ -53,6 +53,7 @@ import {
 import { platformPaths } from '../platform-paths.ts';
 import { listRoleNames, loadRoleConfig } from '../role-loader.ts';
 import type { RuntimePolicy } from '../runtime-policy.ts';
+import { runtimePolicy } from '../runtime-policy.ts';
 import type { Lifecycle } from '../role-manifest.ts';
 import { toolError, ToolError } from '../tool-error.ts';
 import { readTaskPrompt } from '../prompt-store.ts';
@@ -74,6 +75,8 @@ import {
   type CheckoutSpace,
 } from '../worktree.ts';
 import { createPoller } from '../subagent-poller.ts';
+import { awaitCommandPickup, steerCommand, writeCommandDocument, type CommandPickup } from '../command-documents.ts';
+import { commandDocName } from '../report-documents.ts';
 import { createGcController, restoreTasks, retirePane, seedForkView } from '../subagent-gc.ts';
 import { createSessionIo, executeSubagentOutput, type SubagentOutputCursor } from '../subagent-session.ts';
 import type { WorkerWidgetRow } from '../tree-view.ts';
@@ -134,7 +137,7 @@ const SUBAGENT_MANUAL = [
   '',
   'output — `agentId`; the state plus the finalized report or, while it runs, the latest lines (`max_chars`, 100-16000; whole pane only with `full: true`). Normally unneeded: the settlement notice carries the words.',
   '',
-  'send — `agentId` + `message`: steered into a working worker at its next tool gap. A task whose pane is gone revives a new generation first, then takes the text. A closed or spent task is refused. `interrupt` aborts the current turn only — the pane and session stay, and no report arrives.',
+  'send — `agentId` + `message`: steered into a working worker at its next tool gap. A task whose pane is gone revives a new generation first, then takes the text. A closed or spent task is refused. `Message sent` means applied; `Message written` means still unread in the core.',
   '',
   'close — `agentId`; reclaims a finished worker: pane and tab go, and the record keeps the decision — close is final for every session, so later calls are refused and a new subagent is the only next step. A turn in flight is refused — interrupt first. One-shots reclaim automatically; a `worktree` checkout goes too (never forced; dirty refused, branch survives). Another session\'s live task closes the same way, no adoption step.',
   '',
@@ -159,6 +162,24 @@ function roleLifecycle(roleName: string): Lifecycle {
 function defaultAgentSessionsDir(): string {
   const base = process.env.PI_CODING_AGENT_DIR || platformPaths.agentDataDir;
   return join(base, 'sessions');
+}
+
+/**
+ * What a `send` says it achieved (spec S15). `Message sent to subagent <ref>.` is the contract's
+ * wording for a delivered steer, so it is used only when the worker read the command; every other
+ * outcome says what is actually known, because a steer that was written and never read must not
+ * read as delivered.
+ */
+function steerResultText(ref: string, paneId: string, commandId: string, pickup: CommandPickup): string {
+  if (pickup.kind === 'applied') return `Message sent to subagent ${ref}.`;
+  const document = `piher.cmd.${paneId}`;
+  if (pickup.kind === 'replaced') {
+    return `Message written for subagent ${ref}, but a newer command replaced it in the core before the worker read it: nothing of it was applied. Send it again.`;
+  }
+  if (pickup.kind === 'unknown') {
+    return `Message written for subagent ${ref} as command ${commandId} in ${document}, but delivery is unconfirmed: ${pickup.reason}.`;
+  }
+  return `Message written for subagent ${ref} as command ${commandId} in ${document}; the worker has not applied it yet, so it stays in the core until its extension reads it (check with action "output" before resending).`;
 }
 
 export default function subagentPlugin(ctx: Context): void {
@@ -414,6 +435,8 @@ export default function subagentPlugin(ctx: Context): void {
   scoped.on('turn_start', () => gc.onTurnStart());
   const { probeAlive } = session;
   const { spawnPaneInTaskTab, launchParts, approveFor, waitReady, findExistingPane } = spawn;
+  /** How long a `send` waits for the worker to read the command it wrote (spec S15). */
+  const commandPickupMs = d.policy?.commandPickupMs ?? runtimePolicy.commandPickupMs;
 
   /** Re-arm settlement watches after a restart: only rows still awaiting a report whose pane core
    *  still lists. A delivered report needs no watch; a closed task is final; a gone pane is
@@ -906,43 +929,68 @@ export default function subagentPlugin(ctx: Context): void {
       : `${head}: nothing answers there, so the worker's extension host is not running and NOTHING was delivered (${detail}). action "resume" with taskId ${entry.taskId} restarts it in a new pane; action "close" retires the row.`;
   }
 
-  /** Follow_up goes through the extension pipe with steering so supplemental instructions reach a
-   * long-running worker within seconds during a tool-call gap; a plain queue waits for the run. */
-  function executeSubagentSend(params: ToolParams, toolCtx: unknown) {
-    const { entry, cwd, foreign } = targetOf(params, toolCtx);
+  /** Re-arm a row for the turn a steer started: keeping the old consume time would read as a worker
+   *  with nothing in flight, and the settlement (spec S5) is judged against this request. Rolled
+   *  back when no watch takes over. */
+  function rearmAfterSteer(entry: TaskEntry, requestId: string): void {
+    const prevConsumedAt = entry.gen.consumedAt;
+    entry.gen.consumedAt = null;
+    writeRecord(entry);
+    try {
+      lastRequestIdByPane.set(entry.gen.paneId, requestId);
+      startPoller(entry.gen.paneId, entry.cwd, Date.now(), entry.description, requestId);
+    } catch (inner) {
+      entry.gen.consumedAt = prevConsumedAt;
+      writeRecord(entry);
+      throw inner;
+    }
+  }
+
+  /**
+   * A follow-up rides the core (spec S15): the master writes `piher.cmd.<address>` and the worker's
+   * own extension applies it with `pi.sendUserMessage(text, {deliverAs})`, which is what keeps pi's
+   * steering semantics — delivered between tool calls, not behind the whole turn. `terminal.send`
+   * would only paste into the TUI, so it is not this channel either.
+   *
+   * The write is durable, so the result separates two facts instead of blurring them: the core holds
+   * the command, and (when the worker read it) the worker applied it.
+   */
+  async function executeSubagentSend(params: ToolParams, toolCtx: unknown) {
+    const { entry, foreign } = targetOf(params, toolCtx);
     // A closed worker or a spent one-shot is not a conversation partner any more.
     const spent = spentText(entry);
     if (spent !== null) return toolError(spent);
     // Another session's live task resolves so it can be closed, not steered: steering would
     // write a generation this session does not own (S7).
     if (foreign) return toolError(foreignRefusal(entry.taskId, 'send'));
-    return pipeAction(entry, {
-      build: () => ({
-        type: 'follow_up',
-        id: `fu-${Date.now()}`,
-        text: String(params?.message ?? ''),
-        // The reply pipe is the MASTER's (bound at session_start with this session's cwd);
-        // entry.cwd would name a dead pipe for cross-repo workers.
-        from: pipeNameFor(cwd, env?.terminalId ?? ''),
-        steer: true,
-      }),
-      ok: (_res, reqId) => {
-        // A follow_up re-arms the row: keeping the old consume time would read as finished while
-        // a turn is in flight. Roll it back if no poller takes over.
-        const prevConsumedAt = entry.gen.consumedAt;
-        entry.gen.consumedAt = null;
-        writeRecord(entry);
-        try {
-          lastRequestIdByPane.set(entry.gen.paneId, reqId);
-          startPoller(entry.gen.paneId, entry.cwd, Date.now(), entry.description, reqId);
-        } catch (inner) {
-          entry.gen.consumedAt = prevConsumedAt;
-          writeRecord(entry);
-          throw inner;
-        }
-        return { content: [{ type: 'text', text: `Message sent to subagent ${taskRef(entry.gen)}.` }], details: { paneId: entry.gen.paneId } };
-      },
-    });
+    if (!client.available) return toolError(`subagent: ${CORE_REQUIRED}`);
+    const text = String(params?.message ?? '');
+    try {
+      // A just-spawned worker is still booting: its first task must land before any follow-up.
+      const boot = boots.get(entry.gen.paneId);
+      if (boot) await boot;
+      // A pane the core no longer lists cannot read a document, and housekeeping reclaims the panes
+      // of settled workers: revive first (S3) and write to the generation that now exists.
+      await ensureLive(entry);
+      const command = steerCommand(text);
+      const written = await writeCommandDocument(client, entry.gen.paneId, command);
+      if (!written.ok) {
+        return toolError(`Error: failed to reach subagent ${entry.gen.paneId}: ${written.reason} — nothing was delivered.`);
+      }
+      rearmAfterSteer(entry, command.id);
+      const ref = taskRef(entry.gen);
+      const name = commandDocName(entry.gen.paneId);
+      const pickup = name
+        ? await awaitCommandPickup(client, name, { id: command.id, version: written.version }, commandPickupMs)
+        : { kind: 'unknown' as const, reason: 'the address cannot name a document (S9)' };
+      return {
+        content: [{ type: 'text', text: steerResultText(ref, entry.gen.paneId, command.id, pickup) }],
+        details: { paneId: entry.gen.paneId },
+      };
+    } catch (err) {
+      if (err instanceof ToolError) throw err;
+      return toolError(`Error: failed to reach subagent ${entry.gen.paneId}: ${(err as Error).message}`);
+    }
   }
 
   /** Re-send the prompt this task was spawned with. An upstream failure (a provider outage, a dropped
