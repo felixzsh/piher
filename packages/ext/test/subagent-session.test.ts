@@ -1,5 +1,6 @@
 /** Child-session I/O and output reads: candidate resolution, liveness probes, a worker's closing
- * words with cache invalidation, the output delta, the `output` action and reply healing. */
+ * words with cache invalidation, the output delta, the `output` action, and the `hresume` report a
+ * worker's session is resolved from. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
@@ -7,9 +8,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CoreClientLike } from '../src/core-client.ts';
 import type { TaskSeed } from './test-utils.ts';
-import { sessionDirName } from '../src/session-tail.ts';
+import { sessionDirName, bareSessionId } from '../src/session-tail.ts';
 import {
-  cleanPaneChrome, computeSubagentOutputDelta, createSessionIo, cutPaneReportCopy, formatSubagentOutput, resolveSubagentStatus, tailOfPaneRead,
+  cleanPaneChrome, computeSubagentOutputDelta, createSessionIo, cutPaneReportCopy, formatSubagentOutput, HRESUME_LABEL,
+  hresumeSessionFile, resolveSubagentStatus, tailOfPaneRead,
   type SubagentOutputCursor,
 } from '../src/subagent-session.ts';
 import { readTaskRecord } from '../src/task-store.ts';
@@ -26,16 +28,22 @@ const NO_CLOSING = { text: null, why: null };
 /** Terminal id used by the single-worker session fixtures. */
 const PANE = 'tW';
 
-/** CoreClientLike whose terminals carry `piher.session` labels — the worker's only session report. */
+/** CoreClientLike whose terminals carry the core's `hresume` label — the worker's own session
+ *  report (spec S18), written by its Herdr extension. The label value is the documented object; the
+ *  tests below pass the file or the bare id they care about. */
+const hresumeLabel = (fileOrId: string): string => JSON.stringify({
+  agent: 'pi', session: bareSessionId(fileOrId), file: fileOrId, cwd: '/w', pid: 1, boot: 'b',
+});
+
 const sessionClient = (sessionsByPane: Record<string, string>): CoreClientLike => fakeCore({
   listTerminals: async () => Object.entries(sessionsByPane)
-    .map(([id, file]) => terminalInfo({ id, labels: { 'piher.session': file } })),
+    .map(([id, file]) => terminalInfo({ id, labels: { [HRESUME_LABEL]: hresumeLabel(file) } })),
   getTerminal: async (id) => (sessionsByPane[id]
-    ? terminalInfo({ id, labels: { 'piher.session': sessionsByPane[id]! } })
+    ? terminalInfo({ id, labels: { [HRESUME_LABEL]: hresumeLabel(sessionsByPane[id]!) } })
     : null),
 });
 
-/** SessionIo over a scripted `piher.session` label; `sessionsDir` is where candidate files are scanned. */
+/** SessionIo over a scripted `hresume` label; `sessionsDir` is where candidate files are scanned. */
 const io = (reported: string | null, sessionsDir: string, ownSession = '') => createSessionIo({
   client: sessionClient(reported ? { [PANE]: reported } : {}),
   getSessionId: () => ownSession,
@@ -157,10 +165,10 @@ test('resolveSessionFile: the own label wins over the mtime order; a pipe self-r
   assert.equal(
     await ioFor({ 'tW': sub }).resolveSessionFile('tW', cwd),
     sub,
-    'the worker\'s own `piher.session` label wins',
+    'the worker\'s own `hresume` label wins (spec S18)',
   );
-  assert.equal(await ioFor().resolveSessionFile('tOther', cwd, preferred), preferred, 'a pipe self-report wins over the lagging label');
-  assert.equal(await ioFor({ 'tOther': reported }).resolveSessionFile('tOther', cwd), reported, 'without a self-report the label order holds');
+  assert.equal(await ioFor().resolveSessionFile('tOther', cwd, preferred), preferred, 'the session the row already carries wins over the fallback');
+  assert.equal(await ioFor({ 'tOther': reported }).resolveSessionFile('tOther', cwd), reported, 'without a preferred value the label order holds');
   home.dispose();
 });
 
@@ -425,7 +433,7 @@ test('output action: an idle pane showing only its overlay still surfaces the tr
     assert.equal(second.details!.deltaLength, 0);
     assert.equal(second.details!.reportDelivered, false, 'an unchanged report is not re-delivered');
     assert.doesNotMatch(second.content[0]!.text, /Subagent Report/);
-  }, outputPane(() => '\n$ cargo test\n   +3 hidden (7✓)\n', { status: 'idle', labels: { 'piher.session': report } }));
+  }, outputPane(() => '\n$ cargo test\n   +3 hidden (7✓)\n', { status: 'idle', labels: { [HRESUME_LABEL]: hresumeLabel(report) } }));
   home.dispose();
 });
 
@@ -473,7 +481,7 @@ test('output action: the transcript report replaces the pane copy and the delive
   const { root, pi } = await mountSubagent({
     client: {
       ...NO_TERMINALS,
-      ...outputPane(() => RENDERED_PANE, { status: 'idle', labels: { 'piher.session': session } }),
+      ...outputPane(() => RENDERED_PANE, { status: 'idle', labels: { [HRESUME_LABEL]: hresumeLabel(session) } }),
     },
     tasks: [taskRow({ paneId: 'pWorker', taskId, cwd: repo })],
   });
@@ -530,12 +538,12 @@ test('resume: a record pointing at the master session is refused; another pane i
     env: { terminalId: 'p0' },
     client: {
       listTerminals: async () => [
-        terminalInfo({ id: 'p0', labels: { 'piher.session': masterFile } }),
-        terminalInfo({ id: 'p2', labels: { 'piher.session': otherFile } }),
+        terminalInfo({ id: 'p0', labels: { [HRESUME_LABEL]: hresumeLabel(masterFile) } }),
+        terminalInfo({ id: 'p2', labels: { [HRESUME_LABEL]: hresumeLabel(otherFile) } }),
       ],
       getTerminal: async (id) => terminalInfo({
         id,
-        labels: { 'piher.session': id === 'p0' ? masterFile : otherFile },
+        labels: { [HRESUME_LABEL]: hresumeLabel(id === 'p0' ? masterFile : otherFile) },
       }),
     },
     deps: { getSessionFile: () => sessionFile, getCwd: () => cwd },
@@ -555,37 +563,56 @@ test('resume: a record pointing at the master session is refused; another pane i
     home.dispose();
   }
 });
+/* ── the session a worker reports (spec S18) ────────────────────── */
 
-test('applyReplySession: a bare session id self-report repairs a poisoned sessionFile', async () => {
-  const home = new TempHome('piher-reply-session-');
-  const cwd = mkdtempSync(join(tmpdir(), 'piher-reply-cwd-'));
-  const dir = home.dir('sessions', sessionDirName(cwd));
-  const realFile = join(dir, '2026-09-20T05-14-07-064Z_01a0bd3c-6557-746b-adf6-5128f2326c57.jsonl');
-  writeFileSync(realFile, '{}\n');
-  const poisoned = join(cwd, 'stale-01a0bd34.jsonl');
-  writeFileSync(poisoned, '{}\n');
+test('hresumeSessionFile: the documented object yields its file, else its bare session id', () => {
+  assert.equal(
+    hresumeSessionFile(JSON.stringify({ agent: 'pi', session: 'abc-123', file: '/s/abc-123.jsonl', cwd: '/w', pid: 7, boot: 'b' })),
+    '/s/abc-123.jsonl',
+    'the reported file is what a transcript resolver can open',
+  );
+  assert.equal(
+    hresumeSessionFile(JSON.stringify({ agent: 'pi', session: 'abc-123', cwd: '/w' })),
+    'abc-123',
+    'an id alone is still a report: herdr reports ids and paths interchangeably',
+  );
+  // A label piher cannot read is not a session report: guessing here is how a resume lands on the
+  // wrong conversation.
+  for (const junk of [null, undefined, '', '   ', 'not json', '[]', '{}', JSON.stringify({ agent: 'pi', file: '' })]) {
+    assert.equal(hresumeSessionFile(junk as string | null | undefined), null, `no report in ${JSON.stringify(junk)}`);
+  }
+});
 
-  // Records belong to a repository: the reply heals the generation's sessionFile through them.
+test('resume: a task with no session anywhere is refused, and the refusal names what is missing', async () => {
+  const home = new TempHome('piher-resume-nosession-');
+  const cwd = mkdtempSync(join(tmpdir(), 'piher-resume-nosession-cwd-'));
   mkdirSync(join(cwd, '.git'), { recursive: true });
-  const viewFile = join(home.dir('views'), '2026-09-20T05-14-07-064Z_99999999-9999-4999-8999-999999999999.jsonl');
-  const taskId = '11111111-2222-4333-8444-555555555555';
+  const viewFile = join(home.dir('views'), '2026-09-20T07-00-00-000Z_77777777-7777-4777-8777-777777777777.jsonl');
+  const taskId = '88888888-8888-4888-8888-888888888888';
+  // The row survived, its conversation did not: no session file, and the terminal reports no
+  // `hresume` label — exactly the case that used to resume into a fresh conversation silently.
   seedTaskDocuments(viewFile, [{
-    taskId, paneId: 'p2', tabId: 't0', tabName: 'main',
-    cwd, description: 'Investigate bug 19803',
-    sessionFile: poisoned, createdAt: Date.now() - 60_000,
+    taskId, paneId: 'pGone', tabId: 't0', tabName: 'main',
+    cwd, description: 'lost conversation', sessionFile: null, createdAt: Date.now() - 60_000,
   }]);
-  const { root, pi, port } = await mountSubagent({
-    client: { getTerminal: async (id) => terminalInfo({ id, labels: { 'piher.session': realFile } }) },
+  const { root, pi } = await mountSubagent({
+    client: {
+      listTerminals: async () => [terminalInfo({ id: 'pGone', status: 'idle', labels: {} })],
+      getTerminal: async (id) => terminalInfo({ id, status: 'idle', labels: {} }),
+    },
     deps: {
-      getSessionId: () => '99999999-9999-4999-8999-999999999999',
+      getSessionId: () => '77777777-7777-4777-8777-777777777777',
       getSessionFile: () => viewFile,
       getCwd: () => cwd,
     },
   });
   try {
     await fire(pi, 'session_start', { reason: 'reload' }, {});
-    port.current!.applyReplySession('p2', '01a0bd3c-6557-746b-adf6-5128f2326c57');
-    assert.equal(readTaskRecord(cwd, taskId)?.gen.sessionFile, realFile);
+    const refused = await runSubagentRejects(pi, { action: 'resume', taskId }, cwd);
+    assert.match(refused, /has no session to resume/);
+    assert.match(refused, /`hresume` label/, 'the refusal names the report that is missing');
+    assert.match(refused, /`session`/, 'and the document field that would have carried it');
+    assert.match(refused, /fresh conversation/);
   } finally {
     await root.fiber.dispose();
     home.dispose();

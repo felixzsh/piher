@@ -1,8 +1,8 @@
 /**
  * Disposal ledger shared by HMR and session shutdown (D80⑤ + D79).
  *
- * HMR partial reload can skip old fiber effect disposers, so process-level resources (intervals, pipe
- * servers, watchers) would leak without compensation. Modules register those resources by module key;
+ * HMR partial reload can skip old fiber effect disposers, so process-level resources (intervals, core
+ * watchers) would leak without compensation. Modules register those resources by module key;
  * reload disposes matching keys, session_shutdown disposes everything. D79 reuses the same mechanism
  * for pi-surface registration cleanup, where keys need not be file paths.
  */

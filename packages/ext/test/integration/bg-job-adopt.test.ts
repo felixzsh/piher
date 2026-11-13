@@ -198,7 +198,7 @@ test('delivery is what makes a job disposable: labels cleared, list empty, no re
 
 test('mount: a pane that is not a job is ignored', withCleanup(async () => {
   const { pi, root } = await mount({
-    listTerminals: async () => [terminalInfo({ id: 't5', labels: { 'piher.session': 'abc' } })],
+    listTerminals: async () => [terminalInfo({ id: 't5', labels: { 'herdr.tab': 'abc' } })],
   });
   try {
     await fire(pi, 'session_start', {}, {});

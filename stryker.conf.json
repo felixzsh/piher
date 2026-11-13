@@ -8,7 +8,6 @@
   "mutate": [
     "packages/ext/src/tool-gate.ts",
     "packages/ext/src/lock-core.ts",
-    "packages/ext/src/pipe-channel.ts",
     "packages/ext/src/gc-core.ts",
     "packages/ext/src/config-catalog-core.ts"
   ],

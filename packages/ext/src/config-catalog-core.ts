@@ -68,12 +68,13 @@ const SPAWN_CONTRACT_KEYS: readonly string[] = [
   'PIHER_SUBAGENT', 'PIHER_DELEGATION', 'PIHER_ROLE_MANIFEST', 'PIHER_ROLE_BASE',
 ];
 
-/** Knobs the code reads directly instead of through `OPTION_SPECS`: neither has a policy field, a
- *  default or a bound, so the registry is not where they live. `PIHER_TUI` picks the spawn's TUI mode
- *  (`subagent-core.ts`), `PIHER_PIPE_TRACE` turns the pipe trace on (`plugins/subagent.ts`). Every
- *  name here is read by the source, and `test/config-catalog.test.ts` fails if this list falls
- *  behind the source or the source grows a read this list does not know. */
-const DIRECT_READ_KEYS: readonly string[] = ['PIHER_TUI', 'PIHER_PIPE_TRACE'];
+/** Knobs the code reads directly instead of through `OPTION_SPECS`: `PIHER_TUI` has no policy field,
+ *  a default or a bound, so the registry is not where it lives (it picks the spawn's TUI mode,
+ *  `subagent-core.ts`). Every name here is read by the source, and `test/config-catalog.test.ts` fails
+ *  if this list falls behind the source or the source grows a read this list does not know.
+ *  The old pipe-trace knob is NOT here any more: P5 deleted the pipe request path it traced, so a
+ *  value a user still exports is a removed knob and `checkEnvKnobs` names it. */
+const DIRECT_READ_KEYS: readonly string[] = ['PIHER_TUI'];
 
 /** Every `PIHER_*` name this build reads: the option registry, the spawn contracts and the direct
  *  reads. Anything else in the environment is a knob nothing reads, which is what the check names. */

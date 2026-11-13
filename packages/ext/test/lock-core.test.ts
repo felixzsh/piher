@@ -31,7 +31,7 @@ test('normalizeLockPath: separators unified, lowercased, relative → absolute, 
 test('lockTokenKey: label-namespaced hash key, stable per path, distinct across paths', () => {
   const key = lockTokenKey('f:/some/long/path/to/a file.cs');
   assert.match(key, /^piher\.lock\.[0-9a-f]{16}$/); assert.ok(key.startsWith(LOCK_TOKEN_PREFIX));
-  assert.equal(isLockTokenKey(key), true); assert.equal(isLockTokenKey('piher.session'), false);
+  assert.equal(isLockTokenKey(key), true); assert.equal(isLockTokenKey('piher.demo'), false);
   assert.equal(isLockTokenKey(LOCK_TOKEN_PREFIX), false); assert.equal(lockTokenKey('f:/a.cs'), lockTokenKey('f:/a.cs'), 'all terminals must derive one key per path');
   assert.notEqual(lockTokenKey('f:/a.cs'), lockTokenKey('f:/b.cs')); assert.match(fnv1a64('f:/a.cs'), /^[0-9a-f]{16}$/);
 });

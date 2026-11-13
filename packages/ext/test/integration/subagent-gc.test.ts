@@ -12,9 +12,10 @@ import type { TaskEntry } from '../../src/task-row.ts';
 import { checkoutSpaceId } from '../../src/worktree.ts';
 import type { TerminalInfo } from '../../src/core-client.ts';
 import {
-  decideCheckoutSpaces, formatIdleCheckoutNotice, planChannelCheck, shouldClosePane, shouldCloseTaskTab,
+  decideCheckoutSpaces, formatIdleCheckoutNotice, shouldClosePane, shouldCloseTaskTab,
   type CheckoutRowLike, type GcEntryLike,
 } from '../../src/gc-core.ts';
+import * as gcCore from '../../src/gc-core.ts';
 
 const NOW = 1_000_000;
 const TTL = 600_000;
@@ -131,21 +132,11 @@ test('tasks: a worker whose pane is gone is listed as actionable, not dropped', 
   }
 });
 
-test('planChannelCheck: only a worker with a turn in flight has a channel to lose', () => {
-  // Seen live: the heartbeat announced "its message channel is gone" for a worker that was still booting
-  // (`unknown`, no OSC report yet) — one second before that worker registered its own pipe.
-  const live = { closed: false, consumed: false };
-  assert.equal(planChannelCheck({ ...live, terminalStatus: 'working' }), 'ping');
-  const idle = planChannelCheck({ ...live, terminalStatus: 'idle' });
-  assert.equal(idle, 'ping', 'idle is still addressable');
-  const booting = planChannelCheck({ ...live, terminalStatus: 'unknown' });
-  assert.equal(booting, 'skip', 'a booting pane waits');
-  const unlisted = planChannelCheck({ ...live, terminalStatus: undefined });
-  assert.equal(unlisted, 'skip', 'an unlisted pane is revive work');
-  const shut = planChannelCheck({ closed: true, consumed: false, terminalStatus: 'idle' });
-  assert.equal(shut, 'skip', 'a closed task is skipped');
-  const done = planChannelCheck({ closed: false, consumed: true, terminalStatus: 'working' });
-  assert.equal(done, 'skip', 'as is a delivered one');
+test('planChannelCheck: gone with the private socket', () => {
+  // P5 deleted the ping this planned: a follow-up is a document write now (spec S15), so there is no
+  // per-worker channel to lose and no heartbeat to announce it.
+  assert.equal('planChannelCheck' in gcCore, false);
+  assert.equal('formatDeadChannelNotice' in gcCore, false);
 });
 
 test('decideCheckoutSpaces: an empty window closes, a finished-but-open one only gets a reminder', () => {

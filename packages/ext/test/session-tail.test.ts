@@ -7,7 +7,7 @@ import {
   listSessionFiles, parseSessionEntries, readTurnClosing, sessionDirName, sessionFileById,
   type SessionEntryLike, type TurnClosing,
 } from '../src/session-tail.ts';
-import { planSettleWake, shouldPushSettleReply } from '../src/settle-wake-core.ts';
+import { planSettleWake, reportsSettlement } from '../src/settle-wake-core.ts';
 import { jsonl, transcriptMessage, withCleanup } from './test-utils.ts';
 
 const msg = (role: string, text: string, ts: number, stopReason = 'stop') =>
@@ -107,12 +107,12 @@ test('agent_settled.aborted (pi ≥ 1.1): a cancelled run wakes nothing even whe
   assert.equal(plan.notice, false);
 });
 
-test('shouldPushSettleReply: an aborted settle keeps the machine request armed for the re-run', () => {
-  assert.equal(shouldPushSettleReply({ aborted: true, lastStopReason: 'stop' }), false);
-  assert.equal(shouldPushSettleReply({ lastStopReason: 'stop' }), true);
-  // A provider failure pi retries is not a settlement: answering would consume the request with a
-  // null-text reply before the retry can deliver the real closing message.
-  assert.equal(shouldPushSettleReply({ lastStopReason: 'error' }), false);
+test('reportsSettlement: an aborted settle reports nothing, so a one-shot cannot exit on it', () => {
+  assert.equal(reportsSettlement({ aborted: true, lastStopReason: 'stop' }), false);
+  assert.equal(reportsSettlement({ lastStopReason: 'stop' }), true);
+  // A provider failure pi retries is not a settlement: reporting it would say "finished, nothing to
+  // say" over live work, and a one-shot would exit before the real closing message exists.
+  assert.equal(reportsSettlement({ lastStopReason: 'error' }), false);
 });
 
 test('natural settle with a new running set → one notice carrying the set key', () => {
@@ -149,12 +149,12 @@ test('unknown stopReason (null, older pi) counts as a natural end: no notice is 
   assert.equal(plan.notice, true);
 });
 
-/* ── settle fast-path: an aborted settle must not answer the machine request ── */
+/* ── the report guard: an aborted settle must not report ────────────── */
 
-test('settle reply guard: a user abort keeps the request armed', () => {
+test('reportsSettlement: a user abort or a retried error reports nothing', () => {
   const natural = { lastStopReason: 'stop' as const };
-  assert.equal(shouldPushSettleReply(natural), true, 'a genuine settle answers the pending machine request');
-  assert.equal(shouldPushSettleReply({ lastStopReason: 'error' }), false, 'provider error is retried: keep the request armed for the retry');
-  assert.equal(shouldPushSettleReply({ lastStopReason: 'aborted' }), false, 'a user-aborted run may re-run');
-  assert.equal(shouldPushSettleReply({ lastStopReason: null }), true, 'an unknown stopReason (older pi) still replies');
+  assert.equal(reportsSettlement(natural), true, 'a genuine settle has something to report');
+  assert.equal(reportsSettlement({ lastStopReason: 'error' }), false, 'provider error is retried: the report waits for the retry');
+  assert.equal(reportsSettlement({ lastStopReason: 'aborted' }), false, 'a user-aborted run may re-run');
+  assert.equal(reportsSettlement({ lastStopReason: null }), true, 'an unknown stopReason (older pi) still reports');
 });

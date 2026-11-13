@@ -75,11 +75,11 @@ test('getTerminal decodes status/labels; not_found → null; other kinds throw C
   await withCore((c) => {
     if (c.params.terminal === 't9') return { error: { kind: 'not_found', message: 'no terminal t9' } };
     if (c.params.terminal === 't8') return { error: { kind: 'unavailable', message: 'lost' } };
-    return { result: terminal({ status: { state: 'blocked', kind: 'question', msg: 'Pick one?' }, labels: { 'piher.session': '/s.jsonl' }, parent: 't1' }) };
+    return { result: terminal({ status: { state: 'blocked', kind: 'question', msg: 'Pick one?' }, labels: { 'piher.demo': '/s.jsonl' }, parent: 't1' }) };
   }, async (client) => {
     const t = await client.getTerminal('t2');
     assert.equal(t?.status, 'blocked'); assert.equal(t?.statusKind, 'question'); assert.equal(t?.statusMsg, 'Pick one?');
-    assert.equal(t?.labels['piher.session'], '/s.jsonl'); assert.equal(t?.parent, 't1');
+    assert.equal(t?.labels['piher.demo'], '/s.jsonl'); assert.equal(t?.parent, 't1');
     assert.equal(await client.getTerminal('t9'), null);
     await assert.rejects(client.getTerminal('t8'), (err: unknown) => err instanceof CoreError && err.kind === 'unavailable');
   });
@@ -123,8 +123,8 @@ test('waitForOutput: output → matched, check-in → timeout, a core refusal �
 test('setLabels removes with an empty value and never throws; run defaults the parent to this terminal', async () => {
   await withCore((c) => (c.method === 'terminal.label' ? { error: { kind: 'not_found', message: 'gone' } } : { result: terminal() }),
     async (client, calls) => {
-      await client.setLabels({ 'piher.session': '▶1', 'piher.lock.x': null });
-      assert.deepEqual(calls[0]!.params.labels, { 'piher.session': '▶1', 'piher.lock.x': '' });
+      await client.setLabels({ 'piher.demo': '▶1', 'piher.lock.x': null });
+      assert.deepEqual(calls[0]!.params.labels, { 'piher.demo': '▶1', 'piher.lock.x': '' });
       await client.setLabels({});
       assert.equal(calls.length, 1, 'an empty patch sends nothing');
 
@@ -310,10 +310,10 @@ test('watch: events patch the snapshot, wake waiters, and stale seqs are ignored
     seen = watch.version('t2');
     send(sock, event(6, 't2', 'turn', { turn: 9, state: 'done' }));
     send(sock, event(4, 't2', 'turn', { turn: 9, state: 'done' }));
-    send(sock, event(7, 't2', 'labels', { labels: { 'piher.session': '▶1' } }));
+    send(sock, event(7, 't2', 'labels', { labels: { 'piher.demo': '▶1' } }));
     assert.equal(await watch.changed('t2', seen, 2000), true);
     assert.equal(watch.get('t2')?.turn, 0, 'stale turn events were dropped');
-    assert.deepEqual(watch.get('t2')?.labels, { 'piher.session': '▶1' });
+    assert.deepEqual(watch.get('t2')?.labels, { 'piher.demo': '▶1' });
 
     seen = watch.version('t2');
     send(sock, event(8, 't2', 'finished', { reason: 'exited', exit_code: 0, signal: null, finished_ms: 1 }));

@@ -1,7 +1,7 @@
 /**
  * subagent — master-only plugin entry: tool registration, action dispatch, the resume / send / interrupt /
- * output / list actions, and port binding. Inbound deps arrive via `piher.subagent-deps`; outbound
- * pipe/settle queries bind atomically onto `port.current`.
+ * output / list actions, and port binding. Inbound deps arrive via `piher.subagent-deps`; the outbound
+ * board `port.current` binds atomically.
  */
 import { Context } from '@deepseek-ai/cordis';
 import { Type } from 'typebox';
@@ -30,7 +30,6 @@ import {
   type SubagentPortBox,
 } from '../subagent-core.ts';
 import {
-  applyReportedSessionFile,
   describeTaskState,
   isActionable,
   isClosed,
@@ -57,11 +56,10 @@ import { runtimePolicy } from '../runtime-policy.ts';
 import type { Lifecycle } from '../role-manifest.ts';
 import { toolError, ToolError } from '../tool-error.ts';
 import { readTaskPrompt } from '../prompt-store.ts';
-import { pipeNameFor, pipePathFor, pipeRequestTo, type PipeRequest, type PipeResponse } from '../pipe-channel.ts';
 import type { PaneStateSlot } from './bg-job.ts';
-import { bareSessionId, resolveSessionFileValue } from '../session-tail.ts';
+import { bareSessionId } from '../session-tail.ts';
 import { mainWorktreeRoot } from '../storage-layout.ts';
-import { settlementCard, type SettlementCard } from '../settlement-card.ts';
+import type { SettlementCard } from '../settlement-card.ts';
 import { DELEGATION_ENV, type DelegationContext } from '../delegation-core.ts';
 import { createGitIo, createSpawnAction, createSpawner } from '../subagent-spawn.ts';
 import { createCheckoutIo, createCheckoutSpace } from '../worktree-io.ts';
@@ -98,7 +96,6 @@ export interface SubagentDeps {
   getCwd?: () => string;
   /** Test seam: tasks the session starts out holding, as a restore would have seeded them. */
   initialTasks?: TaskEntry[];
-  claimSettleNotice: (key: string) => boolean;
   /** Settlement notice injector from index: buffer while busy, flush at turn_end. */
   deliverNotice?: (content: string, paneId?: string, card?: SettlementCard | null) => Promise<void>;
   /** Panes whose settlement notice is still buffered (GC exemption). */
@@ -273,7 +270,7 @@ export default function subagentPlugin(ctx: Context): void {
   /** Read counters shown in `subagent output` headers (one monotonic number per worker). */
   const outputRevisions = new Map<string, number>();
   const lastRequestIdByPane = new Map<string, string>();
-  /** Pane id → its in-flight boot (pipe readiness, prompt injection); a follow-up waits for it. */
+  /** Pane id → its in-flight boot (readiness, first task); a follow-up waits for it. */
   const boots = new Map<string, Promise<void>>();
 
   /** Write one task record: the task, its current generation and its decision. */
@@ -377,17 +374,6 @@ export default function subagentPlugin(ctx: Context): void {
   }
 
   const boundPort: SubagentPort = {
-    applyReplySession(paneId, sessionFile) {
-      const entry = taskForPane(tasks, panes, paneId);
-      if (!entry) return;
-      // Workers self-report a BARE session id over the pipe; the .jsonl-only guard in applyReportedSessionFile
-      // would discard it and freeze a mis-attributed sessionFile forever, so map the id to its transcript path.
-      const reported = resolveSessionFileValue(entry.cwd, defaultAgentSessionsDir(), sessionFile);
-      const next = applyReportedSessionFile(entry.gen.sessionFile, reported);
-      if (next === entry.gen.sessionFile) return;
-      entry.gen.sessionFile = next;
-      writeRecord(entry);
-    },
     listRunningSubs() {
       // The widget shows the tasks still awaiting a report. The state text comes from the last
       // observation, defaulting to the zero-observation base a fresh spawn shares (S26).
@@ -401,26 +387,6 @@ export default function subagentPlugin(ctx: Context): void {
           startedAt: s.createdAt,
           description: s.description,
         }));
-    },
-    settlementCard(paneId, outcome) {
-      const entry = taskForPane(tasks, panes, paneId);
-      return settlementCard({
-        name: entry ? `${paneId} (${entry.description})` : paneId,
-        ...(entry ? { kind: entry.kind, startedAt: entry.createdAt } : {}),
-        outcome,
-      });
-    },
-    consumeReply(paneId, _outcome, docAt) {
-      const entry = taskForPane(tasks, panes, paneId);
-      if (!entry || entry.gen.consumedAt !== null || isClosed(entry)) return;
-      entry.gen.consumedAt = Date.now();
-      // The pipe delivered this settlement, and the reply names the document it settled: record it,
-      // or a follow-up (which clears `consumedAt` and re-arms a watch) would read the same report as
-      // the new request's answer (S7).
-      if (typeof docAt === 'number') entry.deliveredReport = { address: paneId, at: docAt };
-      writeRecord(entry);
-      // S54: a one-shot worker exits right after this push; its pane goes now, not at the GC TTL.
-      if (entry.lifecycle === 'one-shot') reclaim(entry);
     },
   };
   port.current = boundPort;
@@ -577,7 +543,8 @@ export default function subagentPlugin(ctx: Context): void {
     const argv = launchParts(resumeFile, null, null, approve);
     const lifecycle = roleLifecycle(entry.kind);
     // Admission, not readiness: the slot is held only while the pane is created, so a revive still
-    // waiting for its pipe cannot starve a spawn (S50). The wait below runs outside the slot.
+    // waiting for its agent to report ready cannot starve a spawn (S50). The wait below runs outside
+    // the slot.
     const spawned = await withAdmission(subSemaphore, () => spawnPaneInTaskTab(
       {
         desiredTab: entry.gen.tabName || latest.gen.tabName || null,
@@ -827,6 +794,25 @@ export default function subagentPlugin(ctx: Context): void {
       const verdict = spentText(latest);
       if (verdict !== null) return toolError(verdict);
     }
+    // S18: the worker's session identity comes from the core's `hresume` label, written by the
+    // worker's own Herdr extension. The record already carries it when a settlement document reported
+    // a `session`, and a pane that is still alive can report it now; with neither, a resume would start
+    // a fresh conversation under the old task's name — refuse instead of pretending.
+    const reported = latest.gen.sessionFile ? null : await session.reportedSessionFile(latest.gen.paneId);
+    if (!latest.gen.sessionFile && reported) {
+      latest.gen.sessionFile = reported;
+      // The record is what a later resume reads, so the report is written down the moment it is used.
+      writeTaskRecord(latest.cwd, latest);
+    }
+    if (!latest.gen.sessionFile) {
+      const where = latest.gen.paneId ? `its terminal ${latest.gen.paneId} carries no \`hresume\` label` : 'it has no pane left';
+      return toolError(
+        `Error: task ${taskId} has no session to resume: the record holds none, ${where}, and no `
+        + 'settlement document for it reported a `session`. Resuming without one would start a fresh '
+        + 'conversation that knows nothing of this task. '
+        + `Start the work again with action "spawn" (or action "retry" to re-send task ${taskId}'s brief).`,
+      );
+    }
     // D94: reuse an existing pane for the same session to avoid competing pi processes. This
     // lookup only reads terminal labels, so it runs before the ownership check below.
     const existing = await findExistingPane(latest.gen.sessionFile);
@@ -868,7 +854,7 @@ export default function subagentPlugin(ctx: Context): void {
       }
       const how = existing
         ? 'reused existing pane with same session; pi still running there'
-        : entry.gen.sessionFile ? 'session restored' : 'session file missing; fresh conversation';
+        : 'session restored';
       return {
         content: [{ type: 'text', text: `resumed subagent ${taskRef(entry.gen)} from task ${taskId} (${how}).` }],
         details: { paneId: entry.gen.paneId, taskId },
@@ -877,86 +863,6 @@ export default function subagentPlugin(ctx: Context): void {
       if (err instanceof ToolError) throw err;
       return toolError(`Error: failed to resume task "${taskId}": ${(err as Error).message}`);
     }
-  }
-
-  /** The shared spine of every id-carrying action: revive a closed row, wait for its pipe, send one request,
-   *  fold failures into the error wording. `interrupt` passes `ready: false`: a worker with no turn in
-   *  flight is refused before the pipe instead of being woken to receive a stop. */
-  async function pipeAction(
-    entry: TaskEntry,
-    opts: {
-      /** One request from the closed pipe protocol; its `type`/`id` drive the reply and settle keys. */
-      build(): PipeRequest;
-      ok(res: Extract<PipeResponse, { type: 'ok' }>, reqId: string): unknown;
-      fail?(paneId: string): string;
-      ready?: false;
-    },
-  ): Promise<unknown> {
-    const t0 = Date.now();
-    const trace = (step: string): void => {
-      if (process.env.PIHER_PIPE_TRACE === '1') console.error(`piher: pipeAction ${step} +${Date.now() - t0}ms`);
-    };
-    try {
-      if (opts.ready !== false) {
-        // A just-spawned worker is still booting: its prompt must reach it before any follow-up.
-        const boot = boots.get(entry.gen.paneId);
-        if (boot) {
-          await boot;
-          trace('boot');
-        }
-      }
-      const payload = opts.build();
-      let res: PipeResponse;
-      try {
-        // The pipe IS the liveness proof: a worker that answers it is alive, so a healthy `send` is
-        // one round trip with no liveness RPC and no terminal read in front of it.
-        res = await pipeRequestTo(entry.cwd, entry.gen.paneId, payload);
-      } catch (err) {
-        if (opts.ready === false) throw err;
-        // A pipe that did not answer may mean the pane is gone: revive it, and only a pane made right
-        // now is worth waiting for readiness. A pane that was already alive is not "starting": it has
-        // no listener, and spending the 90 s readiness budget on it turns a dead channel into a
-        // timeout that reads like a slow boot.
-        const revived = await ensureLive(entry);
-        trace(revived ? 'recovered-liveness' : 'alive-no-pipe');
-        if (revived) {
-          const ready = await waitReady(entry.gen.paneId);
-          trace('recovered-ready');
-          if (!ready.ok) throw new Error(ready.message);
-        }
-        try {
-          res = await pipeRequestTo(entry.cwd, entry.gen.paneId, payload);
-        } catch (retryErr) {
-          throw new Error(await pipeUnreachableText(entry, retryErr));
-        }
-      }
-      trace('delivered');
-      if (res.type !== 'ok') {
-        throw new Error(`pipe ${payload.type} rejected: ${res.type === 'error' ? res.message : 'unknown response'}`);
-      }
-      return opts.ok(res, payload.id);
-    } catch (err) {
-      const what = opts.fail?.(entry.gen.paneId) ?? `failed to reach subagent ${entry.gen.paneId}`;
-      return toolError(`Error: ${what}: ${(err as Error).message}`);
-    }
-  }
-
-  /** Why a live pane did not take the request: a ping separates "nothing listens" (its extension
-   *  host is not running, so the message was lost) from "listens but did not answer" (busy or
-   *  rejecting). Both are honest; "retry is safe" is only true for the second. */
-  async function pipeUnreachableText(entry: TaskEntry, err: unknown): Promise<string> {
-    const path = pipePathFor(pipeNameFor(entry.cwd, entry.gen.paneId));
-    let listening = false;
-    try {
-      listening = (await pipeRequestTo(entry.cwd, entry.gen.paneId, { type: 'ping', id: `ping-${Date.now()}` }, 2_000)).type === 'ok';
-    } catch {
-      listening = false;
-    }
-    const head = `subagent pane ${entry.gen.paneId} is alive but its message channel is dead (${path})`;
-    const detail = String((err as Error)?.message ?? err);
-    return listening
-      ? `${head}: it answers a ping but did not take this request (${detail}). Nothing was confirmed delivered — check the pane before resending.`
-      : `${head}: nothing answers there, so the worker's extension host is not running and NOTHING was delivered (${detail}). action "resume" with taskId ${entry.taskId} restarts it in a new pane; action "close" retires the row.`;
   }
 
   /** Re-arm a row for the turn a steer started: keeping the old consume time would read as a worker
@@ -1092,8 +998,8 @@ export default function subagentPlugin(ctx: Context): void {
     const { entry } = targetOf(params, toolCtx);
     // Interrupt stops the current turn and nothing else. A closed task is final; otherwise the
     // probe decides — a worker with no turn in flight has nothing to stop, and naming `close`
-    // points at the natural next step instead of a wait. A probe that fails never refuses: the
-    // pipe attempt itself is the honest test.
+    // points at the natural next step instead of a wait. A probe that fails never refuses: the core
+    // call below is the honest test.
     // No ownership refusal here: `close` refuses a worker with a turn in flight and points at
     // `interrupt`, so refusing `interrupt` across sessions would make another session's stuck
     // worker impossible to end. Interrupting writes no document and adopts nothing.
@@ -1104,6 +1010,7 @@ export default function subagentPlugin(ctx: Context): void {
         + `Close is final for task ${entry.taskId} — start a new subagent for further work.`,
       );
     }
+    // Nothing left in piher can stop a turn without the core: the interrupt IS a core call now.
     let probe: AliveProbe;
     try {
       probe = await probeAlive(entry.gen.paneId, entry.cwd);
@@ -1125,16 +1032,30 @@ export default function subagentPlugin(ctx: Context): void {
         + `and taskId ${entry.taskId}.`,
       );
     }
-    return pipeAction(entry, {
-      ready: false,
-      build: () => ({ type: 'interrupt', id: `int-${Date.now()}` }),
-      ok: () => {
-        // No settlement notice for an interrupted turn: the requester already knows.
-        const lastId = lastRequestIdByPane.get(entry.gen.paneId);
-        if (lastId) d.claimSettleNotice(`${entry.gen.paneId}:${lastId}`);
-        return { content: [{ type: 'text', text: `Interrupt accepted for subagent ${taskRef(entry.gen)} (fire-and-return).` }], details: { paneId: entry.gen.paneId } };
-      },
-    });
+    // Nothing left in piher can stop a turn without the core, and a worker with no turn in flight is
+    // refused above by what the core said — this is the last point the core is still needed.
+    if (!client.available) return toolError(`subagent: ${CORE_REQUIRED}`);
+    // P5 (spec S19): the core's own `terminal.interrupt` is the only place left to stop a turn. The
+    // private socket that used to carry this frame is gone, and `terminal.keys` is not a substitute:
+    // it pastes bytes into the TUI, and what ESC does there belongs to pi's input handling, not to
+    // this action. The core reports what happened to the turn, so the result states it.
+    try {
+      const outcome = await client.interrupt(entry.gen.paneId);
+      // A core that will not say what happened to the turn is not a failure of the interrupt: the
+      // request went out. The result says which of the two it is (spec S17 keeps the core the
+      // authority on an ending, so nothing here is inferred).
+      const detail = outcome === 'still_working'
+        ? ' The core reports the turn still running; it was asked to stop.'
+        : outcome === 'exited'
+          ? ' Its process had already exited.'
+          : outcome === 'stopped' ? ' The core reports the turn stopped.' : '';
+      return {
+        content: [{ type: 'text', text: `Interrupt accepted for subagent ${taskRef(entry.gen)} (fire-and-return).${detail}` }],
+        details: { paneId: entry.gen.paneId },
+      };
+    } catch (err) {
+      return toolError(`Error: failed to interrupt subagent ${entry.gen.paneId}: ${(err as Error).message}`);
+    }
   }
 
   /** S53: reclaim a worker that already finished. `close` is not `cancel`: a worker that is still
@@ -1283,7 +1204,7 @@ export default function subagentPlugin(ctx: Context): void {
       return next;
     },
     // Transcript fallback: small worker panes show only the opaque status overlay, so the pane delta can never
-    // carry the final report. No preferred file — start from the worker's `piher.session` label, not a stale registry value.
+    // carry the final report. No preferred file — start from the worker's own `hresume` report, not a stale registry value.
     readFinalReport: async (paneId: string, entryCwd: string) =>
       (await session.readTurnClosing(paneId, entryCwd, 0)).text,
     writeRecord,

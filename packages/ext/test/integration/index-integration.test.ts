@@ -3,13 +3,12 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import extension from '../../src/index.ts';
-import { pipeNameFor, pipePathFor, pipeRequestTo, startPipeServer, type PipeRequest, type PipeResponse } from '../../src/pipe-channel.ts';
 import { sessionDirName } from '../../src/storage-layout.ts';
 import { WIDGET_MAX_LINES } from '../../src/tree-view.ts';
 import { fakePi, fire, jsonl, seedTaskDocuments, transcriptMessage, withCleanup, type CleanupContext, type FakePi } from '../test-utils.ts';
@@ -176,198 +175,87 @@ test('index: /piher-config reports configuration and hands a guided change to th
 }));
 
 test('index: turn_start resets lastStopReason (A11) so a stale abort cannot swallow the next settlement', withCleanup(async (cleanup) => {
-  const paneId = 'p_a11_test';
-  const pi = await mountIndex(cleanup, 'master', { HC_TERMINAL_SOCKET: '/tmp/piher-test-sock-a11', HC_TERMINAL_ID: paneId });
+  // A worker reports by writing its document, and `reportsSettlement` is what decides whether a
+  // settle has anything to report at all: a stale `aborted` left in `lastStopReason` would silence
+  // the next, genuine settle. That is the A11 regression, observed where it now shows.
+  const pane = 'p_a11_test';
+  const home = cleanup.tempDir('piher-a11-home').path;
   const cwd = cleanup.tempDir('piher-a11-ws').path;
-  const ctx = { cwd, sessionManager: { getBranch: () => [] } };
-
-  try {
-    await fire(pi, 'session_start', { reason: 'new' }, ctx);
-
-    // Turn 1 was aborted by the user (ESC), so the abort latch is set on purpose: a child settling
-    // right after must NOT wake the agent (D92).
-    await fire(pi, 'turn_start');
-    await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'aborted' } }, ctx);
-    await fire(pi, 'agent_settled', {}, ctx);
-
-    // Turn 2 ends without a stopReason (the narrow window A11 is about): pre-fix the stale
-    // "aborted" survives and the notice arriving in the settle gap is buffered forever.
-    await fire(pi, 'turn_start');
-    await fire(pi, 'turn_end', {}, ctx);
-    const res = await pipeRequestTo(cwd, paneId, { type: 'reply', id: 'r-a11', paneId: 'p_child', text: 'child finished', sessionFile: null });
-    assert.equal(res.type, 'ok');
-    assert.equal(pi.userSent.length, 0, 'a notice arriving mid-settle is buffered, not injected');
-
-    await fire(pi, 'agent_settled', {}, ctx);
-    assert.equal(pi.userSent.length, 1, 'the buffered notice must reach the user when the turn settles');
-    assert.match(pi.userSent[0]!.content, /child finished/);
-    assert.deepEqual(pi.userSent[0]!.opts, { deliverAs: 'followUp', triggerTurn: true });
-  } finally {
-    await fire(pi, 'session_shutdown'); // close the pipe server even when an assertion fails
-  }
-}));
-
-test('index: before_agent_start marks the run busy so settlement notices enter the D92 buffer', withCleanup(async (cleanup) => {
-  const paneId = 'p_busy_start';
-  const pi = await mountIndex(cleanup, 'master', { HC_TERMINAL_SOCKET: '/tmp/piher-test-sock-busy', HC_TERMINAL_ID: paneId });
-  const cwd = cleanup.tempDir('piher-busy-ws').path;
-  const ctx = { cwd, sessionManager: { getBranch: () => [] } };
-  try {
-    await fire(pi, 'session_start', { reason: 'new' }, ctx);
-    // pi 1.2 counts the run as busy here, before turn_start fires.
-    await fire(pi, 'before_agent_start', { messageType: 'user', prompt: 'start', systemPromptOptions: { sections: {} } });
-    const res = await pipeRequestTo(cwd, paneId, { type: 'reply', id: 'r-busy-start', paneId: 'p_child', text: 'child finished', sessionFile: null });
-    assert.equal(res.type, 'ok');
-    assert.equal(pi.userSent.length, 0, 'a notice arriving during the start window is buffered');
-    await fire(pi, 'agent_settled', {}, ctx);
-    assert.equal(pi.userSent.length, 1, 'the buffered notice flushes once the run settles');
-  } finally {
-    await fire(pi, 'session_shutdown');
-  }
-}));
-
-test('settle fast-path (D49): an aborted settle keeps the machine request armed; the genuine settle pushes the reply', withCleanup(async (cleanup) => {
-  const childPane = 'p_settle_child';
-  // Own transcript under the temp agent home so the genuine settle finds its closing text.
-  const home = cleanup.tempDir('piher-settle-home').path;
-  const cwd = cleanup.tempDir('piher-settle-ws').path;
-  const parentCwd = cleanup.tempDir('piher-settle-parent').path;
-  const pi = await mountIndex(cleanup, 'master', {
-    HC_TERMINAL_SOCKET: '/tmp/piher-test-sock-settle',
-    HC_TERMINAL_ID: childPane,
-    PI_CODING_AGENT_DIR: home,
-    PI_SESSION_FILE: 'smoke-sess-0001',
-  });
-  const ctx = { cwd, sessionManager: { getBranch: () => [] }, isIdle: () => true };
-  const replies: PipeRequest[] = [];
-  const replyArrived = Promise.withResolvers<void>();
-  const parent = startPipeServer(pipeNameFor(parentCwd, 'p_settle_parent'), (req) => {
-    replies.push(req);
-    replyArrived.resolve();
-    return Promise.resolve({ type: 'ok', id: req.id });
-  });
-
-  try {
-    await fire(pi, 'session_start', { reason: 'new' }, ctx);
-    const prompted = await pipeRequestTo(cwd, childPane, {
-      type: 'prompt', id: 'prompt-smoke', text: 'go', from: pipeNameFor(parentCwd, 'p_settle_parent'),
-    });
-    assert.equal(prompted.type, 'ok');
-
-    // The run "settles" on an abort (a user ESC): pre-fix this consumed the request with a
-    // null-text reply, so the worker's real closing message could never be delivered.
-    await fire(pi, 'turn_start');
-    await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'aborted' } }, ctx);
-    await fire(pi, 'agent_settled', {}, ctx);
-    assert.equal(replies.length, 0, 'an aborted settle must not answer the machine request');
-
-    // A provider error is retried by pi: it is not a settlement either, and answering would consume
-    // the one-shot request with a null-text reply before the retry delivers the real closing message.
-    await fire(pi, 'turn_start');
-    await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'error' } }, ctx);
-    await fire(pi, 'agent_settled', {}, ctx);
-    assert.equal(replies.length, 0, 'an error stop must keep the machine request armed');
-
-    // The continuation run genuinely settles: the still-armed request now carries the real text.
-    await fire(pi, 'turn_start');
-    await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'stop' } }, ctx);
-    const sessDir = join(home, 'sessions', sessionDirName(process.cwd()));
-    await mkdir(sessDir, { recursive: true });
-    await writeFile(
-      join(sessDir, '2026-09-22T00-00-00-000Z_smoke-sess-0001.jsonl'),
-      jsonl(
-        { type: 'session', id: 'smoke-sess-0001' },
-        transcriptMessage('assistant', 'services stopped, tree clean; the full report is in /tmp/report.md', Date.now() + 1000),
-      ),
-    );
-    await fire(pi, 'agent_settled', {}, ctx);
-    // pushSettleReply is fire-and-forget, and the reply crosses a real unix socket: await the
-    // arrival signal with a deadline (deterministic time control cannot cross a socket).
-    const deadline = setTimeout(() => replyArrived.reject(new Error('settle reply did not arrive within 2s')), 2000);
-    deadline.unref?.();
-    await replyArrived.promise;
-    clearTimeout(deadline);
-    assert.equal(replies.length, 1, 'exactly one settle reply, from the genuine settle');
-    const reply = replies[0]!;
-    assert.ok(reply.type === 'reply', `expected a reply, got ${reply.type}`);
-    assert.equal(reply.id, 'prompt-smoke');
-    assert.match(reply.text ?? '', /full report is in/);
-    assert.equal(reply.paneId, childPane);
-  } finally {
-    parent.close();
-    await fire(pi, 'session_shutdown'); // close the child's pipe server even when an assertion fails
-  }
-}));
-
-test('S54 one-shot lifetime: the report reaches the parent before the worker shuts down', withCleanup(async (cleanup) => {
-  const childPane = 'p_oneshot_child';
-  const home = cleanup.tempDir('piher-oneshot-home').path;
-  const cwd = cleanup.tempDir('piher-oneshot-ws').path;
-  const parentCwd = cleanup.tempDir('piher-oneshot-parent').path;
-  const replies: PipeRequest[] = [];
-  /** Reply count observed at the moment the worker asked to exit — the ordering, measured. */
-  const repliesAtShutdown: number[] = [];
-  const replyArrived = Promise.withResolvers<void>();
-  const parent = startPipeServer(pipeNameFor(parentCwd, 'p_oneshot_parent'), (req) => {
-    replies.push(req);
-    replyArrived.resolve();
-    return Promise.resolve({ type: 'ok', id: req.id });
-  });
+  const sockDir = cleanup.tempDir('piher-a11-sock').path;
+  const core = await mountSettleCore(join(sockDir, 'core.sock'), 1);
   const pi = await mountIndex(cleanup, 'worker', {
-    HC_TERMINAL_SOCKET: '/tmp/piher-test-sock-oneshot',
-    HC_TERMINAL_ID: childPane,
+    HC_TERMINAL_SOCKET: join(sockDir, 'core.sock'),
+    HC_TERMINAL_ID: pane,
     PI_CODING_AGENT_DIR: home,
-    PI_SESSION_FILE: 'oneshot-sess-0001',
     PIHER_DELEGATION: JSON.stringify({
-      parentPaneId: 'p_oneshot_parent',
-      parentSessionId: 'aaaa1111',
-      taskId: 't-oneshot',
-      description: 'review the diff',
-      role: 'reviewer',
-      lifecycle: 'one-shot',
+      parentPaneId: 'p_parent', parentSessionId: 'aaaa1111', taskId: 't-a11',
+      description: 'a11 probe', role: 'worker-default', lifecycle: 'persistent',
     }),
   });
-  const ctx = {
-    cwd,
-    sessionManager: { getBranch: () => [] },
-    isIdle: () => true,
-    shutdown: () => { repliesAtShutdown.push(replies.length); },
-  };
+  const ctx = { cwd, sessionManager: { getBranch: () => [] } };
   try {
     await fire(pi, 'session_start', { reason: 'new' }, ctx);
-    const prompted = await pipeRequestTo(cwd, childPane, {
-      type: 'prompt', id: 'prompt-oneshot', text: 'review it', from: pipeNameFor(parentCwd, 'p_oneshot_parent'),
-    });
-    assert.equal(prompted.type, 'ok');
+    // Turn 1 was aborted by the user (ESC): an aborted settle reports nothing, by design.
+    await fire(pi, 'turn_start');
+    await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'aborted' } }, ctx);
+    await fire(pi, 'agent_settled', {}, ctx);
 
+    // Turn 2 ends without a stopReason, the narrow window A11 is about: a stale `aborted` would
+    // survive here and silence this settle as if it had been cancelled too.
+    await fire(pi, 'turn_start');
+    await fire(pi, 'turn_end', {}, ctx);
+    await fire(pi, 'agent_settled', {}, ctx);
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline && core.docs.length === 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(core.docs.length, 1, `the genuine settle reported (core calls: ${core.calls.join(',')})`);
+  } finally {
+    await fire(pi, 'session_shutdown');
+    await core.close();
+  }
+}));
+
+/* ── P5: no listener, no watchdog (spec S19) ─────────────────────── */
+
+test('P5: a worker session_start opens no listener and starts no interval', withCleanup(async (cleanup) => {
+  const pane = 'p_nolisten';
+  const cwd = cleanup.tempDir('piher-nolisten-ws').path;
+  const pi = await mountIndex(cleanup, 'worker', {
+    HC_TERMINAL_SOCKET: '/tmp/piher-test-sock-nolisten',
+    HC_TERMINAL_ID: pane,
+  });
+  const ctx = { cwd, sessionManager: { getBranch: () => [] } };
+
+  /** Socket files the core's socket namespace holds: a listener is the one thing that puts one there. */
+  const socketsNow = (): string[] => readdirSync(tmpdir()).filter((name) => name.startsWith('piher-') && name.endsWith('.sock'));
+  const socketsBefore = socketsNow();
+  /** Every interval the mount starts, so a leftover watchdog cannot hide behind another name. */
+  const intervals: number[] = [];
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = ((fn: () => void, ms?: number, ...rest: unknown[]) => {
+    intervals.push(Number(ms ?? 0));
+    return (realSetInterval as unknown as (...a: unknown[]) => unknown)(fn, ms, ...rest);
+  }) as typeof setInterval;
+  try {
+    await fire(pi, 'session_start', { reason: 'new' }, ctx);
     await fire(pi, 'turn_start');
     await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'stop' } }, ctx);
-    const sessDir = join(home, 'sessions', sessionDirName(process.cwd()));
-    await mkdir(sessDir, { recursive: true });
-    await writeFile(
-      join(sessDir, '2026-09-22T00-00-00-000Z_oneshot-sess-0001.jsonl'),
-      jsonl(
-        { type: 'session', id: 'oneshot-sess-0001' },
-        transcriptMessage('assistant', 'Verdict: one bug, two nits — details in the report.', Date.now() + 1000),
-      ),
-    );
     await fire(pi, 'agent_settled', {}, ctx);
-    const deadline = setTimeout(() => replyArrived.reject(new Error('settle reply did not arrive within 2s')), 2000);
-    deadline.unref?.();
-    await replyArrived.promise;
-    clearTimeout(deadline);
-    // The exit hangs off the push, so the shutdown lands after it: wait (bounded) for the exit.
-    for (let i = 0; i < 50 && repliesAtShutdown.length === 0; i += 1) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
-    assert.deepEqual(repliesAtShutdown, [1], 'the report was already at the parent when the worker asked to exit');
-    const reply = replies[0]!;
-    assert.ok(reply.type === 'reply', `expected a reply, got ${reply.type}`);
-    assert.match(reply.text ?? '', /Verdict: one bug, two nits/);
   } finally {
-    parent.close();
+    globalThis.setInterval = realSetInterval;
     await fire(pi, 'session_shutdown');
   }
+
+  // The private socket is gone: this session put nothing in the socket namespace, and no file names
+  // this worker's pane either.
+  assert.deepEqual(socketsNow(), socketsBefore, 'session_start registered no listener (spec S19)');
+  assert.equal(
+    socketsNow().filter((name) => name.includes(`-${pane}.`)).length,
+    0,
+    'no /tmp/piher-* socket exists for this worker',
+  );
+  assert.deepEqual(intervals, [], 'session_start arms no interval (the 10 s pipe watchdog is gone)');
 }));
 
 /* ── settle without a pipe frame (P2: the first task rides the core, spec S14) ── */
@@ -683,13 +571,31 @@ test('widget: follows restored tasks, master renders it alone', withCleanup(asyn
 
     // No delegation tree command: the widget is the only delegation surface now.
     assert.ok(!master.commands.has('piher-tree'), 'no piher-tree command is registered');
+  } finally {
+    await fire(master, 'session_shutdown');
+  }
+}));
 
-    // A settlement (pipe reply → consumed row) takes the widget down at the next settle.
-    const reply = await pipeRequestTo(cwd, 't1', { type: 'reply', id: 'reply-tree', paneId: 'w2', text: 'done', sessionFile: null });
-    assert.equal(reply.type, 'ok');
-    await fire(master, 'agent_settled', {}, ctx);
-    // Nothing runs any more, so the strip is removed rather than left as an empty widget (pi keeps an
-    // empty array on screen as a stray blank line; undefined is how a widget is taken down).
+test('widget: a settled row is history, so the master paints no widget for it', withCleanup(async (cleanup) => {
+  const cwd = cleanup.tempDir('piher-tree-settled').path;
+  mkdirSync(join(cwd, '.git'), { recursive: true });
+  const sessionFile = join(cleanup.tempDir('piher-tree-settled-sess').path, '2026-01-01T00-00-00-000Z_ffffffff-0000-4000-8000-000000000000.jsonl');
+  seedTaskDocuments(sessionFile, [{
+    taskId: 'task-1', paneId: 'w2', slug: 'harden-pipe', description: 'harden pipe channel', kind: 'worker',
+    cwd, createdAt: Date.now() - 120_000, consumedAt: Date.now() - 60_000,
+  }]);
+  const widgets: Array<{ id: string; lines: string[] | undefined }> = [];
+  const master = await mountIndex(cleanup, 'master', { HC_TERMINAL_SOCKET: '/tmp/piher-test-sock-settled', HC_TERMINAL_ID: 't1' });
+  try {
+    const ctx = {
+      cwd,
+      ui: { setWidget: (id: string, lines: string[] | undefined) => { widgets.push({ id, lines }); } },
+      sessionManager: { getBranch: () => [], getSessionFile: () => sessionFile },
+    };
+    await fire(master, 'session_start', { reason: 'new' }, ctx);
+    await fire(master, 'turn_end', { message: { role: 'assistant', stopReason: 'stop' } }, ctx);
+    // A consumed row has reported: nothing is running, so the strip is removed rather than left as an
+    // empty widget (pi keeps an empty array on screen as a stray blank line; undefined takes it down).
     assert.equal(widgets.at(-1)?.lines, undefined, 'an idle master carries no agent widget');
   } finally {
     await fire(master, 'session_shutdown');
@@ -832,81 +738,6 @@ test('worker settle: the report document is written with no request pending, sta
   });
 }));
 
-test('worker settle: a one-shot worker waits for its document write before shutting down', withCleanup(async (cleanup) => {
-  const agentDir = cleanup.tempDir('piher-oneshot-agent').path;
-  // The worker's pipe is derived from its cwd, so the harness owns a checkout of its own.
-  const cwd = cleanup.tempDir('piher-oneshot-cwd').path;
-  const sessionFile = join(agentDir, '2026-01-01T00-00-00-000Z_bbbbbbbb-0000-4000-8000-000000000000.jsonl');
-  const masterPipe = pipeNameFor(cwd, 'tm');
-  const replies: PipeRequest[] = [];
-  const order: string[] = [];
-  const master = startPipeServer(masterPipe, async (req) => {
-    replies.push(req);
-    order.push(req.type);
-    return { type: 'ok', id: req.id };
-  });
-  await new Promise<void>((resolve) => master.once('listening', resolve));
-  try {
-    await withWorkerCore(order, async (socketPath, calls) => {
-      const pi = await mountIndex(cleanup, 'core-worker', {
-        HC_TERMINAL_SOCKET: socketPath,
-        HC_TERMINAL_ID: 't2',
-        PI_CODING_AGENT_DIR: agentDir,
-        PI_SESSION_FILE: sessionFile,
-        PIHER_DELEGATION: JSON.stringify({
-          taskId: 'task-one-shot', description: 'one-shot worker', role: 'worker', lifecycle: 'one-shot',
-        }),
-      });
-      const shutdowns: string[] = [];
-      const ctx = {
-        cwd,
-        shutdown: () => { shutdowns.push(calls.map((c) => c.method).join(',')); },
-        sessionManager: { getBranch: () => [], getSessionFile: () => sessionFile },
-      };
-      try {
-        await fire(pi, 'session_start', { reason: 'new' }, ctx);
-        // A master request over the worker's pipe: the settle push has somewhere to go, which is what
-        // S54 hangs the one-shot exit off.
-        let prompted: PipeResponse | null = null;
-        const deadline = Date.now() + 5_000;
-        while (prompted === null && Date.now() < deadline) {
-          prompted = await pipeRequestTo(cwd, 't2', { type: 'prompt', id: 'pr-1', text: 'do the thing', from: masterPipe }, 1_000)
-            .catch(() => null);
-        }
-        assert.equal(prompted?.type, 'ok', 'the worker served its pipe prompt');
-        // The transcript is written inside the request boundary, so the settle has words to deliver.
-        writeFileSync(sessionFile, jsonl(transcriptMessage('assistant', 'REPORT: one-shot done', Date.now())));
-
-        await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'stop' } }, ctx);
-        await fire(pi, 'agent_settled', {}, ctx);
-        await waitFor(() => shutdowns.length === 1);
-        assert.equal(shutdowns.length, 1, 'the one-shot worker exits once its report is out');
-        assert.match(shutdowns[0]!, /doc\.set/, 'the document write completed before the shutdown');
-        const reply = replies.find((r) => r.type === 'reply');
-        assert.ok(reply, 'the pipe push went out too');
-        const value = calls.find((c) => c.method === 'doc.set')!.params.value as { text: string | null; at: number };
-        assert.equal(value.text, 'REPORT: one-shot done');
-        // The document is on disk BEFORE the reply leaves the worker: the master reclaims a
-        // one-shot worker's pane as soon as it handles that reply, so a write still in flight would be
-        // cut short and the durable document S6/S12 rely on would never exist (finding 4).
-        const setAt = order.indexOf('doc.set');
-        const replyAt = order.indexOf('reply');
-        assert.ok(setAt >= 0, 'the document was written');
-        assert.ok(setAt < replyAt, `doc.set (${setAt}) precedes the reply (${replyAt}): ${order.join(',')}`);
-        // The reply names the very document it settles, which is how the master records the delivery
-        // as an identity instead of comparing its own clock with the worker's (spec S7).
-        assert.equal((reply as { docAt?: number }).docAt, value.at,
-          'the reply carries the settlement document identity');
-      } finally {
-        await fire(pi, 'session_shutdown');
-      }
-    });
-  } finally {
-    await new Promise<void>((resolve) => master.close(() => resolve()));
-    if (process.platform !== 'win32') rmSync(pipePathFor(masterPipe), { force: true });
-  }
-}));
-
 /* ── P3: a send reaches the worker as a command document (spec S15, S23, S24) ── */
 
 interface DocCall { method: string; params: Record<string, unknown> }
@@ -939,12 +770,17 @@ async function withDocCore(
   const server = createServer((sock) => {
     let buf = '';
     sock.setEncoding('utf8');
+    // A worker that goes away mid-write leaves an ECONNRESET on this socket. Without a listener it
+    // becomes an uncaught exception, which node:test reports as async activity after the test ended.
+    sock.on('error', () => { /* the subscriber is gone: its entry is dropped on 'close' */ });
     let seq = 0;
     const subscription = (params: Record<string, unknown>): { params: Record<string, unknown>; notify: (name: string, version: number) => void } => {
       const entry = {
         params,
         notify: (name: string, version: number): void => {
           seq += 1;
+          // Nothing is notified on a socket nobody is reading any more.
+          if (!sock.writable) return;
           // The measured notification payload (hc 0.1.20): the name and the version, never the value.
           sock.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'event', params: { seq, type: 'doc', data: { name, version } } })}\n`);
         },

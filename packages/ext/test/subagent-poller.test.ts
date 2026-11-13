@@ -156,6 +156,7 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
     readTurnClosing: async () => ({ text: null, why: null }),
     readAskFlag: async () => 'Which data source?',
     resolveSessionFile: async () => '/resolved/session.jsonl',
+    reportedSessionFile: async () => null,
     reattributeStaleSessionFile: async (_paneId: string, _cwd: string, _sinceTs: number, preferred: string | null) => reattributed ?? preferred,
     probeAlive: async () => ({ paneExists: true, agentStatus: 'working', lastActivityMs: 1 }),
   } satisfies SessionIo;

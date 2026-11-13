@@ -56,13 +56,12 @@ export function planSettleWake(input: SettleWakeInput): SettleWakePlan {
 }
 
 /**
- * Whether a just-settled run may answer its pending machine request (the pipe settle fast-path).
- * A user abort ('aborted') settles a run that may re-run, and an 'error' stop is an upstream
- * failure pi retries — answering then reports "finished, no closing message" for live work and
- * consumes the one-shot request plus the parent's claim latch, so the real closing message can
- * never be delivered.
+ * Whether a just-settled run has anything to report at all. A user abort ('aborted') settles a run
+ * that may re-run, and an 'error' stop is an upstream failure pi retries — reporting then says
+ * "finished, nothing to say" over live work, and a one-shot would exit on it, so the real closing
+ * message could never arrive.
  */
-export function shouldPushSettleReply(input: {
+export function reportsSettlement(input: {
   /** pi ≥ 1.1 agent_settled.aborted: the run was cancelled — the closing message may still come after a re-run. */
   aborted?: boolean;
   lastStopReason: string | null;

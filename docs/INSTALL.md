@@ -69,7 +69,7 @@ Hot reload while developing needs node's `--expose-internals` flag before pi's o
 | Herdr app closed | by design | core keeps the terminals; the sidebar is complete when it reopens |
 | core stopped or restarted | known limit | worker terminals are not re-created; `subagent resume` revives the task from its record |
 | `terminal.send` | human-first gate | core refuses to type into a blocked terminal; piher surfaces it as a tool error |
-| Human and machine on one pane | soft locks | machine messages use pipe-channel, the keyboard channel belongs to the human; core parent notes are off for workers |
+| Human and machine on one pane | soft locks | machine messages travel as core documents, the keyboard channel belongs to the human; core parent notes are off for workers |
 
 ## Tests
 

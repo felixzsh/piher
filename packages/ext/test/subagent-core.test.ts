@@ -415,16 +415,13 @@ test('subagent plugin: one tool, lifecycle hooks, port binding and unbinding', a
   assert.ok((pi.listeners.get('session_start') ?? []).length >= 1);
   assert.ok((pi.listeners.get('turn_start') ?? []).length >= 1, 'GC turn_start hook');
   assert.ok(port.current, 'port bound at mount');
-  const members = [
-    'applyReplySession', 'listRunningSubs', 'consumeReply', 'settlementCard',
-  ] as const;
-  for (const key of members) {
-
-    assert.equal(typeof port.current[key], 'function', `port member ${key}`);
-  }
+  assert.equal(typeof port.current.listRunningSubs, 'function', 'the port shows the running workers');
   const shape = port.current as unknown as Record<string, unknown>;
   assert.ok(!('listRows' in shape), 'the tree projection left the port');
-  port.current.applyReplySession('unknown', null);
+  // P5: the pipe is gone, and with it every port member that only served it.
+  for (const gone of ['applyReplySession', 'consumeReply', 'settlementCard']) {
+    assert.ok(!(gone in shape), `port member ${gone} went with the pipe`);
+  }
 
   // A cwd with no repository and no tasks: `list` answers from memory alone there.
   assert.match((await runSubagent(pi, { action: 'list' }, mkdtempSync(join(tmpdir(), 'piher-no-ledger-')))).content[0]!.text, /No subagents started/);

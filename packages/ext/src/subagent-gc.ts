@@ -7,8 +7,6 @@ import { basename } from 'node:path';
 import type { CoreClientLike, CoreEnv, TerminalInfo } from './core-client.ts';
 import {
   decideCheckoutSpaces,
-  planChannelCheck,
-  formatDeadChannelNotice,
   formatIdleCheckoutNotice,
   shouldClosePane,
   shouldCloseTaskTab,
@@ -17,7 +15,6 @@ import {
 import type { SettlementCard } from './settlement-card.ts';
 import { checkoutSpaceId, type CheckoutSpace } from './worktree.ts';
 import { sessionStatePath } from './session-state.ts';
-import { pipeRequestTo } from './pipe-channel.ts';
 import { runtimePolicy } from './runtime-policy.ts';
 import { sleep } from './subagent-core.ts';
 import {
@@ -126,8 +123,6 @@ export function createGcController(h: GcHost): GcController {
   let gcRunning = false;
   /** Path → the settlement a checkout reminder was already delivered for. */
   const remindedCheckouts = new Map<string, number>();
-  /** Panes whose dead channel was already announced: one notice per loss, cleared when it answers. */
-  const deadChannelNotified = new Set<string>();
 
   /** A checkout's space is nobody else's to sweep: close it when empty, and remind the master once
    *  about the window a finished-but-open worker left behind. Never ends a task, never ends a pane. */
@@ -246,42 +241,6 @@ export function createGcController(h: GcHost): GcController {
       await sleep(300);
     }
     await sweepCheckoutSpaces(ttlMs);
-    await sweepChannels(statuses);
-  }
-
-  /** A worker's message channel is what makes a follow-up possible at all. Ping it and say so once
-   *  when it is gone: the alternative is the master finding out on the next `send`, which is exactly
-   *  when the message matters. Never settles, never closes, never touches the row. */
-  async function sweepChannels(statuses: ReadonlyMap<string, string>): Promise<void> {
-    for (const e of [...h.tasks.values()]) {
-      if (!e.gen.paneId) continue;
-      const status = statuses.get(e.gen.paneId);
-      if (planChannelCheck({
-        closed: isClosed(e),
-        consumed: e.gen.consumedAt !== null,
-        terminalStatus: status,
-      }) === 'skip') continue;
-      // Past the planner the terminal is listed and reported: the notice may name its state.
-      const reported = status ?? 'unknown';
-      let ok = false;
-      try {
-        ok = (await pipeRequestTo(e.cwd, e.gen.paneId, { type: 'ping', id: `hb-${Date.now()}` }, 1_500)).type === 'ok';
-      } catch {
-        ok = false;
-      }
-      if (ok) {
-        deadChannelNotified.delete(e.gen.paneId);
-        continue;
-      }
-      if (deadChannelNotified.has(e.gen.paneId)) continue;
-      deadChannelNotified.add(e.gen.paneId);
-      try {
-        await h.deliverNotice?.(formatDeadChannelNotice({ paneId: e.gen.paneId, taskId: e.taskId, status: reported }), e.gen.paneId, null);
-      } catch {
-        /* the next pass re-announces: the latch is only set for a delivered notice */
-        deadChannelNotified.delete(e.gen.paneId);
-      }
-    }
   }
 
   async function runGcSafely(): Promise<void> {

@@ -355,14 +355,14 @@ export function createPoller(h: PollerHost): Poller {
     let recheckMs = MIN_RECHECK_PARK_MS;
     let lastStamp: string | null = null;
     /** Whether the row was already settled when this watch was armed. Such a watch was armed for
-     *  nothing and ends at once. A row settled WHILE the loop runs — by the pipe push, which is the
-     *  normal path — does not end it: that worker's next settle (a person typing in its pane, a
-     *  queued steer) writes a document, and S6 says the master must read it. */
+     *  nothing and ends at once. A row settled WHILE the loop runs does not end it: that worker's next
+     *  settle (a person typing in its pane, a queued steer) writes a document, and S6 says the master
+     *  must read it. */
     const armedConsumed = taskForPane(h.tasks, h.panes, paneId)?.gen.consumedAt !== null;
-    /** The generation's transcript can be mis-attributed at spawn (the `piher.session` label lags, and
-     *  the mtime fallback can adopt a PRE-EXISTING session), and that value is what `resume` restores
-     *  and an existing pane is matched by. Repair it from the core's own report while the worker is
-     *  here; a document's `session` field is the other, later repair. */
+    /** The generation's transcript can be mis-attributed at spawn (the `hresume` report lags, and the
+     *  mtime fallback can adopt a PRE-EXISTING session), and that value is what `resume` restores and an
+     *  existing pane is matched by. Repair it from the core's own report while the worker is here; a
+     *  document's `session` field is the other, later repair. */
     const repairSessionFile = async (entry: TaskEntry, sinceTs: number): Promise<void> => {
       if (!entry.gen.sessionFile) return;
       const fixed = await h.session.reattributeStaleSessionFile(paneId, cwd, sinceTs, entry.gen.sessionFile);
@@ -421,9 +421,9 @@ export function createPoller(h: PollerHost): Poller {
         }
         if (gate.kind === 'clear-gate') blockedNotified = false;
 
-        // A row settled while this loop ran — normally by the pipe push, which is the ordinary path —
-        // keeps one reader and nothing else: the worker's next settle (a person typing in its
-        // attachable pane, a queued steer) writes a document, and S6 says the master must read it.
+        // A row already settled when this loop reached it keeps one reader and nothing else: the
+        // worker's next settle (a person typing in its attachable pane, a queued steer) writes a
+        // document, and S6 says the master must read it.
         // The wait is the silence budget, not a poll cadence — a new settle changes the core's status
         // first, and that event wakes this park, so an idle worker costs no RPCs (a `doc` event is no
         // help: spec S23 keeps them off this subscription).

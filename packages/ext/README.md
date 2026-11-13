@@ -27,7 +27,7 @@ loads and both tools answer with that install command instead of running anythin
 | Commands | `/piher-role`, `/piher-config`, `/piher-locks` |
 | Skill | `piher-tools` — when to delegate, what a prompt must contain, the answer-or-`BLOCKED:` report contract |
 | Session entries | `piher.delegation`, `piher.settlement`, `piher.role-manifest`, `piher.job-exit`, `piher.config-guide` |
-| Terminal labels | `piher.session`, `piher.lock.<hash>` |
+| Terminal labels | `piher.lock.<hash>` (piher's own); `hresume` is the worker's, written by its Herdr extension |
 
 ## Package contents
 

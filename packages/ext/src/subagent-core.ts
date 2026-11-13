@@ -6,7 +6,6 @@
  */
 import { normalizeEntryKind, taskRef } from './task-row.ts';
 import { CORE_REQUIRED } from './core-client.ts';
-import type { SettlementCard, SettlementOutcome } from './settlement-card.ts';
 import type { WorkerWidgetRow } from './tree-view.ts';
 import { Type } from 'typebox';
 
@@ -110,7 +109,7 @@ export class Semaphore {
 
 /** Hold one admission slot for a `create` call and nothing else (S50). The cap bounds how many
  *  children are being created at once, never how long a tool call waits: a call that then waits for
- *  its pane's pipe (readiness, up to PIHER_READY_TIMEOUT_MS) must not occupy a slot, or four slow
+ *  its pane to report ready (up to PIHER_READY_TIMEOUT_MS) must not occupy a slot, or four slow
  *  boots in `resume` would starve a `spawn` for as long as they take. */
 export async function withAdmission<T>(sem: Semaphore, create: () => Promise<T>): Promise<T> {
   const release = await sem.acquire();
@@ -526,14 +525,9 @@ export function taskIdResolutionError(
 
 /** Bound atomically at session_start: consumers read `current` and must tolerate null. */
 export interface SubagentPort {
-  applyReplySession(paneId: string, sessionFile: string | null): void;
+  /** The (paneId, slug, state, elapsed) rows the master's widget shows: one per worker still awaiting
+   *  a report. */
   listRunningSubs(): WorkerWidgetRow[];
-  /** The `piher.settlement` card for a pipe-delivered settlement (S57). */
-  settlementCard(paneId: string, outcome: SettlementOutcome): SettlementCard;
-  /** Pipe settlement: drop the row out of listRunningSubs before the finish notice wakes the master.
-   *  `docAt` is the settlement document's own `at` when the worker wrote one: the row records it so
-   *  a re-armed watch treats that document as delivered (spec S7). */
-  consumeReply(paneId: string, outcome: string | null, docAt?: number | null): void;
 }
 
 export interface SubagentPortBox {

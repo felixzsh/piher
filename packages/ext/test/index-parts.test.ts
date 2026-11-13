@@ -1,12 +1,9 @@
 /**
- * index.ts satellite parts: pipe dispatch, the D92 settlement-notice buffer with its rank hook, the
- * process-mode planner, cross-pane write locks, and the pi-surface proxy with its tombstone
- * compensation.
+ * index.ts satellite parts: the D92 settlement-notice buffer with its rank hook, the process-mode
+ * planner, cross-pane write locks, and the pi-surface proxy with its tombstone compensation.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { handlePipeRequest, type MachineRequest, type PipeHandlerSession } from '../src/index-pipe.ts';
-import { emptySubagentPortBox } from '../src/subagent-core.ts';
 import { collapseNotices, createNoticeBuffer } from '../src/index-notices.ts';
 import { planIndexMode, type IndexMode } from '../src/index-runtime.ts';
 import { installWriteLocks } from '../src/index-locks.ts';
@@ -15,113 +12,6 @@ import { PiSurface } from '../src/pi-surface.ts';
 import { DisposeLedger } from '../src/ledger.ts';
 import type { CoreEnv, TerminalInfo } from '../src/core-client.ts';
 import { fakeCore, fakePi, fire, terminalInfo, type FakePi } from './test-utils.ts';
-
-/* ── index-pipe: common-segment pipe dispatch ───────────────────── */
-
-/** PipeHandlerSession with inert hooks; each test overrides only what it observes. */
-function pipeSession(over: Partial<PipeHandlerSession> = {}): PipeHandlerSession {
-  return {
-    paneId: 'p0',
-    port: emptySubagentPortBox(),
-    claimSettleNotice: () => true,
-    deliverNotice: async () => {},
-    sendUserMessageIn: async () => {},
-    // Whether pi took the message: the stubs here take it, so a handler never re-tries.
-    sendUserMessageAs: async () => true,
-    abort: () => {},
-    setPendingMachineRequest: () => {},
-    ...over,
-  };
-}
-
-test('handlePipeRequest: ping / prompt / steer follow_up / interrupt', async () => {
-  const inMsgs: string[] = [];
-  const asMsgs: Array<{ text: string; mode: string }> = [];
-  let aborted = 0;
-  const state: { pending: MachineRequest | null } = { pending: null };
-  const session = pipeSession({
-    sendUserMessageIn: async (content) => { inMsgs.push(content); },
-    sendUserMessageAs: async (content, mode) => { asMsgs.push({ text: content, mode }); return true; },
-    abort: () => { aborted += 1; },
-    setPendingMachineRequest: (req) => { state.pending = req; },
-  });
-
-  assert.deepEqual(await handlePipeRequest({ type: 'ping', id: '1' }, session), { type: 'ok', id: '1', detail: 'p0' });
-
-  await handlePipeRequest({ type: 'prompt', id: '2', text: 'go', from: 'src' }, session);
-  assert.ok(state.pending !== null && state.pending.id === '2');
-  assert.deepEqual(inMsgs, ['go']);
-
-  await handlePipeRequest({ type: 'follow_up', id: '3', text: 'more', steer: true }, session);
-  assert.deepEqual(asMsgs, [{ text: 'more', mode: 'steer' }]);
-
-  await handlePipeRequest({ type: 'interrupt', id: '4' }, session);
-  assert.equal(aborted, 1);
-  assert.equal(state.pending, null);
-});
-
-test('handlePipeRequest: reply binds port, claims once, delivers notice', async () => {
-  const applied: Array<[string, string | null]> = [];
-  const consumed: Array<[string, string | null]> = [];
-  const notices: string[] = [];
-  const claimed: string[] = [];
-  const port = emptySubagentPortBox();
-  port.current = {
-    applyReplySession(paneId, sessionFile) { applied.push([paneId, sessionFile]); },
-    consumeReply(paneId, outcome) { consumed.push([paneId, outcome]); },
-    settlementCard(paneId, outcome) { return { name: paneId, role: null, outcome, elapsedMs: null }; },
-    listRunningSubs() { return []; },
-  };
-  const latch = new Set<string>();
-  const session = pipeSession({
-    port,
-    claimSettleNotice: (key) => {
-      claimed.push(key);
-      if (latch.has(key)) return false;
-      latch.add(key);
-      return true;
-    },
-    deliverNotice: async (content) => { notices.push(content); },
-  });
-
-  const req = { type: 'reply' as const, id: 'r1', paneId: 'p2', text: 'done', sessionFile: '/tmp/s.jsonl' };
-  assert.equal((await handlePipeRequest(req, session)).type, 'ok');
-  assert.deepEqual(applied, [['p2', '/tmp/s.jsonl']]);
-  assert.deepEqual(consumed, [['p2', 'done']], 'a finish notice must drop the pane from the running set first');
-  // the notice names the pane, the text and the session path
-  for (const frag of [/p2/, /done/, /Session: \/tmp\/s\.jsonl/]) assert.match(notices[0]!, frag);
-  await handlePipeRequest(req, session);
-  assert.equal(notices.length, 1, 'a duplicate claim must not re-deliver');
-  assert.deepEqual(claimed, ['p2:r1', 'p2:r1']);
-});
-
-test('handlePipeRequest: the reply claim key is the id the parent pushed (B8)', async () => {
-  // The parent pushes `prompt-<taskId>`, the child echoes that id on settle, and the poll loop
-  // claims `${paneId}:${id}` (subagent-poller.ts). A mismatch shows as two settlement notices.
-  const claims: string[] = [];
-  const state: { pending: MachineRequest | null } = { pending: null };
-  const session = pipeSession({
-    claimSettleNotice: (key) => { claims.push(key); return true; },
-    setPendingMachineRequest: (req) => { state.pending = req; },
-  });
-
-  const sentId = 'prompt-3f1a-task';
-  await handlePipeRequest({ type: 'prompt', id: sentId, text: 'go', from: 'src' }, session);
-  assert.equal(state.pending?.id, sentId, 'the pushed id is the pending machine request id');
-
-  await handlePipeRequest({ type: 'reply', id: state.pending!.id, paneId: 'p2', text: 'done', sessionFile: null }, session);
-  assert.deepEqual(claims, [`p2:${sentId}`]);
-});
-
-test('handlePipeRequest: an unknown request type is refused by name', async () => {
-  // PipeRequest is closed, but parsePipeLine forwards whatever JSON arrives: a peer asking for a type
-  // this version does not implement (`role` was removed with the live role switch) must hear it.
-  const req = { type: 'role', id: 'r1', role: 'reviewer' } as unknown as Parameters<typeof handlePipeRequest>[0];
-  assert.deepEqual(
-    await handlePipeRequest(req, pipeSession()),
-    { type: 'error', id: 'r1', message: 'unknown type role' },
-  );
-});
 
 /* ── index-notices: D92 settlement-notice buffer ────────────────── */
 

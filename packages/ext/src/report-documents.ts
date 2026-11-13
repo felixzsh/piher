@@ -11,7 +11,7 @@
  * settle hook (index.ts) and the worker's command watch both build on this module.
  */
 import type { CoreClientLike } from './core-client.ts';
-import { shouldPushSettleReply } from './settle-wake-core.ts';
+import { reportsSettlement } from './settle-wake-core.ts';
 
 /** Report document value (spec S10): the worker's own closing words plus the turn they belong to.
  *
@@ -91,8 +91,8 @@ export type ReportDeliveryPlan =
   /** The same (`taskId`, `turn`) already went out: a second `turn` event for it delivers nothing. */
   | { kind: 'duplicate' }
   /** The document predates the request boundary: it belongs to an earlier turn, whose report the
-   *  pipe (or an earlier poller) already delivered. Delivering it would announce finished work as
-   *  the answer to a request that is still running. */
+   *  poller already delivered. Delivering it would announce finished work as the answer to a request
+   *  that is still running. */
   | { kind: 'stale' }
   /** Not this task's report (a stale document from another generation): leave it alone. */
   | { kind: 'foreign' };
@@ -105,10 +105,9 @@ export function planReportDelivery(input: {
   address: string;
   /** The current request's boundary: a document written before it answers an earlier request. */
   sinceTs: number;
-  /** The settlement already delivered for this row, by any path — the pipe push or a poller. The
-   *  pipe reports the very `at` of the document it delivered, so this is an exact identity, never a
-   *  race between two clocks: a follow-up clearing the consume time must not make the report the
-   *  pipe already announced look like news. */
+  /** The settlement already delivered for this row. It names the document instance (`address`, `at`),
+   *  so this is an exact identity, never a race between two clocks: a follow-up clearing the consume
+   *  time must not make the report the poller already announced look like news. */
   delivered?: DeliveredReport | null;
   /** Settlements this mount delivered, by `reportDeliveryKey`. */
   deliveredKeys: ReadonlySet<string>;
@@ -294,7 +293,7 @@ export function planSettleWrite(input: {
   if (!input.clientAvailable) return { kind: 'skip', reason: 'no-core-client' };
   if (!input.address) return { kind: 'skip', reason: 'no-address' };
   if (!input.delegationTaskId) return { kind: 'skip', reason: 'no-delegation' };
-  if (!shouldPushSettleReply({ aborted: input.aborted, lastStopReason: input.lastStopReason })) {
+  if (!reportsSettlement({ aborted: input.aborted, lastStopReason: input.lastStopReason })) {
     return { kind: 'skip', reason: 'reports-nothing' };
   }
   return {

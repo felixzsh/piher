@@ -297,7 +297,7 @@ test('adoption ignores what it already tracks, foreign panes, and fires no late 
   const live = (id: string, labels: Record<string, string>) => ({ id: `t-${id}`, cwd: '/repo', labels, state: 'live' as const, exitCode: null });
   const plans = planAdoption([
     live('known', { [JOB_LABEL_KEY]: 'job-1' }),
-    live('foreign', { 'piher.session': 'abc' }),
+    live('foreign', { 'herdr.tab': 'abc' }),
     live('stale', { [JOB_LABEL_KEY]: 'job-3', [JOB_META_LABEL]: encodeJobMeta({ name: null, log: '', started: now - 600_000, timeout: 300, command: 'sleep' }) }),
   ], new Set(['job-1']), now);
   assert.deepEqual(plans.map((plan) => plan.job.id), ['job-3']);

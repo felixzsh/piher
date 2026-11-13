@@ -2,7 +2,6 @@
  *  the master branch of index.ts only: a worker must never load bootstrap/subagent-poller (C3). */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import type { Context } from '@deepseek-ai/cordis';
-import type { Server } from 'node:net';
 import { PiSurface } from './pi-surface.ts';
 import { createCordisApp } from './bootstrap.ts';
 import { cordisProvide } from './cordis-services.ts';
@@ -19,13 +18,11 @@ export interface MasterPluginMount {
   env: CoreEnv | null;
   extPath: string;
   port: SubagentPortBox;
-  pipeServerBox: { current: Server | null };
   deliverNotice: (content: string, paneId?: string, card?: SettlementCard | null) => Promise<void>;
   noticePending: () => ReadonlySet<string>;
   getSessionId: () => string;
   /** This session's transcript path; the subagent registry is stored beside it. */
   getSessionFile: () => string | null;
-  claimSettleNotice: (key: string) => boolean;
 }
 
 async function loadEntry(
@@ -51,14 +48,6 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
   // strip-types) and misses pi's typebox alias. HMR-only; production uses plugin().
   const useLoader = cordisApp.loaderReady && cordisApp.hmrActive;
 
-  // Pipe server is created in the common segment; closing it from a core plugin would kill it on hmr reload (d87).
-  sessionRoot.effect(() => () => {
-    if (m.pipeServerBox.current) {
-      try { m.pipeServerBox.current.close(); } catch { /* already closed */ }
-      m.pipeServerBox.current = null;
-    }
-  }, 'pipe-server');
-
   const surface = new PiSurface(m.pi as unknown as object, cordisApp.ledger);
   cordisProvide(sessionRoot, 'piher.surface', surface);
   const jobDeps = {
@@ -81,7 +70,6 @@ export async function mountMasterPlugins(m: MasterPluginMount): Promise<void> {
     noticePending: m.noticePending,
     getSessionId: m.getSessionId,
     getSessionFile: m.getSessionFile,
-    claimSettleNotice: m.claimSettleNotice,
     terminalState: jobDeps.state,
   });
   await loadEntry(sessionRoot, useLoader, './plugins/subagent.ts', subagentPlugin);

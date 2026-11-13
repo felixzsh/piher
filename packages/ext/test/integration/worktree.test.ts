@@ -5,12 +5,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import type { Server, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { listTaskRecords } from '../../src/task-store.ts';
-import { pipeNameFor, startPipeServer } from '../../src/pipe-channel.ts';
 import type { SubagentPortBox } from '../../src/subagent-core.ts';
+import { HRESUME_LABEL } from '../../src/subagent-session.ts';
 import { NodeCheckoutIo, parsePorcelain } from '../../src/worktree-io.ts';
 import {
   checkoutAckLine,
@@ -258,6 +257,9 @@ interface WtHarness {
   retired: string[];
   /** Spaces the app was asked to close, and a way to make the app unreachable. */
   spaces: { closed: string[]; fail: boolean };
+  /** The worker settles the way a real one does: it writes its report document, and the master's own
+   *  poll loop reads it. One notice per settlement, and the row is consumed here (spec S6-S8). */
+  settle(paneId: string, taskId: string, text: string): Promise<void>;
 }
 
 async function withHarness(fn: (h: WtHarness) => Promise<void>): Promise<void> {
@@ -268,39 +270,38 @@ async function withHarness(fn: (h: WtHarness) => Promise<void>): Promise<void> {
   process.env.HOME = home;
   process.env.USERPROFILE = home;
   const tempHome = new TempHome('wt-agent-');
-  const sockets = new Set<Socket>();
-  const servers: Server[] = [];
-  const repoName = basename(repo);
-  /** Every cwd a worker may run in, and the pane ids the fake core hands out. */
-  const cwds = [
-    join(home, '.herdr', 'worktrees', repoName, 'probe'),
-    join(home, '.herdr', 'worktrees', repoName, 'feat-Probe'),
-    join(home, '.herdr', 'worktrees', repoName, 'shot'),
-    repo,
-  ];
   const panes = ['p2', 'p3', 'p4', 'p5'];
-  for (const cwd of cwds) {
-    for (const paneId of panes) {
-      const server = startPipeServer(pipeNameFor(cwd, paneId), async (req) => ({ type: 'ok', id: req.id }));
-      servers.push(server);
-      server.on('connection', (sock) => {
-        sockets.add(sock);
-        sock.on('close', () => sockets.delete(sock));
-      });
-      server.unref();
-    }
-  }
-  await Promise.all(servers.map((s) => new Promise<void>((resolve) => s.once('listening', resolve))));
+  /** One fresh transcript per pane: what the worker's own Herdr extension reports in `hresume`, and
+   *  therefore the session a resume restores (spec S18). */
+  const sessionDir = join(home, 'worker-sessions');
+  mkdirSync(sessionDir, { recursive: true });
+  const sessionFiles = new Map<string, string>();
+  const sessionFor = (paneId: string): string => {
+    const existing = sessionFiles.get(paneId);
+    if (existing) return existing;
+    const file = join(sessionDir, `2026-01-01T00-00-00-000Z_${paneId}.jsonl`);
+    writeFileSync(file, '{}\n');
+    sessionFiles.set(paneId, file);
+    return file;
+  };
+  /** Parks the poll loop until a test says otherwise: a settlement is what releases it. */
+  const gates = new Set<() => void>();
+  /** Set by a settlement that lands while the loop is NOT parked, so its next park returns at once
+   *  instead of waiting for a wake that already came. */
+  let wake = false;
+  const releaseGates = (): void => { for (const release of [...gates]) release(); gates.clear(); };
 
+  /** Poll loops that started: the settle boundary only exists once one is reading the pane. */
+  let watchCalls = 0;
   const labels: Array<Record<string, string>> = [];
   const listed: TerminalInfo[] = [];
   const retired: string[] = [];
   const spaces: WtHarness['spaces'] = { closed: [], fail: false };
   let paneIndex = 0;
-  const { root, pi, port } = await mountSubagent({
+  const { root, pi, port, client } = await mountSubagent({
     deps: {
-      // A spawn whose pipe never answers must fail fast here; the production default is 90 s and this
-      // suite used to wait it out, which is why the run needed --test-force-exit to end.
+      // A spawn whose readiness never arrives must fail fast here; the production default is 90 s and
+      // this suite used to wait it out, which is why the run needed --test-force-exit to end.
       policy: { readinessTimeoutMs: 3000 },
       checkoutIo: new NodeCheckoutIo(),
       checkoutSpace: {
@@ -312,25 +313,55 @@ async function withHarness(fn: (h: WtHarness) => Promise<void>): Promise<void> {
       },
     },
     client: {
-      // The harness panes report an idle agent: settlement is observed through the pipe, and a
-      // close must see a finished turn rather than a silent one.
-      getTerminal: async (id: string) => terminalInfo({ id, status: 'idle' }),
+      // The harness panes report an idle agent — a close must see a finished turn rather than a
+      // silent one — and the session their own Herdr extension reports (spec S18).
+      getTerminal: async (id: string) => terminalInfo({
+        id,
+        status: 'idle',
+        labels: sessionFiles.has(id)
+          ? { [HRESUME_LABEL]: JSON.stringify({ agent: 'pi', session: sessionFor(id), file: sessionFor(id) }) }
+          : {},
+      }),
       listTerminals: async () => listed,
-      // Parked forever: an unparked fake watch makes the poll loop spin on microtasks.
-      watchChildren: () => fakeWatch({ terminals: () => [], park: () => new Promise<boolean>(() => {}) }),
+      // The poll loop parks until a settlement releases it: an unparked fake watch would spin on
+      // microtasks, and a worker that says nothing settles nothing.
+      watchChildren: () => (watchCalls += 1, fakeWatch({
+        terminals: () => [],
+        park: () => new Promise<boolean>((resolve) => {
+          if (wake) { wake = false; resolve(true); return; }
+          gates.add(() => resolve(true));
+        }),
+      })),
+      // S25: the first task is believed by the core's own result, so the harness's worker takes it.
+      send: async () => ({ started: true, status: 'working' as const, turn: 1 }),
       run: async (o) => {
         labels.push({ ...o.labels });
-        return terminalInfo({ id: panes[paneIndex++] ?? 'p9', cwd: o.cwd, labels: o.labels });
+        const id = panes[paneIndex++] ?? 'p9';
+        sessionFor(id);
+        return terminalInfo({ id, cwd: o.cwd, labels: o.labels });
       },
       kill: async (id) => { retired.push(id); },
     },
   });
+
+  /** Writes the worker's report document and lets the master's poll loop read it. */
+  const settle = async (paneId: string, taskId: string, text: string): Promise<void> => {
+    // The settle boundary is the request the worker took, so the loop must have armed before the
+    // document can answer anything (`watchChildren` is the first thing a poll loop does).
+    await waitFor(() => watchCalls > 0);
+    await client.docSet(`piher.rep.${paneId}`, {
+      taskId, turn: 1, stopReason: 'stop', session: sessionFiles.get(paneId) ?? null, text, at: Date.now(),
+    }, 0);
+    wake = true;
+    releaseGates();
+    // The row is consumed by the master's loop, not by the test: wait for the fact, not a timer.
+    await waitFor(() => taskRows(repo).some((r) => r.taskId === taskId && r.consumed));
+  };
   try {
-    await fn({ repo, home, pi, port, labels, listed, retired, spaces });
+    await fn({ repo, home, pi, port, labels, listed, retired, spaces, settle });
   } finally {
     await root.fiber.dispose();
-    for (const sock of sockets) sock.destroy();
-    await Promise.all(servers.map((s) => new Promise<void>((resolve) => s.close(() => resolve()))));
+    releaseGates();
     tempHome.dispose();
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
@@ -368,7 +399,7 @@ test('spawn worktree: one name makes the checkout, and says where it is', async 
     // app wrote the tab id back onto the first pane, and the reviewer sits beside the worker it reads.
     h.listed.push(terminalInfo({
       id: 'p2',
-      labels: { ...h.labels[0]!, 'herdr.tab': 'wtTab', 'piher.session': '/sessions/a.jsonl' },
+      labels: { ...h.labels[0]!, 'herdr.tab': 'wtTab', [HRESUME_LABEL]: JSON.stringify({ agent: 'pi', session: 'w1', file: '/sessions/a.jsonl' }) },
     }));
     const reviewer = await runSubagent(
       h.pi,
@@ -417,7 +448,7 @@ test('close: the worktree goes, the branch survives; a dirty checkout is refused
     const paneId = spawn.details?.paneId as string;
     const path = checkoutPath(h, 'probe');
     await waitFor(() => h.port.current !== null);
-    h.port.current!.consumeReply(paneId, 'REPORT: done');
+    await h.settle(paneId, spawn.details?.taskId as string, 'REPORT: done');
 
     writeFileSync(join(path, 'uncommitted.txt'), 'x\n');
     const refused = await runSubagentRejects(h.pi, { action: 'close', agentId: paneId }, h.repo);
@@ -448,7 +479,7 @@ test('resume: unfinished work revives; a closed worker is final', async () => {
     const taskId = spawn.details?.taskId as string;
     await waitFor(() => h.port.current !== null);
     // A result that was read is unfinished business for a persistent worker: it stays revivable.
-    h.port.current!.consumeReply(paneId, 'REPORT: done');
+    await h.settle(paneId, taskId, 'REPORT: done');
     const resumed = await runSubagent(h.pi, { action: 'resume', taskId }, h.repo);
     assert.match(resumed.content[0]!.text, /resumed subagent/);
     assert.notEqual(resumed.details?.paneId, paneId, 'a fresh pane holds the revived session');
@@ -457,7 +488,6 @@ test('resume: unfinished work revives; a closed worker is final', async () => {
     // that already finished, so the revived one reports first.
     const revivedPane = resumed.details?.paneId as string;
     await waitFor(() => h.port.current !== null);
-    h.port.current!.consumeReply(revivedPane, 'REPORT: again');
     await runSubagent(h.pi, { action: 'close', agentId: revivedPane }, h.repo);
     const refusedResume = await runSubagentRejects(h.pi, { action: 'resume', taskId }, h.repo);
     assert.match(refusedResume, /closed by the master/);
@@ -479,7 +509,7 @@ test('one-shot: its settlement closes the space and keeps the checkout for the m
     const path = checkoutPath(h, 'shot');
     assert.ok(existsSync(path), 'the one-shot got its checkout');
     await waitFor(() => h.port.current !== null);
-    h.port.current!.consumeReply(paneId, 'REPORT: swept');
+    await h.settle(paneId, spawn.details?.taskId as string, 'REPORT: swept');
     await waitFor(() => h.spaces.closed.length > 0);
     // The window closes; the working tree stays, because the master decides whether to merge.
     assert.deepEqual(h.spaces.closed, [checkoutSpaceId(path)]);
@@ -513,7 +543,7 @@ test('one-shot: a checkout still used by another worker keeps its space', async 
     assert.equal((worker.details?.paneId as string) !== (reviewer.details?.paneId as string), true);
     await waitFor(() => h.port.current !== null);
 
-    h.port.current!.consumeReply(reviewer.details?.paneId as string, 'REPORT: swept');
+    await h.settle(reviewer.details?.paneId as string, reviewer.details?.taskId as string, 'REPORT: swept');
     const reviewerTaskId = reviewer.details?.taskId as string;
     await waitFor(() => taskRows(h.repo).some((r) => r.taskId === reviewerTaskId && r.consumed));
     assert.deepEqual(h.spaces.closed, [], 'the worker is still in that space, so its tab stays');
@@ -531,7 +561,7 @@ test('resume: a revived worker goes back to the space its checkout owns', async 
     assert.equal(h.labels[0]!['herdr.space'], space, 'the first pane names the checkout space');
     await waitFor(() => h.port.current !== null);
     // Read the result: unfinished business for a persistent worker, so `resume` revives it.
-    h.port.current!.consumeReply(paneId, 'REPORT: done');
+    await h.settle(paneId, taskId, 'REPORT: done');
     h.listed.push(terminalInfo({ id: paneId, labels: { ...h.labels[0]!, 'herdr.tab': 'wtTab' } }));
 
     const resumed = await runSubagent(h.pi, { action: 'resume', taskId }, h.repo);

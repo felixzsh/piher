@@ -108,36 +108,6 @@ export function decideCheckoutSpaces(opts: {
 
 /** One line the master can act on. It names the decision, never a countdown: nothing closes by
  *  itself, and housekeeping never ends a window that still holds an idle worker. */
-/** Whether the channel heartbeat should ping this row at all. Only a worker with a turn in flight
- *  has a channel to lose: a delivered report means the turn is over, and `unknown` means pi has
- *  not reported a state yet — the process is still booting and its pipe is seconds away. Announcing
- *  a loss in either case is noise the master has to read and act on. */
-export function planChannelCheck(input: {
-  /** The master's decision stands: a closed task has no channel to lose. */
-  closed: boolean;
-  /** A delivered report means no turn is in flight, so there is no channel to lose either. */
-  consumed: boolean;
-  /** What core reports for the pane; `undefined` when it does not list the terminal at all. */
-  terminalStatus: string | undefined;
-}): 'skip' | 'ping' {
-  if (input.closed || input.consumed) return 'skip';
-  if (input.terminalStatus === undefined) return 'skip';
-  if (input.terminalStatus === 'unknown') return 'skip';
-  return 'ping';
-}
-
-/** A worker whose pane is alive but whose channel is gone can never receive a follow-up: say it once,
- *  with the two ways out, so the master does not discover it on the next `send`. */
-export function formatDeadChannelNotice(opts: {
-  paneId: string;
-  taskId: string;
-  status: string;
-}): string {
-  return `Note: subagent ${opts.paneId} is alive (${opts.status}) but its message channel is gone — a ` +
-    'follow-up sent to it would not arrive. Nothing was lost: the row is untouched. Restart it with ' +
-    `subagent action:"resume" taskId ${opts.taskId}, or retire it with action:"close".`;
-}
-
 export function formatIdleCheckoutNotice(opts: {
   name: string;
   minutes: number;

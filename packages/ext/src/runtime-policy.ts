@@ -9,7 +9,7 @@ export interface RuntimePolicy {
   readonly gcTickMs: number
   readonly sessionTtlSeconds: number
   readonly gitTimeoutMs: number
-  /** Subagent pane pipe readiness wait */
+  /** How long a spawn waits for the worker's agent to report ready (spec S14) */
   readonly readinessTimeoutMs: number
   /** How long `send` waits for the worker to read the steering command it wrote (spec S15) */
   readonly commandPickupMs: number

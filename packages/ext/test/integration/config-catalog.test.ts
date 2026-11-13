@@ -80,17 +80,19 @@ test('checkEnvKnobs names a removed knob instead of leaving it a silent no-op', 
   assert.equal(issues.length, 2, issues.join(' | '));
   assert.match(issues.join(' | '), /PIHER_SETTLE_WINDOW_MS="4000" is set but no code reads it/);
   assert.match(issues.join(' | '), /PIHER_POLL_INTERVAL_MS/);
+  // `PIHER_PIPE_TRACE` traced the pipe request path, which P5 deleted: it is a removed knob now.
+  assert.match(checkEnvKnobs({ PIHER_PIPE_TRACE: '1' }).join(' | '), /PIHER_PIPE_TRACE="1" is set but no code reads it/);
   // The spawn contracts are read by the code and are not knobs: they are never "removed".
   assert.deepEqual(checkEnvKnobs({ PIHER_SUBAGENT: '1', PIHER_DELEGATION: '{}', PIHER_ROLE_MANIFEST: '{}', PIHER_ROLE_BASE: '/r' }), []);
 });
 
 test('checkEnvKnobs: a knob the code reads is never reported as removed', () => {
-  // Read outside the option registry, and the first version of this guard called both of them
-  // removed: `PIHER_TUI` picks the spawn's TUI mode (`subagent-core.ts`) and `PIHER_PIPE_TRACE`
-  // turns the pipe trace on (`plugins/subagent.ts`). Telling a user to unset those would be wrong.
-  assert.deepEqual(checkEnvKnobs({ PIHER_TUI: 'regular', PIHER_PIPE_TRACE: '1' }), []);
+  // Read outside the option registry, and the first version of this guard called it removed:
+  // `PIHER_TUI` picks the spawn's TUI mode (`subagent-core.ts`). Telling a user to unset that would
+  // be wrong.
+  assert.deepEqual(checkEnvKnobs({ PIHER_TUI: 'regular' }), []);
   const known = new Set(knownEnvKeys());
-  assert.ok(known.has('PIHER_TUI') && known.has('PIHER_PIPE_TRACE'), 'both are catalog-knowledgeable knobs');
+  assert.ok(known.has('PIHER_TUI'), 'a catalog-knowledgeable knob');
 });
 
 test('secret-shaped keys are redacted and never rendered verbatim', () => {

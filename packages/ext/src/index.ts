@@ -2,17 +2,16 @@
  * piher extension entry point and composition root.
  *
  * Layout: index-runtime.ts picks the process mode (worker / bare pi / herdr master);
- * index-roles.ts the role runtime, index-pipe.ts the pipe protocol handler, index-notices.ts the
- * notice buffer, index-locks.ts write locks;
+ * index-roles.ts the role runtime, index-notices.ts the notice buffer, index-locks.ts write locks;
  * index-master.ts is the dynamic master mount.
+ *
+ * Nothing here opens a listener (spec S19): every channel between a worker and its master is a core
+ * document or a core terminal call, so an extension instance holds no socket and no watchdog.
  *
  * pi contract: onUpdate must have AgentToolResult shape (a string crashes the TUI); tool-result
  * details persist in session JSONL and getBranch() replay implements branch rollback.
  */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
-import {
-  closePipeServer, ownsPipe, pipeNameFor, pipePathFor, pipeRequest, releasePipe, startPipeServer, takeOverPipe,
-} from './pipe-channel.ts';
 import { installRenderers } from './renderers.ts';
 import { SETTLEMENT_CUSTOM_TYPE, sendSettlementNotice } from './settlement-card.ts';
 import { createCoreClient } from './core-client.ts';
@@ -20,10 +19,9 @@ import type { DocWatch } from './core-client.ts';
 import { bareSessionId, readSessionFile, readTurnClosing, resolveSessionFileValue } from './session-tail.ts';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
-import { existsSync } from 'node:fs';
 import { platformPaths } from './platform-paths.ts';
 import { WRITE_LOCK_ENV } from './lock-core.ts';
-import { ABORT_STOP_REASON, planSettleWake, shouldPushSettleReply } from './settle-wake-core.ts';
+import { ABORT_STOP_REASON, planSettleWake } from './settle-wake-core.ts';
 import { planSettleWrite, writeReportDocument } from './report-documents.ts';
 import { commandDocName } from './report-documents.ts';
 import { clearCommandDocument, planCommandApplication } from './command-documents.ts';
@@ -40,13 +38,9 @@ import {
 } from './delegation-core.ts';
 import { widgetLines } from './tree-view.ts';
 import { createNoticeBuffer } from './index-notices.ts';
-import { handlePipeRequest, type MachineRequest } from './index-pipe.ts';
 import { installWriteLocks } from './index-locks.ts';
 import { installConfigCommand } from './config-command.ts';
 import { composeMasterRuntime, createRoleRuntime } from './index-roles.ts';
-
-/** How often a worker re-checks that its own socket path still exists (see watchPipePath). */
-const PIPE_WATCHDOG_MS = 10_000;
 
 function agentSessionsDir(): string {
   return process.env.PI_CODING_AGENT_DIR ? join(process.env.PI_CODING_AGENT_DIR, 'sessions') : platformPaths.sessionsDir;
@@ -81,7 +75,6 @@ export default async function (pi: ExtensionAPI) {
 
   let agentActive = false;
   let lastStopReason: string | null = null;
-  let latestCtx: { abort?: () => void } | null = null;
   const subagentPort = emptySubagentPortBox();
   let d96NoticeKey: string | null = null;
   let d96NoticeAt = 0;
@@ -179,90 +172,13 @@ export default async function (pi: ExtensionAPI) {
   });
   const deliverNotice = notices.deliverNotice;
 
-  /* ── pipe channel: this pane's NDJSON server + the settle fast-path push (D48/D49/D50) ── */
-  const pipeServerBox: { current: ReturnType<typeof startPipeServer> | null } = { current: null };
-  let pipeWatchdog: ReturnType<typeof setInterval> | null = null;
-  /** This instance's ownership generation for the pane's channel (see takeOverPipe). */
-  let pipeGeneration = 0;
-  let pendingMachineRequest: MachineRequest | null = null;
-  /** Dedup latch for settle notices: one per paneId+request id per round. */
-  const settleNoticeLatch = new Set<string>();
-  function claimSettleNotice(key: string): boolean {
-    if (settleNoticeLatch.has(key)) return false;
-    settleNoticeLatch.add(key);
-    return true;
-  }
-
-  async function startPipeServerFor(cwd: string): Promise<void> {
-    const paneId = env?.terminalId ?? '';
-    if (!paneId) {
-      // No address means no channel: every follow-up to this pane is undeliverable, which is worth
-      // saying out loud rather than discovering as a 90 s timeout on the other side.
-      return;
-    }
-    const name = pipeNameFor(cwd, paneId);
-    const path = pipePathFor(name);
-    // Exactly one server per pane, whoever else is in this process. Taking ownership closes the
-    // previous holder first — our own server on a rebind, or a second copy of this extension loaded in
-    // the same pane (an installed package plus the spawner's `-e`). Binding before that close would let
-    // libuv delete the new entry; leaving the previous holder alive would let a stale ctx answer.
-    const generation = await takeOverPipe(paneId, async () => {
-      const mine = pipeServerBox.current;
-      pipeServerBox.current = null;
-      if (pipeWatchdog) clearInterval(pipeWatchdog);
-      pipeWatchdog = null;
-      if (mine) await closePipeServer(mine);
-    });
-    pipeGeneration = generation;
-    /** A bind failure is silent by construction (net.Server reports it on 'error'), so it is the one
-     *  failure that used to leave a live worker unreachable with nothing in any log. */
-    const bindFailed = (err: Error): void => {
-      const code = (err as NodeJS.ErrnoException)?.code ?? null;
-      void deliverNotice(
-        `piher: this pane cannot receive follow-up messages — its pipe ${path} failed to bind`
-        + `${code ? ` (${code})` : ''}. A master that sends to it will report the channel as dead.`,
-        paneId,
-        null,
-      );
-    };
-    try {
-      const server = startPipeServer(name, async (req) => handlePipeRequest(req, {
-        paneId,
-        port: subagentPort,
-        claimSettleNotice,
-        deliverNotice,
-        sendUserMessageIn: (content) => sendUserMessageAs(content, 'followUp').then(() => undefined),
-        sendUserMessageAs,
-        abort: () => { latestCtx?.abort?.(); },
-        setPendingMachineRequest: (next) => { pendingMachineRequest = next; },
-      }), bindFailed);
-      pipeServerBox.current = server;
-      server.once('listening', () => {
-        watchPipePath(cwd, path, paneId, generation);
-      });
-    } catch (err) {
-      // A synchronous throw (path too long, permission) is the same outcome as a failed bind.
-      bindFailed(err as Error);
-    }
-  }
-
-  /** The path is a filesystem entry that a live listener does not own: anything that unlinks it (a
-   *  stale pre-bind unlink from another instance, a tmp cleaner) leaves the socket open while every
-   *  new connect() gets ENOENT — a worker that keeps working and cannot be reached. Nothing in the
-   *  process notices, so this re-checks and rebinds. */
-  function watchPipePath(cwd: string, path: string, paneId: string, generation: number): void {
-    if (pipeWatchdog) clearInterval(pipeWatchdog);
-    pipeWatchdog = setInterval(() => {
-      // A channel someone else took over is not ours to heal, and healing it would start a tug of war.
-      if (!ownsPipe(paneId, generation)) return;
-      if (existsSync(path)) return;
-      void startPipeServerFor(cwd);
-    }, PIPE_WATCHDOG_MS);
-    pipeWatchdog.unref?.();
-  }
+  /* ── the settle boundary: where this turn's closing words begin ──
+   *  Nothing arms it from outside any more: the master's first task and every steer arrive through
+   *  the core (spec S14/S15), so a turn's own start is the only boundary there is. */
+  let turnStartedAt = 0;
 
   /** The worker's own closing words: the finalized text, else the reason the turn ended without
-   *  one (a refused tool, an error). Shared by the pipe push and the report document so the two
+   *  one (a refused tool, an error). Shared by the report document and the one-shot exit so the two
    *  can never disagree about whether the worker said anything: a turn that ended by token cap or
    *  abort still has words. A worker still thinking has neither, and its report stays withheld.
    *
@@ -279,9 +195,8 @@ export default async function (pi: ExtensionAPI) {
   }
 
   /** Everything one settle reports, resolved once: the closing words (or the reason the turn ended
-   *  without any) and the core's turn. The push and the document read it from the same place, so
-   *  they cannot disagree about which turn settled, and the turn costs one round trip instead of
-   *  two. */
+   *  without any) and the core's turn. The document reads it from one place, so it cannot disagree
+   *  with itself about which turn settled. */
   type SettleReport = { text: string | null; why: string | null; file: string | null; turn: number | null };
 
   async function collectSettleReport(sinceTs: number): Promise<SettleReport> {
@@ -291,88 +206,24 @@ export default async function (pi: ExtensionAPI) {
       try {
         turn = (await client.getTerminal(env.terminalId))?.turn ?? null;
       } catch {
-        turn = null; // reported below; the push still carries the words
+        turn = null;
       }
     }
     return { text, why, file, turn };
   }
 
-  /** Returns whether a settlement reply actually went out: a worker whose report never reached the
-   *  master must not exit as if it had (S54 — the push comes first, the shutdown after).
-   *
-   *  Everything it decides on arrives in `input`, captured when the settle happened: the document is
-   *  written before this runs, and `lastStopReason`/`pendingMachineRequest` are live state that a
-   *  later turn (or a newer request) would have moved by then.
-   *
-   *  `docAt` is the `at` of the report document this reply settles, or null when no document was
-   *  written. The master records it against the row, which is how a re-armed watch knows the report
-   *  is already delivered (spec S7) — an identity, not a comparison of two clocks. */
-  async function pushSettleReply(input: {
-    aborted: boolean;
-    turnStopReason: string | null;
-    request: MachineRequest | null;
-    report: SettleReport;
-    docAt: number | null;
-  }): Promise<boolean> {
-    const { aborted, turnStopReason, request: req, report, docAt } = input;
-    if (!req) {
-      return false;
-    }
-    // An aborted settle is not a settlement: the closing message is still coming, and answering now
-    // would burn the one-shot request + the parent's claim latch on a null-text reply ("left no
-    // closing message") — the real closing message then never gets delivered. Keep the request armed.
-    if (!shouldPushSettleReply({ aborted, lastStopReason: turnStopReason })) {
-      return false;
-    }
-    // A newer request landed while this settlement's document was being written: the report answers
-    // the request it settled, not that one.
-    if (pendingMachineRequest !== req) {
-      return false;
-    }
-    pendingMachineRequest = null;
-    // A request with no requester pipe (a task the master handed over through the core, spec S14):
-    // there is nobody to push to — the document written before this is the delivery (spec S6-S8).
-    if (!req.from) {
-      return false;
-    }
-    try {
-      // A turn that ended with nothing to say but a reason — a refused tool, an error — must say
-      // it: staying silent left the master waiting its whole silence budget for a report that was
-      // never coming.
-      const reportText = report.text ?? report.why ?? null;
-      if (reportText === null) {
-        return false;
-      }
-      await pipeRequest(req.from, {
-        type: 'reply',
-        id: req.id,
-        paneId: env?.terminalId ?? '',
-        text: reportText,
-        // Push the resolved PATH when readable; fall back to the bare id for the master-side mapping.
-        sessionFile: report.file ?? (sessionId || null),
-        ...(docAt !== null ? { docAt } : {}),
-      }, 5000);
-    } catch (err) {
-      /* The requester's pollLoop is the fallback; surface the dead letter for triage. */
-      console.error(`piher: settle reply push to ${req.from} failed: ${(err as Error)?.message ?? err}`);
-      return false;
-    }
-    return true;
-  }
-
-  /** Spec S6/S8: write the settlement report document on every settle that has a channel, whether or
-   *  not the master asked. `planSettleWrite` decides, so the one case that cannot write is named
-   *  rather than guessed at: a worker with no report channel at all, which the master then diagnoses
-   *  from the core's `turn` (spec S5) instead of waiting out a silence. */
+  /** Spec S6/S8: write the settlement report document on every settle of a worker that has an
+   *  address and a delegation identity. `planSettleWrite` decides, so the one case that cannot write
+   *  is named rather than guessed at: a worker with no report channel at all, which the master then
+   *  diagnoses from the core's `turn` (spec S5) instead of waiting out a silence. */
   async function writeSettleDocument(input: {
     aborted: boolean;
     turnStopReason: string | null;
     report: SettleReport;
-    hadRequest: boolean;
-    /** The settlement's own `at`, minted by the caller so the push can name the document it settles. */
+    /** The settlement's own `at`, minted by the caller so the row records exactly this settlement. */
     at: number;
   }): Promise<boolean> {
-    const { aborted, turnStopReason, report, hadRequest, at } = input;
+    const { aborted, turnStopReason, report, at } = input;
     const address = env?.terminalId ?? null;
     const plan = planSettleWrite({
       isSubagent,
@@ -403,10 +254,9 @@ export default async function (pi: ExtensionAPI) {
     }
     const written = await writeReportDocument(client, address, plan.value);
     if (!written.ok) {
-      console.error(`piher: settle document for ${address} was not written: ${written.reason}`
-        + (hadRequest
-          ? ' (the pipe push carries the same report)'
-          : ' (and no request is pending: the master will report that a turn ran with no report)'));
+      // The document is the only channel a settlement has: a failed write means the master will tell
+      // "a turn ran and no report arrived" (spec S5), and the reason is the worker's to record.
+      console.error(`piher: settle document for ${address} was not written: ${written.reason}`);
       return false;
     }
     return true;
@@ -495,7 +345,6 @@ export default async function (pi: ExtensionAPI) {
   pi.on('session_start', async (event, ctx) => {
     sessionId = resolveSessionId(ctx);
     ownSessionPath = reportedSessionFile(ctx);
-    latestCtx = ctx as { abort?: () => void } | null;
     // On resume pi restores widget state from the session; calling setWidget again
     // breaks the TUI '/' command-panel route (v1.3 M9).
     if ((event as { reason?: string } | undefined)?.reason !== 'resume') renderWorkerWidget(ctx);
@@ -521,12 +370,11 @@ export default async function (pi: ExtensionAPI) {
           /* Best effort; the marker already carries the identity. */
         }
       }
-      // The master reads the worker's session file from this label.
-      if (sessionFile) void client.setLabels({ 'piher.session': sessionFile });
+      // The master reads the worker's session from the core's own `hresume` label, which the worker's
+      // Herdr extension writes (spec S18). piher writes no session label of its own any more.
       writeWorkerMarker(sessionFile, roles.state.manifest?.role, delegation ?? undefined);
     }
 
-    await startPipeServerFor((ctx as { cwd?: string }).cwd ?? process.cwd());
     startCommandWatch();
   });
 
@@ -564,14 +412,10 @@ export default async function (pi: ExtensionAPI) {
     agentActive = true;
     // A11: reset so a previous turn's abort cannot taint this one.
     lastStopReason = null;
-    // P2 (spec S14): the master's first task now arrives through the core's own `send`, so no pipe
-    // frame armed a request for it. Without one a settlement has no boundary (`sinceTs` fell back to
-    // 0, letting an older closing message through) and a one-shot worker never exited. A local request
-    // names this turn's start and has no requester pipe: the document is its delivery (spec S6-S8).
-    if (isSubagent && pendingMachineRequest === null) {
-      const at = Date.now();
-      pendingMachineRequest = { id: `turn-${at}`, from: null, sinceTs: at };
-    }
+    // P5 (spec S14/S19): the master's first task and every steer arrive through the core, so nothing
+    // outside this process arms a settle boundary — this turn's own start is the boundary. Without
+    // one a settlement has no `sinceTs` (it fell back to 0, letting an older closing message through).
+    turnStartedAt = Date.now();
   });
 
   pi.on('turn_end', async (event: unknown, ctx) => {
@@ -616,38 +460,29 @@ export default async function (pi: ExtensionAPI) {
       void sendUserMessageAs(notice, 'followUp');
     }
     if (lastStopReason !== ABORT_STOP_REASON && !aborted) void notices.flush('followUp');
-    // One report for this settle, resolved before either channel uses it: the request (read before
-    // the push consumes it), the turn's stop reason, the closing words and the core's turn. All of it
-    // is captured HERE, synchronously — the document write runs before the push, and by then a newer
-    // turn or a newer request would have moved the live state these decisions depend on.
-    const request = pendingMachineRequest;
+    // One report for this settle, resolved from the settle's own boundary: the closing words of this
+    // turn and the core's turn. Both are captured HERE, synchronously — the document write runs off the
+    // caller's turn, and by then a newer turn would have moved the live state these decisions need.
+    const sinceTs = turnStartedAt;
     const turnStopReason = lastStopReason;
     const at = Date.now();
-    const settled = collectSettleReport(request?.sinceTs ?? 0).catch((err: unknown) => {
+    const settled = collectSettleReport(sinceTs).catch((err: unknown) => {
       // A report that cannot be read must not become an unhandled rejection that silently cancels the
-      // push: the words are gone, but the settle is still reported as "no closing message".
+      // write: the words are gone, but the settle is still reported as "no closing message".
       console.error(`piher: settle report could not be read: ${(err as Error)?.message ?? err}`);
       return { text: null, why: null, file: ownSessionFile, turn: null } satisfies SettleReport;
     });
-    // P1: the report document is written on every settle, and written BEFORE the reply leaves this
-    // process. Two reasons, both ordering: the master's reply handling reclaims a one-shot worker's
-    // pane immediately (the retire would otherwise cut the write short), and the reply names the
-    // document's `at` so the master can record exactly which settlement the pipe delivered (S7).
-    const pushed = settled
-      .then(async (report) => {
-        const written = await writeSettleDocument({ aborted, turnStopReason, report, hadRequest: request !== null, at });
-        const sent = await pushSettleReply({ aborted, turnStopReason, request, report, docAt: written ? at : null });
-        return { written, sent };
-      });
+    // P1/P5: the report document is the whole delivery — the master's poller reads it (spec S6-S8),
+    // and nothing is pushed anywhere any more.
+    const written = settled
+      .then((report) => writeSettleDocument({ aborted, turnStopReason, report, at }));
     // S54: a role-declared `one-shot` worker exits once its report is in the master's hands. The
-    // ordering is the whole risk — shutting down first loses the report the parent waits for. "In the
-    // master's hands" is the document write (spec S6-S8, the channel that survives a restart) or the
-    // pipe push, whichever happened; since P2 the first task's settlement has no pipe push at all.
-    // An aborted turn reports nothing (S52).
+    // ordering is the whole risk — shutting down first loses the report the parent waits for, and the
+    // document write is the only channel left that carries it. An aborted turn reports nothing (S52).
     if (isSubagent && !aborted && delegation?.lifecycle === 'one-shot') {
-      void pushed.then(({ written, sent }) => { if (written || sent) ctx.shutdown(); });
+      void written.then((ok) => { if (ok) ctx.shutdown(); });
     } else {
-      void pushed;
+      void written;
     }
   });
 
@@ -657,15 +492,6 @@ export default async function (pi: ExtensionAPI) {
     // Nothing outlives the session it serves: the command subscription is a connection of its own.
     commandWatch?.close();
     commandWatch = null;
-    // Stop the watchdog first: a rebind during shutdown would outlive the session it serves.
-    if (pipeWatchdog) clearInterval(pipeWatchdog);
-    pipeWatchdog = null;
-    if (pipeServerBox.current) {
-      const server = pipeServerBox.current;
-      pipeServerBox.current = null;
-      await closePipeServer(server);
-    }
-    if (env?.terminalId) releasePipe(env.terminalId, pipeGeneration);
   });
 
   /* ── master vs worker mount (dynamic: workers never load the cordis tree, C3) ── */
@@ -677,7 +503,6 @@ export default async function (pi: ExtensionAPI) {
       env,
       extPath: fileURLToPath(import.meta.url),
       port: subagentPort,
-      pipeServerBox,
       deliverNotice,
       noticePending: notices.noticePending,
       getSessionId: () => sessionId,
@@ -685,7 +510,6 @@ export default async function (pi: ExtensionAPI) {
       // id is only the fallback for a host that reports an id instead of a file.
       getSessionFile: () => ownSessionPath
         ?? (sessionId ? resolveSessionFileValue(process.cwd(), agentSessionsDir(), sessionId) : null),
-      claimSettleNotice,
     });
 
   }

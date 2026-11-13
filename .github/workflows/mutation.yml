@@ -20,8 +20,8 @@ jobs:
       matrix:
         include:
           - shard: core
-            # pipe-channel is the slowest (socket IO per mutant); pair it with small pure cores
-            files: packages/ext/src/tool-gate.ts,packages/ext/src/lock-core.ts,packages/ext/src/gc-core.ts,packages/ext/src/config-catalog-core.ts,packages/ext/src/pipe-channel.ts
+            # small pure cores, paired so each shard stays a few minutes
+            files: packages/ext/src/tool-gate.ts,packages/ext/src/lock-core.ts,packages/ext/src/gc-core.ts,packages/ext/src/config-catalog-core.ts
           - shard: delegation
             files: packages/ext/src/delegation-core.ts,packages/ext/src/ledger.ts,packages/ext/src/subagent-core.ts,packages/ext/src/subagent-session.ts
           - shard: surface

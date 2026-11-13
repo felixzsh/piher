@@ -76,9 +76,9 @@ export type ResolvedTaskEntry = { entry: TaskEntry; foreign: boolean } | { error
  *  fields are stripped at the document seam (`toTaskRow`) and never reach disk. Liveness is
  *  not among them: it is observed from core per surface, never stored (S11, S12). */
 export interface TaskEntry extends TaskRow {
-  /** The settlement last delivered for this row, by ANY path: the pipe push or a poller. It names
-   *  the document instance (address + the worker's `at`), which is exactly what the pipe reports
-   *  when it delivers, so a re-armed watch can never read the same report as news (spec S7). */
+  /** The settlement last delivered for this row, by the poller that read its report document. It names
+   *  the document instance (address + the worker's `at`), so a re-armed watch can never read the same
+   *  report as news (spec S7). */
   deliveredReport?: DeliveredReport | null;
 }
 

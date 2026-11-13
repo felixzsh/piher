@@ -38,11 +38,13 @@ its own rules.
   `terminal.rm`.
 - **Status comes only from pi's native OSC 7501 report**, which core stores and the app renders.
   piher never writes terminal status.
-- Metadata lives in **terminal labels**, and only ones with a reader inside piher: `piher.session`
-  (the worker's own session file) and `piher.lock.<hash>` (write-lock beacons). `hc get <terminal>
-  --json` shows them.
-- Machine-to-machine messages use **pipe-channel** (a private local socket per pair), never PTY
-  injection: PTY input belongs to the human at that pane. Core's parent notes are disabled for worker
+- Metadata lives in **terminal labels**, and only ones with a reader inside piher: `piher.lock.<hash>`
+  (write-lock beacons). `hc get <terminal> --json` shows them. A worker's **session identity** comes
+  from the core's own `hresume` label, written by the worker's Herdr extension — piher writes no
+  session label of its own.
+- Machine-to-machine messages use **the core's documents** (`piher.rep.<address>`,
+  `piher.cmd.<address>`), never PTY injection and never a socket of piher's: PTY input belongs to the
+  human at that pane, and the extension opens no listener. Core's parent notes are disabled for worker
   terminals (`noNotify: true`).
 - State arrives through core's `events.subscribe` (`status` / `turn` / `finished` / `labels`); a
   snapshot is pulled only when an event fires or a `missed` event says to resync.
@@ -201,7 +203,7 @@ After install, piher is live in every pi session, not only inside a core termina
 | Surface | Bare `pi` | Inside a herdr-core terminal |
 |---|---|---|
 | `subagent`, `bg_job` | **not registered** | live |
-| Worker-terminal rules, write locks, pipe channel | off | live |
+| Worker-terminal rules, write locks, core documents | off | live |
 | Role manifest and its visible-tool layer (`setActiveTools`) | off | on |
 | Session entries of the extension's own types | replayed from the transcript | live |
 
@@ -253,8 +255,8 @@ extension that owns `subagent` (for example `@tintinweb/pi-subagents`, `@minhduy
 - **Event-driven, never poll**: core's `events.subscribe` drives state; polling is a safety net with a
   long interval, not the mechanism.
 - **Zero app-side mod**: piher writes terminals and labels through core; the app decides how they look.
-- **PTY input belongs to humans**: machine-to-machine messages use the pipe channel; core's parent
-  notes are off for worker terminals.
+- **PTY input belongs to humans**: machine-to-machine messages travel as core documents; core's
+  parent notes are off for worker terminals.
 - **Best-effort metadata**: a label or notice failure is swallowed and never blocks the session.
 
 ## Repository layout

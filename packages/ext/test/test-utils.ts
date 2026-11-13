@@ -403,7 +403,6 @@ export async function mountSubagent(opts: SubagentMountOptions = {}): Promise<Su
     sessionRoot: root,
     port,
     getSessionId: () => '',
-    claimSettleNotice: () => true,
     terminalState: { activePaneIds: () => new Set<string>() },
     ...(opts.tasks?.length ? { initialTasks: opts.tasks } : {}),
     ...opts.deps,

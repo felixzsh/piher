@@ -15,10 +15,10 @@ or at a file that no longer exists, fails the suite.
 | D11 | The built-in role names (`master`, `worker-default`) are read from the bundle only, so a workspace or user file cannot hijack them | `packages/ext/src/role-loader.ts:30` |
 | D29 | Task-tab GC is a pure decision function: a consumed pane is closed, a pane no live task claims is never touched | `packages/ext/src/gc-core.ts:1` |
 | D45 | PTY input belongs to the human at that pane: core's parent notes are disabled for worker terminals | `packages/ext/src/core-client.ts:1` |
-| D47 | Machine-to-machine traffic goes through the extension's own pipe channel, never through PTY injection, so the transcript stays clean | `packages/ext/src/pipe-channel.ts:1` |
-| D48 | Each pane serves its own pipe name, so no side has to assume a controller/child role | `packages/ext/src/pipe-channel.ts:22` |
-| D49 | A reply follows the pipe name the sender declared, instead of a hard-coded route | `packages/ext/src/pipe-channel.ts:50` |
-| D50 | The latest machine request per pane is tracked, so an interrupt is claimed once and a settlement reply can be pushed without a round trip | `packages/ext/src/index-pipe.ts:1` |
+| D47 | ~~Machine-to-machine traffic goes through the extension's own pipe channel, never through PTY injection, so the transcript stays clean~~ superseded by the core documents (S6–S15): traffic still avoids the PTY, but the channel is the core's, not a socket piher opens | `packages/ext/src/report-documents.ts:1` |
+| D48 | ~~Each pane serves its own pipe name, so no side has to assume a controller/child role~~ superseded: a worker's address names its documents (`piher.rep.<address>`, `piher.cmd.<address>`), and nothing listens | `packages/ext/src/report-documents.ts:42` |
+| D49 | ~~A reply follows the pipe name the sender declared, instead of a hard-coded route~~ superseded: the settlement is a document the master's poll loop reads, so there is no route to declare | `packages/ext/src/report-documents.ts:52` |
+| D50 | ~~The latest machine request per pane is tracked, so an interrupt is claimed once and a settlement reply can be pushed without a round trip~~ superseded: a settle is deduped by the document instance (`address`, `at`), and `interrupt` is the core's own `terminal.interrupt` | `packages/ext/src/report-documents.ts:78` |
 | D76 | Role manifest v2 with a fail-closed validator: an unknown rule value is an error at load, not a silent refusal at call time | `packages/ext/src/role-manifest.ts:1` |
 | D77 | The visible-tool layer hides tools outside the manifest *after* every plugin has registered, so a role cannot see what it may not call | `packages/ext/src/index-roles.ts:1` |
 | D78 | The master composes a cordis tree for its plugins; a worker process bypasses it entirely | `packages/ext/src/bootstrap.ts:1` |
@@ -55,7 +55,7 @@ or at a file that no longer exists, fails the suite.
 | S21 | The catalog rides the prompt: an action would spend a round trip on text that fits in the request for free | `packages/ext/src/role-catalog.ts:1` |
 | S22 | A role switch is the one recompute point for the visible tool set; a widen from a human asks first | `packages/ext/src/role-state.ts:1` |
 | S41 | One task directory per repository: a spawn or resume asked from a linked worktree resolves the main checkout's `<repo>/.piher/tasks`, not its own | `packages/ext/src/storage-layout.ts:1` |
-| S50 | The admission slot covers pane creation only, so a resume waiting for its pipe cannot starve a spawn behind it | `packages/ext/src/subagent-core.ts:1` |
+| S50 | The admission slot covers pane creation only, so a resume waiting for its agent to report ready cannot starve a spawn behind it | `packages/ext/src/subagent-core.ts:110` |
 | S52 | An interrupted turn reports nothing: the settlement notice hangs off the push that carries the report, never off an aborted turn | `packages/ext/src/index.ts:1` |
 | S53 | `close` reclaims a worker that already finished — `terminal.kill` then `terminal.rm`, the app closes the pane, the record keeps the decision and later calls are refused | `packages/ext/src/plugins/subagent.ts:1` |
 | S54 | The push comes before the shutdown: a worker whose report never reached the caller must not exit as if it had | `packages/ext/src/index.ts:1` |

@@ -36,6 +36,7 @@ import {
 import { allocateTaskSlug, taskRef, type TaskEntry } from './task-row.ts';
 import type { Poller } from './subagent-poller.ts';
 import type { SessionIo } from './subagent-session.ts';
+import { HRESUME_LABEL, hresumeSessionFile } from './subagent-session.ts';
 
 const statAsync = promisify(statCb);
 
@@ -611,7 +612,7 @@ export function createSpawner(h: SpawnerHost): Spawner {
     try {
       const terminals = await h.client.listTerminals({ all: true });
       const inSpace = terminals.filter((t) => t.labels['herdr.space'] === spaceId && t.labels['herdr.tab']);
-      const ours = inSpace.find((t) => t.labels['piher.session']);
+      const ours = inSpace.find((t) => hresumeSessionFile(t.labels[HRESUME_LABEL]) !== null);
       return (ours ?? inSpace[0])?.labels['herdr.tab'] ?? '';
     } catch {
       return '';
@@ -619,14 +620,14 @@ export function createSpawner(h: SpawnerHost): Spawner {
   }
 
   /** D94: reuse a terminal that already runs the same session instead of competing on one transcript.
-   *  Workers self-report their session file in the `piher.session` label. */
+   *  The worker's own Herdr extension reports its session in the `hresume` label (spec S18). */
   async function findExistingPane(sessionFile: string | null): Promise<{ paneId: string; tabId: string } | null> {
     if (!sessionFile) return null;
     const wanted = bareSessionId(sessionFile);
     try {
       const terminals = await h.client.listTerminals();
       const match = terminals.find((t) => {
-        const reported = t.labels['piher.session'];
+        const reported = hresumeSessionFile(t.labels[HRESUME_LABEL]);
         return reported != null && bareSessionId(reported) === wanted;
       });
       if (!match) return null;
@@ -836,14 +837,15 @@ export function createSpawnAction(h: SpawnActionHost) {
       saveTaskPrompt(taskId, spec.prompt);
       const injectId = `prompt-${taskId}`;
       const boot = (async (): Promise<void> => {
-        // S14: the core's own status is the readiness gate — the worker's private pipe is not asked.
+        // S14: the core's own status is the readiness gate, and the send's own result is delivery.
         // One budget for the whole boot (readiness + delivery retries): a retry may not restart a
         // clock the first attempt already spent, since a `send`/`retry` action waits on this boot.
         const deadline = Date.now() + readinessTimeoutMs;
         const ready = await waitReady(paneId, readinessTimeoutMs);
         if (!ready.ok) throw new BootFailure(ready.message, ready.keepPane);
-        // The `piher.session` label lags right after spawn, so the mtime fallback would otherwise adopt
-        // the newest PRE-EXISTING session in cwd; only a file written after the terminal existed counts.
+        // The worker's `hresume` report lags right after spawn (its own Herdr extension writes it a
+        // moment later), so the mtime fallback would otherwise adopt the newest PRE-EXISTING session in
+        // cwd; only a file written after the terminal existed counts.
         entry.gen.sessionFile = await resolveSessionFile(paneId, cwd, undefined, { minMtimeMs: spawnedAt - 2_000 });
         h.writeRecord(entry);
         // M11: the first task goes through the core's own `send`, reserving the PTY keyboard channel
