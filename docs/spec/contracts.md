@@ -16,14 +16,21 @@ removed concept (`settled`, the ledger, `/piher-tree`) is rewritten.
 - Resume on a spent one-shot:
   `Error: task <taskId> was a one-shot and already delivered its verdict; there is nothing to resume. Spawn a new one-shot for new work.`
 - Resume whose transcript is gone: names the task, the path it expected, and offers `retry` as the way out.
-- Resume with no session anywhere (P5): names the three places it looked — the core's `hresume` label on
-the record's address, the `session` field the settlement document reported, and the record itself — and
-says that reviving without one starts a fresh conversation. It reports only what it established: a null
-from the label read is "no label, no terminal, or the core did not answer", and the document is read
-before the refusal is printed. Fixed shape, extended by P5: `Error: task <taskId> has no session to
-resume: its core terminal is gone, its settlement document reported no session, and its record carries
-none — reviving it would start a fresh conversation. Use action "spawn" for new work, or "retry" to
-start a new task from the same brief.`
+- Resume with no session anywhere (P5). Three shapes, each asserting only what its read established:
+  `Error: task <taskId> cannot be checked for a session right now: the core did not answer for its
+  terminal <paneId> or its settlement document, so no session could be read. Try action "resume" again
+  once the core answers.` · `Error: task <taskId> has no session to resume: <what the terminal read
+  established>, <what the document read established>, and its record carries none — reviving it would
+  start a fresh conversation. Use action "spawn" for new work, or "retry" to start a new task from the
+  same brief.` (the terminal clause is one of `it has no terminal left`, `its core terminal is gone`, `its
+  core terminal <paneId> is not its own (<why>)`, `its core terminal reports no session`; the document
+  clause is one of `its settlement document reported no session`, `the settlement document at its address
+  belongs to another task`, `the document at its address is not a report piher can read`, `it has no
+  settlement document`) · `Error: task <taskId> cannot be resumed: its transcript <path> is gone, and
+  reviving it would start a fresh conversation that knows nothing of the task. Use action "retry" to
+  start a new task…`
+- Ownership of a terminal is a fact piher wrote there: the `piher.task` label set at spawn must name the
+  task. An address, and a missing `parent`, are never evidence of ownership (`S18`, `S26`).
 - Unknown id: `Error: unknown subagent id "<raw>" (see action list)` — printed only after the view, the
   records of this repository, and the id forms of S17 have all missed.
 

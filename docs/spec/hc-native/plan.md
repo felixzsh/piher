@@ -116,3 +116,19 @@ empty interim settle cannot fire between a finished turn and a steer's turn (`do
 `docs/extensions.md:336`); recorded where the empty settle is written. Residuals: the seam is the fake
 core, not a live `hc`; a channel-less worker's row still reads `idle` in `list`; `config-catalog` now
 names any unregistered `PIHER_*` and sweeps the whole source tree.
+L7. **P5 done**: `511da5a` (`2e796b9` + `ed949b9` + `511da5a` for the corrections; `3a43fe5` is the
+docs-only commit), Risk: item 4 + item 3 (the settle boundary collapsed to a process fact, and `interrupt`
+plus the session resolution of `output`/`resume` changed behaviour), `tsc` clean + `npm test`
+**535/535** on `511da5a`, Route: delegated. Two reviews, both REJECT, then two correction rounds verified by
+the parent — the phase's review budget is two, and the second round's 8 findings were closed without a third
+review, which this line records rather than disguises. Deleted: `pipe-channel.ts`, `index-pipe.ts` and its
+test, `PIPE_WATCHDOG_MS` with the healing interval, takeover/generations, the settle fast-path push,
+`pendingMachineRequest`, the settle-claim latch, the `piher.session` label and `PIHER_PIPE_TRACE`; the
+plan's boundary sweep is **0**, repo-wide. What the two corrections established: ownership is now a fact
+piher wrote into the core — the `piher.task` label set at spawn must name the task, and an address or a
+missing `parent` is never evidence of ownership (S18/S26); a session is only written into a record when it
+is an existing `.jsonl`; the resume refusal has three shapes and asserts only what its read established;
+`turnStartedAt` is defined for a turn that began before the mount; and the "never PTY injection" claim is
+gone from the README and the decision notes, because `terminal.interrupt` presses the stop key in that pane.
+Residuals: the seam is the fake core, not a live `hc`; a channel-less worker's row still reads `idle`;
+`send` to a vanished pane still revives without a session.
