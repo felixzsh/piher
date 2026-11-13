@@ -30,12 +30,14 @@ function markdownUnder(dir: string): string[] {
   return out;
 }
 
-/** What a user reads: the README pair, `docs/`, and the shipped skill. */
+/** What a user reads: the README pair, `docs/`, and the shipped skill. The design records under
+ *  `docs/spec/` are excluded on purpose: they quote knobs historically (a spec that says a knob was
+ *  deleted names it, and that is the opposite of rot). */
 function shippedDocs(): string[] {
   return [
     'README.md',
     'packages/ext/README.md',
-    ...markdownUnder('docs'),
+    ...markdownUnder('docs').filter((path) => !path.startsWith('docs/spec/')),
     ...markdownUnder('packages/ext/skills'),
   ];
 }
