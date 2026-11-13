@@ -191,6 +191,15 @@ test('createRuntimePolicy: an invalid/out-of-range value warns once and falls ba
   assert.equal(createRuntimePolicy().readinessTimeoutMs, 90_000);
 }));
 
+test('the readiness knob describes what it now controls: ready plus the first message', () => {
+  const spec = OPTION_SPECS.find((o) => o.name === 'PIHER_READY_TIMEOUT_MS');
+  assert.ok(spec);
+  // P2 (spec S14): the wait is not a socket bind any more, so `/piher-config doctor` must not say it is.
+  assert.doesNotMatch(spec.description, /pipe/);
+  assert.match(spec.description, /ready/);
+  assert.match(spec.description, /first message/);
+});
+
 test('registry: every registered name reaches the reader that owns it', withCleanup((cleanup) => {
   applyEnv(cleanup, { PIHER_JOBS_DIR: '/tmp/piher-job-test' });
   assert.equal(optionValue('PIHER_JOBS_DIR'), '/tmp/piher-job-test');

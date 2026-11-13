@@ -370,6 +370,135 @@ test('S54 one-shot lifetime: the report reaches the parent before the worker shu
   }
 }));
 
+/* ── settle without a pipe frame (P2: the first task rides the core, spec S14) ── */
+
+/** A core that answers only what a settle needs: one terminal with a turn, and a document store
+ *  that records every write so a test can read what the worker published (spec S6-S8). */
+async function mountSettleCore(socketPath: string, turn: number): Promise<{
+  docs: Array<{ name: string; value: unknown; version: number }>;
+  calls: string[];
+  close(): Promise<void>;
+}> {
+  const docs: Array<{ name: string; value: unknown; version: number }> = [];
+  const calls: string[] = [];
+  const server = createServer((sock) => {
+    let buf = '';
+    sock.setEncoding('utf8');
+    sock.on('error', () => {});
+    sock.on('data', (chunk) => {
+      buf += chunk;
+      const idx = buf.indexOf('\n');
+      if (idx < 0) return;
+      const req = JSON.parse(buf.slice(0, idx)) as { id: number; method: string; params: Record<string, unknown> };
+      calls.push(req.method);
+      let result: unknown = {};
+      if (req.method === 'terminal.get') {
+        result = { address: req.params.terminal, state: 'live', labels: {}, turn, status: { state: 'idle' } };
+      } else if (req.method === 'doc.get') {
+        result = { value: null, version: 0 };
+      } else if (req.method === 'doc.set') {
+        docs.push({ name: String(req.params.name), value: req.params.value, version: Number(req.params.version) });
+        result = { version: 1 };
+      }
+      sock.end(`${JSON.stringify({ jsonrpc: '2.0', id: req.id, result })}\n`);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  return { docs, calls, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+}
+
+/** Boots a one-shot worker whose task arrived through the core (no pipe frame armed a request) and
+ *  fires one full turn over a session file the test writes. */
+async function firePtyTurn(cleanup: CleanupContext, opts: {
+  pane: string;
+  /** A closing message written BEFORE this turn, this many ms old: a stale report to be ignored. */
+  stale?: { text: string; ageMs: number };
+  /** The turn's own closing message, stamped when the turn wrote it; null for a turn without words. */
+  closing?: string | null;
+  /** What this settle should end in: a document (waited for) or nothing at all (a short grace). */
+  expect: 'write' | 'silent';
+}): Promise<{ docs: Array<{ name: string; value: unknown; version: number }>; calls: string[]; shutdowns: number; pi: FakePi }> {
+  const home = cleanup.tempDir(`piher-pty-home-${opts.pane}`).path;
+  const cwd = cleanup.tempDir(`piher-pty-ws-${opts.pane}`).path;
+  const sockDir = cleanup.tempDir(`piher-pty-sock-${opts.pane}`).path;
+  const core = await mountSettleCore(join(sockDir, 'core.sock'), 1);
+  const sessionId = `pty-sess-${opts.pane}`;
+  const pi = await mountIndex(cleanup, 'worker', {
+    HC_TERMINAL_SOCKET: join(sockDir, 'core.sock'),
+    HC_TERMINAL_ID: opts.pane,
+    PI_CODING_AGENT_DIR: home,
+    PI_SESSION_FILE: sessionId,
+    PIHER_DELEGATION: JSON.stringify({
+      parentPaneId: 'p_parent', parentSessionId: 'aaaa1111', taskId: 't-pty',
+      description: 'typed brief', role: 'reviewer', lifecycle: 'one-shot',
+    }),
+  });
+  let shutdowns = 0;
+  const ctx = {
+    cwd,
+    sessionManager: { getBranch: () => [] },
+    isIdle: () => true,
+    shutdown: () => { shutdowns += 1; },
+  };
+  try {
+    await fire(pi, 'session_start', { reason: 'new' }, ctx);
+    const sessDir = join(home, 'sessions', sessionDirName(process.cwd()));
+    await mkdir(sessDir, { recursive: true });
+    const file = join(sessDir, `2026-09-22T00-00-00-000Z_${sessionId}.jsonl`);
+    const scrolled = [
+      { type: 'session', id: sessionId },
+      ...(opts.stale ? [transcriptMessage('assistant', opts.stale.text, Date.now() - opts.stale.ageMs)] : []),
+    ];
+    await writeFile(file, jsonl(...scrolled));
+    // No pipe frame: the master's brief came through `terminal.send` and pi starts the turn itself.
+    await fire(pi, 'turn_start');
+    await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'stop' } }, ctx);
+    // The turn's own words are stamped now, after its start — what a real transcript looks like.
+    if (opts.closing != null) {
+      await writeFile(file, jsonl(...scrolled, transcriptMessage('assistant', opts.closing, Date.now())));
+    }
+    await fire(pi, 'agent_settled', {}, ctx);
+    const deadline = Date.now() + (opts.expect === 'write' ? 2_000 : 150);
+    while (Date.now() < deadline && (shutdowns === 0 || core.docs.length === 0)) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    return { docs: core.docs, calls: core.calls, shutdowns, pi };
+  } finally {
+    await fire(pi, 'session_shutdown');
+    await core.close();
+  }
+}
+
+test('S54/P2: a one-shot whose brief came through the core still writes its report and exits', withCleanup(async (cleanup) => {
+  const pane = 'p_pty_one';
+  const result = await firePtyTurn(cleanup, {
+    pane,
+    closing: 'REPORT: the typed brief was answered.',
+    expect: 'write',
+  });
+  // The document is the delivery for a task with no requester pipe, and the exit waits for it.
+  assert.equal(result.docs.length, 1, `one report document, written on the settle (core calls: ${result.calls.join(',')})`);
+  const doc = result.docs[0]!;
+  assert.equal(doc.name, `piher.rep.${pane}`);
+  assert.equal((doc.value as { text?: string }).text, 'REPORT: the typed brief was answered.');
+  assert.equal((doc.value as { turn?: number }).turn, 1);
+  assert.equal(result.shutdowns, 1, 'the one-shot exited once its report was in the master\'s hands');
+}));
+
+test('S54/P2: a settle with no closing words of its own never publishes an older turn\'s report', withCleanup(async (cleanup) => {
+  const pane = 'p_pty_two';
+  const result = await firePtyTurn(cleanup, {
+    pane,
+    stale: { text: 'STALE: a report from before this turn.', ageMs: 60_000 },
+    closing: null,
+    expect: 'silent',
+  });
+  // The request boundary is this turn's start (no pipe frame armed one), not the beginning of the
+  // session: with a zero boundary the stale closing message above would have settled this turn.
+  assert.deepEqual(result.docs, [], 'nothing was published, and no stale text was passed off as this turn');
+  assert.equal(result.shutdowns, 0, 'a worker with nothing to report does not exit as if it had');
+}));
+
 test('a persistent worker settles without exiting', withCleanup(async (cleanup) => {
   const childPane = 'p_persistent_child';
   let shutdowns = 0;
@@ -637,11 +766,6 @@ test('worker settle: the report document is written with no request pending, sta
   const agentDir = cleanup.tempDir('piher-worker-agent').path;
   const cwd = cleanup.tempDir('piher-worker-cwd').path;
   const sessionFile = join(agentDir, '2026-01-01T00-00-00-000Z_ffffffff-0000-4000-8000-000000000000.jsonl');
-  // A refused tool and an ended turn with no words: the diagnosis, not the stop word, is the report.
-  writeFileSync(sessionFile, jsonl(
-    transcriptMessage('toolResult', 'Error: role "worker" does not permit tool "bash"', Date.now(), 'stop'),
-    { type: 'message', message: { role: 'assistant', content: [], timestamp: Date.now(), stopReason: 'stop' } },
-  ));
   await withWorkerCore([], async (socketPath, calls) => {
     const pi = await mountIndex(cleanup, 'core-worker', {
       HC_TERMINAL_SOCKET: socketPath,
@@ -654,6 +778,12 @@ test('worker settle: the report document is written with no request pending, sta
     try {
       await fire(pi, 'session_start', { reason: 'new' }, ctx);
       await fire(pi, 'turn_start');
+      // A refused tool and an ended turn with no words, written by the turn itself (after its start):
+      // the diagnosis, not the stop word, is the report.
+      writeFileSync(sessionFile, jsonl(
+        transcriptMessage('toolResult', 'Error: role "worker" does not permit tool "bash"', Date.now(), 'stop'),
+        { type: 'message', message: { role: 'assistant', content: [], timestamp: Date.now(), stopReason: 'stop' } },
+      ));
       await fire(pi, 'agent_settled', {}, ctx);
       // No request is pending here (S6): the write is off the settle's critical path, so the test
       // waits for it instead of assuming it already landed.

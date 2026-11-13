@@ -300,7 +300,7 @@ export default async function (pi: ExtensionAPI) {
     docAt: number | null;
   }): Promise<boolean> {
     const { aborted, turnStopReason, request: req, report, docAt } = input;
-    if (!req || !req.from) {
+    if (!req) {
       return false;
     }
     // An aborted settle is not a settlement: the closing message is still coming, and answering now
@@ -315,6 +315,11 @@ export default async function (pi: ExtensionAPI) {
       return false;
     }
     pendingMachineRequest = null;
+    // A request with no requester pipe (a task the master handed over through the core, spec S14):
+    // there is nobody to push to — the document written before this is the delivery (spec S6-S8).
+    if (!req.from) {
+      return false;
+    }
     try {
       // A turn that ended with nothing to say but a reason — a refused tool, an error — must say
       // it: staying silent left the master waiting the whole vacuum budget for a report that was
@@ -453,6 +458,14 @@ export default async function (pi: ExtensionAPI) {
     agentActive = true;
     // A11: reset so a previous turn's abort cannot taint this one.
     lastStopReason = null;
+    // P2 (spec S14): the master's first task now arrives through the core's own `send`, so no pipe
+    // frame armed a request for it. Without one a settlement has no boundary (`sinceTs` fell back to
+    // 0, letting an older closing message through) and a one-shot worker never exited. A local request
+    // names this turn's start and has no requester pipe: the document is its delivery (spec S6-S8).
+    if (isSubagent && pendingMachineRequest === null) {
+      const at = Date.now();
+      pendingMachineRequest = { id: `turn-${at}`, from: null, sinceTs: at };
+    }
   });
 
   pi.on('turn_end', async (event: unknown, ctx) => {
@@ -515,16 +528,18 @@ export default async function (pi: ExtensionAPI) {
     // pane immediately (the retire would otherwise cut the write short), and the reply names the
     // document's `at` so the master can record exactly which settlement the pipe delivered (S7).
     const pushed = settled
-      .then((report) => writeSettleDocument({ aborted, turnStopReason, report, hadRequest: request !== null, at })
-        .then((written) => pushSettleReply({
-          aborted, turnStopReason, request, report, docAt: written ? at : null,
-        })));
+      .then(async (report) => {
+        const written = await writeSettleDocument({ aborted, turnStopReason, report, hadRequest: request !== null, at });
+        const sent = await pushSettleReply({ aborted, turnStopReason, request, report, docAt: written ? at : null });
+        return { written, sent };
+      });
     // S54: a role-declared `one-shot` worker exits once its report is in the master's hands. The
-    // ordering is the whole risk — shutting down first loses the report the parent waits for — and
-    // `pushed` already resolves after the document write, so the exit waits for both. An aborted
-    // turn reports nothing (S52).
+    // ordering is the whole risk — shutting down first loses the report the parent waits for. "In the
+    // master's hands" is the document write (spec S6-S8, the channel that survives a restart) or the
+    // pipe push, whichever happened; since P2 the first task's settlement has no pipe push at all.
+    // An aborted turn reports nothing (S52).
     if (isSubagent && !aborted && delegation?.lifecycle === 'one-shot') {
-      void pushed.then((sent) => { if (sent) ctx.shutdown(); });
+      void pushed.then(({ written, sent }) => { if (written || sent) ctx.shutdown(); });
     } else {
       void pushed;
     }

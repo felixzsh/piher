@@ -198,6 +198,8 @@ test('contract: every request piher sends names a real method, known params, and
     await client.run({ argv: ['pi'], cwd: '/w', env: { A: '1' }, labels: { a: 'b' }, name: 'w', noNotify: true });
     await client.run({ line: 'echo hi', parent: null });
     await client.send('t2', 'hi', { force: true });
+    // The `if` gate: readiness and the paste in one request (spec S14). Its param name is the core's.
+    await client.send('t2', 'hi', { if: 'idle' });
     await client.keys('t2', ['enter']);
     await client.interrupt('t2');
     await client.read('t2', { lines: 40 });

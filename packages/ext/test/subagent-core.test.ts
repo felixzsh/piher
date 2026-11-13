@@ -20,7 +20,7 @@ import {
 import {
   allocateTaskSlug, parseTaskDocument, slugifyTask, taskRef, type TaskEntry,
 } from '../src/task-row.ts';
-import { planReadyAttempt, readyBackoffMs, readyFailureText } from '../src/subagent-spawn.ts';
+import { keepsPane, planReadyAttempt, readyBackoffMs, readyFailureText, unreportedGraceMs } from '../src/subagent-spawn.ts';
 
 const RT = { nodePath: '/usr/local/bin/node', cliPath: '/opt/pi/dist/cli.js', extPath: '/ext/index.ts' };
 
@@ -249,19 +249,36 @@ test('readyBackoffMs: exponential with a cap (500ms → 1s → 2s → 4s → 4s)
   }
 });
 
-test('planReadyAttempt: ready wins; a gone pane fails fast; an unknown probe keeps retrying', () => {
+test('planReadyAttempt: ready wins; a gone pane fails fast; a dialog and an error are said at once', () => {
   const plan = (over: Partial<Parameters<typeof planReadyAttempt>[0]>) =>
-    planReadyAttempt({ elapsedMs: 10, attempt: 0, timeoutMs: 90_000, alive: true, ready: false, ...over });
-  assert.deepEqual(plan({ ready: true }), { kind: 'ready' });
+    planReadyAttempt({ elapsedMs: 10, attempt: 0, timeoutMs: 90_000, alive: true, status: 'unknown', ...over });
+  assert.deepEqual(plan({ status: 'idle' }), { kind: 'ready' });
+  assert.deepEqual(plan({ status: 'done' }), { kind: 'ready' }, 'done is not working: the composer takes input');
   assert.deepEqual(plan({ alive: false }), { kind: 'give-up', reason: 'pane-gone' });
   assert.deepEqual(plan({ alive: null }), { kind: 'retry', delayMs: 500 });
-  assert.deepEqual(plan({ elapsedMs: 89_999, attempt: 7 }), { kind: 'retry', delayMs: 4000 });
-  assert.deepEqual(plan({ elapsedMs: 90_000, attempt: 8 }), { kind: 'give-up', reason: 'timeout' });
+  assert.deepEqual(plan({ status: 'working' }), { kind: 'retry', delayMs: 500 });
+  assert.deepEqual(plan({ elapsedMs: 89_999, attempt: 7, status: 'working' }), { kind: 'retry', delayMs: 4000 });
+  assert.deepEqual(plan({ elapsedMs: 90_000, attempt: 8, status: 'working' }), { kind: 'give-up', reason: 'timeout' });
+  // A dialog or a reported error is not "wait longer": the boot says so at once and keeps the pane.
+  assert.deepEqual(plan({ status: 'blocked' }), { kind: 'give-up', reason: 'blocked' });
+  assert.deepEqual(plan({ status: 'error' }), { kind: 'give-up', reason: 'error' });
   // A dead pane outranks the timeout: the more accurate reason wins.
   assert.deepEqual(plan({ elapsedMs: 120_000, attempt: 9, alive: false }), { kind: 'give-up', reason: 'pane-gone' });
 });
 
-test('readyFailureText: crash, blocked, working-but-slow and never-reported are distinguishable', () => {
+test('planReadyAttempt: a program that never reports status is handed its task after the grace', () => {
+  const plan = (over: Partial<Parameters<typeof planReadyAttempt>[0]>) =>
+    planReadyAttempt({ attempt: 1, timeoutMs: 90_000, alive: true, status: 'unknown', elapsedMs: 0, ...over });
+  assert.equal(unreportedGraceMs(90_000), 3_000, 'a grace, not the whole budget');
+  assert.equal(unreportedGraceMs(300), 150, 'never more than half the budget');
+  assert.deepEqual(plan({ elapsedMs: 2_999 }), { kind: 'retry', delayMs: 1000 }, 'still booting');
+  assert.deepEqual(plan({ elapsedMs: 3_000 }), { kind: 'ready' }, 'nobody can tell, so the delivery decides');
+  assert.deepEqual(plan({ status: null, elapsedMs: 3_000 }), { kind: 'ready' });
+  // A program that does report status is still waited for: the grace is not a release from readiness.
+  assert.deepEqual(plan({ status: 'working', elapsedMs: 3_000 }), { kind: 'retry', delayMs: 1000 });
+});
+
+test('readyFailureText: crash, blocked, error, working-but-slow and never-reported are distinguishable', () => {
   const crashed = readyFailureText({
     paneId: 'wX:p9',
     reason: 'pane-gone',
@@ -276,16 +293,32 @@ test('readyFailureText: crash, blocked, working-but-slow and never-reported are 
     paneId: 'wX:p9', reason: 'timeout', elapsedMs: 90_000, timeoutMs: 90_000, lastStatus: 'working',
   });
   assert.match(slow, /was not ready within 90s/);
-  assert.match(slow, /alive and working/);
+  assert.match(slow, /alive and already running a turn/);
+  assert.match(slow, /pane is kept/, 'the advice must survive the boot keeping the pane');
 
   const blocked = readyFailureText({
-    paneId: 'wX:p9', reason: 'timeout', elapsedMs: 90_000, timeoutMs: 90_000, lastStatus: 'blocked',
+    paneId: 'wX:p9', reason: 'blocked', elapsedMs: 10, timeoutMs: 90_000, lastStatus: 'blocked',
   });
   assert.match(blocked, /blocked on a dialog/);
+  assert.match(blocked, /answer that dialog in the pane, then retry this task/);
+  assert.match(blocked, /pane is kept/);
 
-  const stuck = readyFailureText({ paneId: 'wX:p9', reason: 'timeout', elapsedMs: 90_000, timeoutMs: 90_000, lastStatus: 'idle' });
+  const errored = readyFailureText({
+    paneId: 'wX:p9', reason: 'error', elapsedMs: 10, timeoutMs: 90_000, lastStatus: 'error',
+  });
+  assert.match(errored, /reported an error before it was ready/);
+  assert.match(errored, /pane is kept/);
+
+  const stuck = readyFailureText({ paneId: 'wX:p9', reason: 'timeout', elapsedMs: 90_000, timeoutMs: 90_000, lastStatus: 'unknown' });
   assert.match(stuck, /never reported `idle`/);
+  assert.match(stuck, /PI_PROGRAM_STATUS=0/, 'a program that reports nothing is named as such');
   assert.ok(!stuck.includes('last output'));
+  assert.ok(!stuck.includes('failed to load the piher extension'), 'the pipe is not the diagnosis any more');
+});
+
+test('keepsPane: only a gone pane is retired; every live failure keeps its terminal and row', () => {
+  assert.equal(keepsPane('pane-gone'), false);
+  for (const reason of ['timeout', 'blocked', 'error'] as const) assert.equal(keepsPane(reason), true, reason);
 });
 
 test('resolveTaskIdPrefix: exact beats length, prefixes need four chars and report ambiguity', () => {

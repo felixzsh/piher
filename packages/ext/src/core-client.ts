@@ -163,9 +163,11 @@ export interface CoreClientLike {
   getTerminal(id: string): Promise<TerminalInfo | null>;
   listTerminals(opts?: { labels?: Record<string, string>; all?: boolean }): Promise<TerminalInfo[]>;
   run(opts: RunOptions): Promise<TerminalInfo>;
-  /** Paste text and press Enter (core waits for ~3 s of human quiet), and report whether a turn
-   *  started (`SendResult`): the paste alone is not delivery. */
-  send(id: string, text: string, opts?: { force?: boolean }): Promise<SendResult>;
+  /** Paste text and press Enter (core waits for ~3 s of human quiet) and report whether a turn
+   *  started (`SendResult`): the paste alone is not delivery. `if` makes the paste conditional on the
+   *  program's status AT THE MOMENT IT TYPES, so readiness and the paste are one request: a program
+   *  that stopped being ready in the gap is refused with `status_mismatch` and nothing is typed. */
+  send(id: string, text: string, opts?: { force?: boolean; if?: 'idle' | 'working' }): Promise<SendResult>;
   keys(id: string, keys: readonly string[]): Promise<void>;
   interrupt(id: string): Promise<InterruptOutcome>;
   read(id: string, opts?: { lines?: number }): Promise<ReadBuffer>;
@@ -659,12 +661,13 @@ export class CoreClient implements CoreClientLike {
     return decodeTerminal(await this.request('terminal.run', params));
   }
 
-  async send(id: string, text: string, opts: { force?: boolean } = {}): Promise<SendResult> {
+  async send(id: string, text: string, opts: { force?: boolean; if?: 'idle' | 'working' } = {}): Promise<SendResult> {
     return decodeSendResult(await this.request('terminal.send', {
       terminal: id,
       text,
       caller: this.env.terminalId,
       ...(opts.force ? { force: true } : {}),
+      ...(opts.if ? { if: opts.if } : {}),
     }, 30_000));
   }
 

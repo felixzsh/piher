@@ -1,5 +1,5 @@
-/** Spawn domain: readiness failures, the spawn tool (piped prompt injection, off-turn settlement,
- * rollback) and the injectable git adapter. */
+/** Spawn domain: readiness failures, the spawn tool (first task through the core, off-turn
+ * settlement, rollback) and the injectable git adapter. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -9,7 +9,7 @@ import {
 import type { Server, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import type { CoreClientLike, CoreStatus, SendResult } from '../../src/core-client.ts';
+import { CoreError, type CoreClientLike, type CoreStatus, type SendResult } from '../../src/core-client.ts';
 import type { RuntimePolicy } from '../../src/runtime-policy.ts';
 import { pipeNameFor, pipePathFor, startPipeServer } from '../../src/pipe-channel.ts';
 import {
@@ -18,7 +18,7 @@ import {
 import { sessionStatePath } from '../../src/session-state.ts';
 import type { SubagentPortBox } from '../../src/subagent-core.ts';
 import type { TaskRow } from '../../src/task-row.ts';
-import { NodeGitAdapter, createSpawner, planTaskSend, type GitExecFile } from '../../src/subagent-spawn.ts';
+import { BootFailure, NodeGitAdapter, createSpawner, planTaskSend, type GitExecFile } from '../../src/subagent-spawn.ts';
 import {
   TempHome, fakeCore, fakeWatch, fire, jsonl, mountSubagent, readTaskView, runSubagent, runSubagentRejects,
   seedTaskDocuments, terminalInfo, transcriptMessage, type FakePi,
@@ -34,8 +34,8 @@ const spawnerFor = (client: Partial<CoreClientLike>, over: Record<string, unknow
   ...over,
 } as Parameters<typeof createSpawner>[0]);
 
-test('waitReady/planTaskSend: the core decides readiness, and only a started turn is delivery', async (t) => {
-  await t.test('a gone terminal fails fast with its last output instead of waiting out the timeout', async () => {
+test('waitReady/planTaskSend: the core decides readiness, and the turn proves delivery', async (t) => {
+  await t.test('a gone terminal fails fast with its last output, and its pane is not kept', async () => {
     const spawner = spawnerFor({
       getTerminal: async () => null,
       read: async () => ({ text: 'TypeError: boom at footer.render', complete: true }),
@@ -46,65 +46,204 @@ test('waitReady/planTaskSend: the core decides readiness, and only a started tur
     if (out.ok) return;
     assert.match(out.message, /exited before its agent reported ready/);
     assert.match(out.message, /TypeError: boom at footer\.render/);
+    assert.equal(out.keepPane, false, 'nothing is left to keep');
     assert.ok(Date.now() - started < 10_000, 'a gone terminal must not wait for the readiness timeout');
   });
 
-  await t.test('a live terminal whose agent never reports idle is alive-but-not-ready, not gone', async () => {
-    const terminalId = 'tH';
+  await t.test('a program that never reports status is handed its task after the grace, not failed', async () => {
     const spawner = spawnerFor({
       getTerminal: async (id) => terminalInfo({ id, status: 'unknown' }),
       read: async () => ({ text: 'booting', complete: true }),
-    }, { readinessTimeoutMs: 50 });
-    const out = await spawner.waitReady(terminalId);
+    }, { readinessTimeoutMs: 400 });
+    const started = Date.now();
+    const out = await spawner.waitReady('tH');
+    assert.equal(out.ok, true, 'PI_PROGRAM_STATUS=0 must not make a worker unreachable');
+    assert.ok(Date.now() - started <= 500, 'the grace, not the whole budget');
+  });
+
+  await t.test('a pane stuck in a turn of its own for the whole budget fails, keeping its pane', async () => {
+    const spawner = spawnerFor({
+      getTerminal: async (id) => terminalInfo({ id, status: 'working' }),
+    }, { readinessTimeoutMs: 300 });
+    const out = await spawner.waitReady('tW');
     assert.equal(out.ok, false);
     if (out.ok) return;
     assert.match(out.message, /was not ready within/);
-    assert.match(out.message, /never reported `idle`/, 'a live terminal means "still booting", not "gone"');
+    assert.equal(out.keepPane, true, 'a live pane is kept so its output can be read');
   });
 
-  await t.test('an agent blocked on a dialog is told to answer it, not to retry blindly', async () => {
+  await t.test('an agent blocked on a dialog is reported at once, with advice the kept pane can honour', async () => {
     const spawner = spawnerFor({
       getTerminal: async (id) => terminalInfo({ id, status: 'blocked' }),
-    }, { readinessTimeoutMs: 20 });
+    }, { readinessTimeoutMs: 90_000 });
+    const started = Date.now();
     const out = await spawner.waitReady('tB');
     assert.equal(out.ok, false);
     if (out.ok) return;
     assert.match(out.message, /blocked on a dialog/);
+    assert.match(out.message, /answer that dialog in the pane, then retry this task/);
+    assert.equal(out.keepPane, true);
+    assert.ok(Date.now() - started < 2_000, 'no waiting out a budget a person has to answer');
   });
 
-  await t.test('planTaskSend: a null or false result is not delivery, and the budget ends the retries', () => {
-    assert.deepEqual(planTaskSend({ started: true, elapsedMs: 5, attempt: 3, timeoutMs: 1000 }), { kind: 'delivered' });
-    assert.deepEqual(planTaskSend({ started: null, elapsedMs: 5, attempt: 0, timeoutMs: 1000 }), { kind: 'retry', delayMs: 500 });
-    assert.deepEqual(planTaskSend({ started: false, elapsedMs: 5, attempt: 2, timeoutMs: 1000 }), { kind: 'retry', delayMs: 2000 });
-    assert.deepEqual(planTaskSend({ started: null, elapsedMs: 1000, attempt: 4, timeoutMs: 1000 }), { kind: 'give-up' });
+  await t.test('planTaskSend: a null result is delivery only when a turn says so, else the composer is submitted', () => {
+    const facts = (over: Partial<Parameters<typeof planTaskSend>[0]>) => planTaskSend({
+      refusedNotIdle: false, started: null, turnBefore: 0, sendTurn: 0, turnAfter: 0, statusAfter: 'idle',
+      elapsedMs: 5, timeoutMs: 1000, ...over,
+    });
+    assert.deepEqual(facts({ started: true }), { kind: 'delivered' });
+    // `started: null` is "nobody can tell", not "not delivered": a turn that moved proves delivery.
+    assert.deepEqual(facts({ turnAfter: 1 }), { kind: 'delivered' }, 'a new turn is the proof the core could not give');
+    assert.deepEqual(facts({ sendTurn: 1 }), { kind: 'delivered' }, "the send's own turn names it");
+    assert.deepEqual(facts({ statusAfter: 'working' }), { kind: 'delivered' }, 'a turn in flight is delivery');
+    // No turn and no status: the text went in, so only the submit is missing.
+    assert.deepEqual(facts({}), { kind: 'resubmit', delayMs: 500 });
+    assert.deepEqual(facts({ started: false }), { kind: 'resubmit', delayMs: 500 });
+    // A refused `if` gate typed nothing, so a fresh paste cannot duplicate.
+    assert.deepEqual(facts({ refusedNotIdle: true }), { kind: 'repaste', delayMs: 500 });
+    // No evidence either side (a core that would not answer) is not delivery.
+    assert.deepEqual(facts({ turnBefore: null, turnAfter: null }), { kind: 'resubmit', delayMs: 500 });
+    assert.deepEqual(facts({ elapsedMs: 1000 }), { kind: 'give-up' });
   });
 
-  await t.test('deliverFirstTask: a send that started no turn is retried once the agent is idle again', async () => {
-    const sent: string[] = [];
-    let reads = 0;
+  await t.test('deliverFirstTask: a send that started no turn is submitted, never pasted twice', async () => {
+    const pastes: string[] = [];
+    const keys: string[][] = [];
     let turn = 0;
+    let composer = '';
     const spawner = spawnerFor({
-      getTerminal: async (id) => terminalInfo({ id, status: 'idle' }),
-      // The measured loss (spec S22): the first send leaves the text in the composer and no turn runs.
+      getTerminal: async (id) => terminalInfo({ id, status: 'idle', turn }),
+      // The measured loss (spec S22): the text lands in the composer and the core's Enter never
+      // submits it. A second paste would put the brief in the turn twice.
       send: async (_id, text) => {
-        sent.push(text);
-        reads += 1;
-        if (reads === 1) return { started: null, status: 'idle', turn };
-        turn += 1;
-        return { started: true, status: 'working', turn };
+        pastes.push(text);
+        composer += text;
+        return pastes.length === 1 ? { started: null, status: 'idle', turn } : { started: true, status: 'working', turn };
       },
-    }, { readinessTimeoutMs: 2_000 });
-    await spawner.deliverFirstTask('t2', 'do the thing');
-    assert.deepEqual(sent, ['do the thing', 'do the thing'], 'the same task is sent again, not a new one');
+      keys: async (_id, pressed) => {
+        keys.push([...pressed]);
+        if (pressed.includes('enter') && composer !== '') {
+          composer = '';
+          turn += 1;
+        }
+      },
+    }, { readinessTimeoutMs: 5_000 });
+    await spawner.deliverFirstTask('t2', 'do the thing', { budgetMs: 5_000, statusAtReady: 'idle' });
+    assert.deepEqual(pastes, ['do the thing'], 'the brief is pasted once');
+    assert.deepEqual(keys, [['enter']], 'the retry submits what the composer already holds');
     assert.equal(turn, 1, 'the turn happened');
   });
 
-  await t.test('deliverFirstTask: a core that refuses the send fails the spawn instead of looping', async () => {
+  await t.test('deliverFirstTask: a send refused because the agent stopped being idle pastes nothing it can duplicate', async () => {
+    let refuse = 1;
+    const pastes: string[] = [];
+    const gates: Array<string | undefined> = [];
+    let turn = 0;
+    const spawner = spawnerFor({
+      getTerminal: async (id) => terminalInfo({ id, status: 'idle', turn }),
+      send: async (_id, text, opts) => {
+        gates.push(opts?.if);
+        if (refuse > 0) {
+          refuse -= 1;
+          // Nothing was typed: the core refused the paste because the status moved in the gap.
+          throw new CoreError('terminal.send', 'status_mismatch', 'status is working', null);
+        }
+        pastes.push(text);
+        turn += 1;
+        return { started: true, status: 'working', turn };
+      },
+    }, { readinessTimeoutMs: 5_000 });
+    await spawner.deliverFirstTask('t2', 'do the thing', { budgetMs: 5_000, statusAtReady: 'idle' });
+    assert.deepEqual(pastes, ['do the thing'], 'one paste: the refused attempt typed nothing');
+    assert.equal(gates[0], 'idle', 'the first paste is gated on the status the core sees at that moment');
+    assert.equal(turn, 1, 'the turn happened');
+  });
+
+  await t.test('deliverFirstTask: a done agent is pasted without the idle gate, and a refusal drops it', async () => {
+    let sends = 0;
+    let turn = 0;
+    const gates: Array<string | undefined> = [];
+    const spawner = spawnerFor({
+      getTerminal: async (id) => terminalInfo({ id, status: 'done', turn }),
+      send: async (_id, _text, opts) => {
+        sends += 1;
+        gates.push(opts?.if);
+        if (opts?.if === 'idle') throw new CoreError('terminal.send', 'status_mismatch', 'status is done', null);
+        turn += 1;
+        return { started: true, status: 'working', turn };
+      },
+    }, { readinessTimeoutMs: 5_000 });
+    await spawner.deliverFirstTask('t2', 'x', { budgetMs: 5_000, statusAtReady: 'done' });
+    assert.deepEqual(gates, [undefined], 'done has no gate in the core schema, so the paste goes ungated');
+    assert.equal(sends, 1);
+
+    // When the gate is on (the normal idle boot) a refusal must not survive as a stuck gate.
+    let turn2 = 0;
+    let refusals = 0;
+    const spawner2 = spawnerFor({
+      getTerminal: async (id) => terminalInfo({ id, status: 'idle', turn: turn2 }),
+      send: async (_id, _text, opts) => {
+        if (opts?.if === 'idle' && refusals === 0) {
+          refusals += 1;
+          throw new CoreError('terminal.send', 'status_mismatch', 'status is done', null);
+        }
+        turn2 += 1;
+        return { started: true, status: 'working', turn: turn2 };
+      },
+    }, { readinessTimeoutMs: 5_000 });
+    await spawner2.deliverFirstTask('t2', 'x', { budgetMs: 5_000, statusAtReady: 'idle' });
+    assert.equal(refusals, 1, 'one refused gate, then the ungated send landed');
+  });
+
+  await t.test('deliverFirstTask: a core that missed the start is believed through the turn, not re-sent', async () => {
+    const pastes: string[] = [];
+    const keys: string[][] = [];
+    let turn = 0;
+    const spawner = spawnerFor({
+      // The turn went up, and the core still answered `started: null`: nobody can tell, but the turn
+      // can. A second paste here would duplicate the brief; a resend would spend the whole budget.
+      getTerminal: async (id) => terminalInfo({ id, status: 'done', turn }),
+      send: async (_id, text) => {
+        pastes.push(text);
+        turn += 1;
+        return { started: null, status: 'idle', turn: 0 };
+      },
+      keys: async (_id, pressed) => { keys.push([...pressed]); },
+    }, { readinessTimeoutMs: 90_000 });
+    const started = Date.now();
+    await spawner.deliverFirstTask('t2', 'do the thing', { budgetMs: 90_000, statusAtReady: 'idle' });
+    assert.deepEqual(pastes, ['do the thing'], 'one paste');
+    assert.deepEqual(keys, [], 'no submit and no second send: the turn proves it');
+    assert.ok(Date.now() - started < 5_000, 'the boot does not burn the readiness budget on a turn that ran');
+  });
+
+  await t.test('deliverFirstTask: the retries share the caller budget instead of spending a new one', async () => {
+    const pastes: string[] = [];
+    const spawner = spawnerFor({
+      getTerminal: async (id) => terminalInfo({ id, status: 'idle', turn: 0 }),
+      // Never a turn: only the budget can end this, and it is the caller's 500 ms, not a fresh 60 s.
+      send: async (_id, text) => { pastes.push(text); return { started: null, status: 'idle', turn: 0 }; },
+      keys: async () => {},
+    }, { readinessTimeoutMs: 60_000 });
+    const started = Date.now();
+    await assert.rejects(
+      () => spawner.deliverFirstTask('t2', 'x', { budgetMs: 500, statusAtReady: 'idle' }),
+      (err: unknown) => err instanceof BootFailure && err.keepPane && /took no turn from its first message/.test(err.message),
+    );
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 3_000, `one budget for the whole delivery (took ${elapsed}ms)`);
+    assert.equal(pastes.length, 1, 'only the first attempt pastes; the rest submit what is there');
+  });
+
+  await t.test('deliverFirstTask: a hard refusal keeps the pane instead of killing it', async () => {
     const spawner = spawnerFor({
       getTerminal: async (id) => terminalInfo({ id, status: 'idle' }),
-      send: async () => { throw new Error('blocked: the program is waiting on a dialog'); },
+      send: async () => { throw new CoreError('terminal.send', 'blocked', 'the program is waiting on a dialog', null); },
     }, { readinessTimeoutMs: 2_000 });
-    await assert.rejects(() => spawner.deliverFirstTask('t2', 'x'), /refused its first message: blocked:/);
+    await assert.rejects(
+      () => spawner.deliverFirstTask('t2', 'x', { budgetMs: 2_000, statusAtReady: 'idle' }),
+      (err: unknown) => err instanceof BootFailure && err.keepPane && /could not take its first message: blocked:/.test(err.message),
+    );
   });
 });
 
@@ -140,6 +279,8 @@ interface PipeEnv {
   spawnLabels: Array<Record<string, string>>;
   /** Report the worker's terminal as gone, as housekeeping would have reclaimed it. */
   paneGone: boolean;
+  /** Report a pane as finished the moment it is created: a child that died before it was ready. */
+  paneFinished: boolean;
   /** How many pipe connections die before one is served: a reclaimed pane's socket, then the revived one. */
   deadPipes: number;
   /** Uncancellable poll loop: make the children watch's `changed` never resolve, so a row it holds
@@ -152,6 +293,15 @@ interface PipeEnv {
   /** Answers the fake core gives its next sends, one per send; empty means "went working at once".
    *  `started: null` is the measured lost send (spec S22). */
   sendResults: SendResult[];
+  /** Texts pasted into a worker's composer, in order. A send the core refused pastes nothing. */
+  pastes: Array<{ paneId: string; text: string }>;
+  /** What sits unsubmitted in each pane's composer: a send that did not start a turn leaves its text
+   *  there, and Enter submits it (spec S22's measured loss). */
+  composer: Record<string, string>;
+  /** Sends the fake core refused with `status_mismatch`: nothing was typed. */
+  statusMismatches: number;
+  /** How many of the next sends are refused with `status_mismatch` (the status moved in the gap). */
+  refuseSend: number;
   /** Panes whose agent never reports `idle`, so readiness has to wait for the core. */
   notReady: Set<string>;
   /** The status word the core reports per pane; a missing entry means an idle agent. */
@@ -192,8 +342,9 @@ async function withPipeEnv(
   let wake = false;
   const env: PipeEnv = {
     cwd, home, pi: undefined as never, port: undefined as never, frames: [], retired: [], spawnEnvs: [], spawnLabels: [],
-    parkPollers: () => { parked = true; }, rejectSend: false, sendDelayMs: 0, paneGone: false, deadPipes: 0,
+    parkPollers: () => { parked = true; }, rejectSend: false, sendDelayMs: 0, paneGone: false, paneFinished: false, deadPipes: 0,
     sendResults: [], notReady: new Set<string>(), statuses: {},
+    pastes: [], composer: {}, statusMismatches: 0, refuseSend: 0,
     turns: {}, wakeWorker: () => { wake = true; }, gated: false, transcript: SUB_TEXT,
     client: undefined as never, workerSessionFile: sessionFile,
   };
@@ -228,31 +379,59 @@ async function withPipeEnv(
     if (opts.paneSeq) { for (const id of ['p3', 'p4', 'p5', 'p6']) ensureServer(id); }
     await Promise.all(servers.map((s) => new Promise<void>((resolve) => s.once('listening', resolve))));
   }
+  /** The worker's agent takes the composer: what a turn would receive, now one delivery. */
+  const submit = (id: string): void => {
+    const text = env.composer[id];
+    if (text === undefined || text === '') return;
+    delete env.composer[id];
+    env.frames.push({ channel: 'core', type: 'prompt', id: `send-${env.frames.length + 1}`, text, from: '' });
+    env.turns[id] = (env.turns[id] ?? 0) + 1;
+    if (env.transcript !== null) {
+      writeFileSync(sessionFile, jsonl(transcriptMessage('assistant', env.transcript, Date.now())));
+    }
+  };
   const clientOpts: Partial<CoreClientLike> = {
     getTerminal: async (id: string) => env.paneGone ? null : terminalInfo({
       id,
       // S14: the core's status word is the readiness gate, so an agent that has not said `idle` yet is
       // reported as never having reported — what `run --bg` shows before the worker boots.
       status: env.notReady.has(id) ? 'unknown' : env.statuses[id] ?? 'idle',
+      state: env.paneFinished ? 'finished' : 'live',
+      turn: env.turns[id] ?? 0,
       labels: ['p2', 'p3', 'p4', 'p5', 'p6'].includes(id) ? { 'piher.session': sessionFile } : {},
     }),
     // S14/S22: the first task rides the core's own `send`, and its result is the only delivery proof.
-    send: async (id: string, text: string) => {
+    // The paste lands in the composer; the core's own Enter submits it unless the scripted result says
+    // the turn never started — the measured loss, where a second paste would put the brief in the turn
+    // twice.
+    send: async (id: string, text: string, o?: { if?: 'idle' | 'working' }) => {
       if (env.rejectSend) throw new Error('blocked: the program is waiting on a dialog');
       if (env.sendDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, env.sendDelayMs));
-      // The text went in either way; only a started turn means the agent took it as a task.
-      env.frames.push({ channel: 'core', type: 'prompt', id: `send-${env.frames.length + 1}`, text, from: '' });
+      const status = env.notReady.has(id) ? 'unknown' : env.statuses[id] ?? 'idle';
+      if (env.refuseSend > 0) {
+        env.refuseSend -= 1;
+        env.statusMismatches += 1;
+        throw new CoreError('terminal.send', 'status_mismatch', `status is ${status}, not ${o?.if ?? 'any'}`, null);
+      }
+      if (o?.if && status !== o.if) {
+        env.statusMismatches += 1;
+        throw new CoreError('terminal.send', 'status_mismatch', `status is ${status}`, null);
+      }
+      env.pastes.push({ paneId: id, text });
+      env.composer[id] = (env.composer[id] ?? '') + text;
       const scripted = env.sendResults.shift();
       const started = scripted ? scripted.started : true;
-      if (started === true) env.turns[id] = (env.turns[id] ?? 0) + 1;
-      if (started === true && env.transcript !== null) {
-        writeFileSync(sessionFile, jsonl(transcriptMessage('assistant', env.transcript, Date.now())));
-      }
+      if (started === true) submit(id);
       return {
         started,
-        status: scripted?.status ?? (started === true ? 'working' : 'idle'),
+        status: scripted?.status ?? (started === true ? 'working' : status),
         turn: env.turns[id] ?? 0,
       };
+    },
+    // Enter submits whatever the composer holds; on an empty composer it does nothing, and it can never
+    // add a second copy of the brief.
+    keys: async (id: string, pressed: readonly string[]) => {
+      if (pressed.includes('enter')) submit(id);
     },
     // The poller parks on the children watch: while parked, `changed` never resolves and the
     // snapshot reports the worker as working, so the row stays running with no polling.
@@ -368,21 +547,42 @@ test('spawn action: an acknowledgement now, the prompt later, the report as a no
       assert.match(listed, /long probe/);
     });
 
-    await t.test('a refused first send retires the terminal and reports the failed start', async () => {
+    await t.test('a live pane that refused its first send is kept, and the master is told what to do', async () => {
       env.rejectSend = true;
-      const text = (await runSubagent(env.pi, { description: 'probe', prompt: PROMPT }, env.cwd)).content[0]!.text;
+      const text = (await runSubagent(env.pi, { description: 'blocked probe', prompt: PROMPT }, env.cwd)).content[0]!.text;
       assert.match(text, /^started subagent/, 'the start is acknowledged before the core answers');
       const slug = /started subagent ([a-z0-9-]+)@/.exec(text)![1];
       const failedTaskId = /\(task ([0-9a-f-]+),/.exec(text)![1];
+      await waitFor(() => env.pi.userSent.length > 0);
+      // A refusal says nothing about the pane's health: killing it would make the advice a lie and
+      // throw away the only place the reason is visible.
+      assert.deepEqual(env.retired, [], 'a live pane is not retired');
+      const notice = env.pi.userSent.at(-1)?.content ?? '';
+      assert.match(notice, /is up but did not take its first message/);
+      assert.match(notice, /blocked: the program is waiting on a dialog/);
+      assert.match(notice, /read it with action "output"/);
+      assert.match(notice, /then retry task /);
+      assert.ok(readTaskRecord(env.cwd, failedTaskId) !== null, 'the task is still there to retry or close');
+      // It also stays listed: a row whose pane is alive is actionable.
+      const listed = (await runSubagent(env.pi, { action: 'list' }, env.cwd)).content[0]!.text;
+      assert.match(listed, /blocked probe/);
+      // Scoped by slug: earlier subtests parked their workers on the same harness pane id.
+      assert.ok((env.port.current?.listRunningSubs() ?? []).some((s) => s.slug === slug), 'the kept task stays listed');
+      env.rejectSend = false;
+    });
+
+    await t.test('a pane that died before it was ready is retired and its row dropped', async () => {
+      env.paneFinished = true;
+      const text = (await runSubagent(env.pi, { description: 'dead probe', prompt: PROMPT }, env.cwd)).content[0]!.text;
+      assert.match(text, /^started subagent/, 'the start is acknowledged before the pane dies');
+      const deadTaskId = /\(task ([0-9a-f-]+),/.exec(text)![1];
       await waitFor(() => env.retired.length === 1 && env.pi.userSent.length > 0);
-      assert.deepEqual(env.retired, ['p2'], 'the failed terminal is killed');
+      assert.deepEqual(env.retired, ['p2'], 'the dead terminal is killed');
       const notice = env.pi.userSent.at(-1)?.content ?? '';
       assert.match(notice, /failed to start/);
-      assert.match(notice, /blocked: the program is waiting on a dialog/);
-      // Scoped by slug: earlier subtests parked their workers on the same harness pane id.
-      assert.ok(!(env.port.current?.listRunningSubs() ?? []).some((s) => s.slug === slug), 'no ghost running row for the failed start');
-      assert.equal(readTaskRecord(env.cwd, failedTaskId), null, 'a spawn that never started leaves no record');
-      env.rejectSend = false;
+      assert.match(notice, /Nothing is running there/);
+      assert.equal(readTaskRecord(env.cwd, deadTaskId), null, 'a spawn that never started leaves no record');
+      env.paneFinished = false;
     });
   });
 });
@@ -1112,19 +1312,74 @@ test('P2: the first task rides the core, gated on readiness and on the send resu
       assert.equal(env.frames.length, 1, 'a started turn is never re-sent');
     });
 
-    await t.test('a send whose result is `started: null` is retried, and the turn happens', async () => {
-      // The measured loss (spec S22): the text goes in before the agent reports `idle` and no turn
-      // ever runs. The same send after readiness does start one.
+    await t.test('a send whose result is `started: null` is submitted, never pasted twice', async () => {
+      // The measured loss (spec S22): the text goes in and the core's Enter never submits it. The
+      // composer holds the brief, so the retry submits it — a second paste would put the master's
+      // instructions in the turn twice.
       env.sendResults = [{ started: null, status: 'idle', turn: 0 }];
+      const pastesBefore = env.pastes.length;
       const spawned = await runSubagent(env.pi, { description: 'lost first send', prompt: PROMPT }, env.cwd);
       const paneId = spawned.details?.paneId as string;
       const before = env.turns[paneId] ?? 0;
       await waitFor(() => env.turns[paneId] === before + 1);
-      const sent = env.frames.filter((f) => f.channel === 'core').slice(-2);
-      assert.equal(sent.length, 2, 'the unstarted send is tried again');
-      assert.deepEqual(sent.map((f) => f.text), [PROMPT, PROMPT], 'the same brief, not a rewritten one');
-      assert.equal(env.turns[paneId], before + 1, 'the retried send started the turn');
+      const pastes = env.pastes.slice(pastesBefore);
+      assert.equal(pastes.length, 1, 'the brief is pasted exactly once, in the form that counts');
+      const sent = env.frames.filter((f) => f.channel === 'core').slice(-1)[0]!;
+      assert.equal(sent.text, PROMPT, 'the turn holds the brief once, not twice');
+      assert.notEqual(sent.text, `${PROMPT}${PROMPT}`, 'no duplicate brief from a second paste');
+      assert.equal(env.turns[paneId], before + 1, 'the retried submit started the turn');
+      assert.equal(env.composer[paneId], undefined, 'the composer is empty once the turn took it');
       assert.equal(existsSync(pipePathFor(pipeNameFor(env.cwd, paneId))), false, 'still no worker pipe');
     });
   }, { pipes: false });
+});
+
+test('P2: readiness does not depend on the program reporting, and the paste is gated', async (t) => {
+  await withPipeEnv(async (env) => {
+    env.parkPollers();
+
+    await t.test('a program that reports nothing still gets its brief (PI_PROGRAM_STATUS=0)', async () => {
+      // No status word at all: the core cannot gate us, so readiness must not wait out the budget.
+      env.notReady.add('p2');
+      const spawned = await runSubagent(env.pi, { description: 'silent program', prompt: PROMPT }, env.cwd);
+      const paneId = spawned.details?.paneId as string;
+      const taskId = spawned.details?.taskId as string;
+      await waitFor(() => env.turns[paneId] === 1);
+      assert.deepEqual(env.frames.filter((f) => f.channel === 'core').map((f) => f.text), [PROMPT]);
+      assert.equal(env.turns[paneId], 1, 'the turn happened without any status word');
+      assert.deepEqual(env.retired, [], 'the worker is not killed for not reporting');
+      assert.ok(readTaskRecord(env.cwd, taskId) !== null, 'the task is recorded');
+      env.notReady.delete('p2');
+    });
+
+    await t.test('a status change between the readiness read and the paste types nothing, and pastes once', async () => {
+      // The core refuses the paste because the agent is no longer idle: nothing went in, so a fresh
+      // send is safe and the brief cannot be duplicated.
+      const pastesBefore = env.pastes.length;
+      const turnsBefore = env.turns.p2 ?? 0;
+      env.refuseSend = 1;
+      const spawned = await runSubagent(env.pi, { description: 'status race', prompt: PROMPT }, env.cwd);
+      const paneId = spawned.details?.paneId as string;
+      await waitFor(() => env.turns[paneId] === turnsBefore + 1);
+      assert.equal(env.statusMismatches, 1, 'the core refused the first paste');
+      assert.deepEqual(env.pastes.slice(pastesBefore).map((p) => p.text), [PROMPT], 'one paste, not two');
+      assert.deepEqual(env.frames.filter((f) => f.channel === 'core').slice(-1).map((f) => f.text), [PROMPT]);
+      assert.equal(env.turns[paneId], turnsBefore + 1, 'the gated retry started the turn');
+    });
+
+    await t.test('a blocked worker is kept with its task, and the master is told how to unblock it', async () => {
+      env.statuses.p2 = 'blocked';
+      const text = (await runSubagent(env.pi, { description: 'trust dialog probe', prompt: PROMPT }, env.cwd)).content[0]!.text;
+      assert.match(text, /^started subagent/);
+      const taskId = /\(task ([0-9a-f-]+),/.exec(text)![1];
+      await waitFor(() => env.pi.userSent.length > 0);
+      assert.deepEqual(env.retired, [], 'the pane a person must answer is not killed');
+      const notice = env.pi.userSent.at(-1)?.content ?? '';
+      assert.match(notice, /is up but did not take its first message/);
+      assert.match(notice, /blocked on a dialog/);
+      assert.match(notice, /answer that dialog in the pane, then retry this task/);
+      assert.ok(readTaskRecord(env.cwd, taskId) !== null, 'the task survives so it can be retried');
+      delete env.statuses.p2;
+    });
+  }, { pipes: false, policy: { readinessTimeoutMs: 800 } });
 });
