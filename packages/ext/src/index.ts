@@ -302,21 +302,23 @@ export default async function (pi: ExtensionAPI) {
     return true;
   }
 
-  /** P1 (spec S6): write the settlement report document on every settle, whether or not the
+  /** P1 (spec S6, S8): write the settlement report document on every settle, whether or not the
    *  master asked — the pipe push above is gated on a pending request, which is the reason a
-   *  master-side guess had to exist at all. Best effort like the push: a failed write is logged,
-   *  never thrown, and an aborted or errored turn still reports nothing. */
-  async function writeSettleDocument(aborted = false): Promise<boolean> {
+   *  master-side guess had to exist at all. Best effort like the push, but never silent: a write
+   *  that could not land is logged with its reason, and the master still learns the report through
+   *  the push (when one is pending) or the transcript fallback. */
+  async function writeSettleDocument(input: { aborted: boolean; sinceTs: number; hadRequest: boolean }): Promise<boolean> {
+    const { aborted, sinceTs, hadRequest } = input;
     if (!isSubagent || !client.available || !env?.terminalId || !delegation) return false;
     if (!shouldPushSettleReply({ aborted, lastStopReason })) return false;
-    const { text, why, file } = ownClosing(pendingMachineRequest?.sinceTs ?? 0);
+    const { text, why, file } = ownClosing(sinceTs);
     // A worker still thinking has no closing text and no reason: withhold like the pipe push.
     if (text === null && why === null) return false;
     let turn: number | null = null;
     try {
       turn = (await client.getTerminal(env.terminalId))?.turn ?? null;
     } catch {
-      /* fall through to the logged skip below */
+      /* reported below */
     }
     if (turn === null) {
       console.error(`piher: settle document for ${env.terminalId} skipped: the core would not report its turn`);
@@ -325,13 +327,21 @@ export default async function (pi: ExtensionAPI) {
     const written = await writeReportDocument(client, env.terminalId, {
       taskId: delegation.taskId,
       turn,
-      stopReason: lastStopReason,
+      // A turn that ended without words states its reason here instead (spec S8): `stopReason`
+      // alone would say "stop", which reads as a finished turn that had nothing to report.
+      stopReason: text === null ? why : lastStopReason,
       session: file ?? (sessionId || null),
       text,
       at: Date.now(),
     });
-    if (!written) console.error(`piher: settle document for ${env.terminalId} was not written`);
-    return written !== null;
+    if (!written.ok) {
+      console.error(`piher: settle document for ${env.terminalId} was not written: ${written.reason}`
+        + (hadRequest
+          ? ' (the pipe push carries the same report)'
+          : ' (no request is pending: this settlement reaches the master through the transcript fallback)'));
+      return false;
+    }
+    return true;
   }
 
   pi.on('session_start', async (event, ctx) => {
@@ -449,14 +459,19 @@ export default async function (pi: ExtensionAPI) {
       void sendUserMessageAs(notice, 'followUp');
     }
     if (lastStopReason !== ABORT_STOP_REASON && !aborted) void notices.flush('followUp');
+    // The request this settlement answers, read before the push consumes it: the pipe reply and the
+    // report document must reason about the same turn, and the push clears the request synchronously.
+    const settleSinceTs = pendingMachineRequest?.sinceTs ?? 0;
+    const hadRequest = pendingMachineRequest !== null;
     const pushed = pushSettleReply(aborted);
     // P1: the report document goes out on every settle regardless of the pipe push above.
-    void writeSettleDocument(aborted);
+    const documented = writeSettleDocument({ aborted, sinceTs: settleSinceTs, hadRequest });
     // S54: a role-declared `one-shot` worker exits once its report is in the master's hands. The
     // ordering is the whole risk — shutting down first loses the report the parent waits for — so the
-    // exit hangs off the push, and never off an aborted turn (S52: an interrupted turn reports nothing).
+    // exit hangs off the push AND waits for the document write: three core round-trips the shutdown
+    // would otherwise cut short. An aborted turn reports nothing (S52).
     if (isSubagent && !aborted && delegation?.lifecycle === 'one-shot') {
-      void pushed.then((sent) => { if (sent) ctx.shutdown(); });
+      void Promise.all([pushed, documented]).then(([sent]) => { if (sent) ctx.shutdown(); });
     } else {
       void pushed;
     }

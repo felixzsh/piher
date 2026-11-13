@@ -360,6 +360,9 @@ export default function subagentPlugin(ctx: Context): void {
       const entry = taskForPane(tasks, panes, paneId);
       if (!entry || entry.gen.consumedAt !== null || isClosed(entry)) return;
       entry.gen.consumedAt = Date.now();
+      // The pipe delivered this settlement, so the worker's document for it is spent: a follow-up
+      // clears `consumedAt` and re-arms a watch, which must not read the same report again (S7).
+      entry.deliveredReportAt = Date.now();
       writeRecord(entry);
       // S54: a one-shot worker exits right after this push; its pane goes now, not at the GC TTL.
       if (entry.lifecycle === 'one-shot') reclaim(entry);

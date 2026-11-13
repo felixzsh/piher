@@ -150,6 +150,16 @@ test('docGet/docSet: values round-trip, a stale version fails as conflict', asyn
   });
 });
 
+test('docGet: a frame without a version is refused, not read as version 0', async () => {
+  // Coercing a missing version to 0 would make every later compare-and-swap conflict forever.
+  await withCore(() => ({ result: { value: { taskId: 't' } } }), async (client) => {
+    await assert.rejects(
+      client.docGet('piher.rep.t2'),
+      (err: unknown) => err instanceof CoreError && err.kind === 'internal',
+    );
+  });
+});
+
 /* ── contract: requests stay inside the hc 0.1.16 OpenRPC snapshot ── */
 
 interface OpenRpc { methods: Array<{ name: string; params: Array<{ name: string; required?: boolean }> }> }

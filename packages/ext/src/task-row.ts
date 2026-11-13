@@ -82,13 +82,18 @@ export interface TaskEntry extends TaskRow {
    *  and the claim is per request, so this is what stops the master from reading one
    *  settlement twice. */
   noticeAnnounced?: { fingerprint: string; at: number } | null;
+  /** When this row's settlement was delivered from the worker's report document, by ANY path:
+   *  the pipe push or a poller. A document whose `at` is not newer belongs to that settlement, so
+   *  a re-armed watch never announces it again (spec S7). */
+  deliveredReportAt?: number | null;
 }
 
 /** The durable row alone: what a record file holds. */
 export function toTaskRow(entry: TaskEntry): TaskRow {
-  const { settleWindowStartedAt: _w, noticeAnnounced: _n, ...row } = entry;
+  const { settleWindowStartedAt: _w, noticeAnnounced: _n, deliveredReportAt: _d, ...row } = entry;
   void _w;
   void _n;
+  void _d;
   const fingerprint = row.gen.reportDelivered ? { ...row.gen.reportDelivered } : null;
   const delivered = fingerprint ? { reportDelivered: fingerprint } : {};
   return {

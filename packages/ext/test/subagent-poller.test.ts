@@ -592,34 +592,31 @@ test('pollLoop: before declaring a timeout, a closing text found without the bou
   assert.match(f.notices[0]!, /finished and will do no further work/, 'the notice is the settlement one');
 });
 
-/* ── P1: settlement from the report document (spec S6–S7) ────────────────── */
+/* ── P1: settlement from the report document (spec S6–S8, S23) ────────────────── */
 
 const DOC_TEXT = 'REPORT: the document is the settlement';
+const DOC_STARTED_MS = 13_000;
 
-function docFixture(paneId = 'p-doc', taskId = 'task-doc-1') {
-  const f = fixture(makeEntry(paneId, { taskId }));
-  // The settle window is pushed beyond any test budget, and the transcript holds no candidate
-  // at all: only the report document can settle this row.
+/** A row whose transcript holds no candidate at all and whose settle window is pushed beyond any
+ *  test budget: only a report document can settle it. */
+function docFixture(paneId = 'p-doc', taskId = 'task-doc-1', lifecycle: 'persistent' | 'one-shot' = 'persistent') {
+  const f = fixture(makeEntry(paneId, { taskId, lifecycle }));
   f.host.policy = { settleWindowMs: 3_600_000, subagentTimeoutMs: 3_600_000, pollIntervalMs: 500 };
   f.state({ text: null, pendingTool: false, activity: false, turnEnded: false });
   f.host.session.resolveSessionFile = async () => null;
-  const seed = (turn: number) => f.seedDoc(`piher.rep.${paneId}`, {
-    taskId, turn, stopReason: 'stop', session: '/worker/s.jsonl', text: DOC_TEXT, at: 13_000,
+  const seed = (turn: number, over: Partial<Record<string, unknown>> = {}) => f.seedDoc(`piher.rep.${paneId}`, {
+    taskId, turn, stopReason: 'stop', session: '/worker/s.jsonl', text: DOC_TEXT, at: DOC_STARTED_MS, ...over,
   });
   return { ...f, seed };
 }
 
 test('pollLoop: the report document settles on the turn event with no settle window', async () => {
   const f = docFixture();
-  let seeded = false;
-  f.onPark(async () => {
-    if (!seeded) {
-      seeded = true;
-      f.seed(3);
-      return true; // the core's turn event lands with the document write
-    }
-    return false;
-  });
+  const events = [
+    () => { f.seed(3); return true; }, // the core's turn event lands with the document write
+    () => { f.waitState('exited'); return true; }, // the watch ends with the pane
+  ];
+  f.onPark(async () => (events.shift() ?? (() => false))());
   await start(f);
   assert.equal(f.notices.length, 1, 'one delivery, from the document');
   const notice = f.notices[0]!;
@@ -634,38 +631,32 @@ test('pollLoop: the report document settles on the turn event with no settle win
 
 test('pollLoop: a second turn for the same document value delivers nothing twice', async () => {
   const f = docFixture();
-  // One poller for both runs, as in production: the mount outlives the re-arm, so the
-  // (`taskId`, `turn`) delivery set survives it.
+  // One poller for both runs, as in production: the mount outlives the re-arm, so the delivery set
+  // (`address`, `turn`) survives it.
   const poller = createPoller(f.host);
   const begin = (requestId: string) => poller.startPoller(f.entry!.gen.paneId, '/tmp', 10_000, 'desc', requestId);
-  let seeded = false;
-  f.onPark(async () => {
-    if (!seeded) {
-      seeded = true;
-      f.seed(3);
-      return true;
-    }
-    return false;
-  });
+  const firstEvents = [
+    () => { f.seed(3); return true; },
+    () => { f.waitState('exited'); return true; },
+  ];
+  f.onPark(async () => (firstEvents.shift() ?? (() => false))());
   await begin('req-1');
   assert.equal(f.notices.filter((n) => /finished and will do no further work/.test(n)).length, 1);
 
-  // A follow_up re-arms the row, and the core replays the turn event with the same document
-  // value (the worker wrote nothing new). The settlement must not go out again.
+  // A follow_up re-arms the row, and the core replays the turn event with the same document value
+  // (the worker wrote nothing new). The settlement must not go out again.
   f.entry!.gen.consumedAt = null;
   f.waitState('idle');
-  let wakes = 0;
-  f.onPark(async () => {
-    wakes += 1;
-    if (wakes === 1) return true;
-    f.waitState('exited');
-    return true;
-  });
+  const secondEvents = [
+    () => true,
+    () => { f.waitState('exited'); return true; },
+  ];
+  f.onPark(async () => (secondEvents.shift() ?? (() => false))());
   await begin('req-2');
   assert.equal(
     f.notices.filter((n) => /finished and will do no further work/.test(n)).length,
     1,
-    'the same (taskId, turn) never settles twice',
+    'the same (address, turn) never settles twice',
   );
   assert.deepEqual(f.claimKeys, ['p-doc:req-1'], 'no second claim for the same document');
 });
@@ -673,7 +664,7 @@ test('pollLoop: a second turn for the same document value delivers nothing twice
 test('pollLoop: a report document from another task is ignored, the transcript still settles', async () => {
   const f = docFixture();
   f.seedDoc('piher.rep.p-doc', {
-    taskId: 'some-other-task', turn: 1, stopReason: 'stop', session: null, text: 'REPORT: not mine', at: 13_000,
+    taskId: 'some-other-task', turn: 1, stopReason: 'stop', session: null, text: 'REPORT: not mine', at: DOC_STARTED_MS,
   });
   f.state({ text: 'REPORT: mine', pendingTool: false, activity: true, turnEnded: true });
   f.entry!.settleWindowStartedAt = 10_000; // the window already elapsed on the virtual clock
@@ -681,4 +672,110 @@ test('pollLoop: a report document from another task is ignored, the transcript s
   assert.equal(f.notices.length, 1);
   assert.ok(f.notices[0]!.includes('REPORT: mine'), 'a stale foreign document never shadows the transcript');
   assert.ok(!f.notices[0]!.includes('not mine'));
+});
+
+test('pollLoop: a document older than the request boundary is not the new request\'s settlement', async () => {
+  // The pipe already delivered this report for the previous request; the follow-up cleared the
+  // consume time. Reading the same document again would announce finished work as the answer to a
+  // request that is still running.
+  const f = docFixture();
+  f.seed(1, { text: 'REPORT: the previous request', at: DOC_STARTED_MS - 8_000 });
+  const events = [
+    () => true,
+    () => { f.waitState('exited'); return true; }, // ends the watch; nothing was ever delivered
+  ];
+  f.onPark(async () => (events.shift() ?? (() => false))());
+  await start(f);
+  assert.ok(
+    f.notices.every((n) => !n.includes('REPORT: the previous request')),
+    `the earlier turn's report is never delivered as this one's settlement: ${JSON.stringify(f.notices)}`,
+  );
+  assert.equal(f.notices.filter((n) => /finished and will do no further work/.test(n)).length, 0,
+    'no settlement notice came out of the stale read');
+  // The pane ending is what ended the row, not the earlier turn's document.
+  assert.match(f.notices.at(-1) ?? '', /stopped before settling/);
+  assert.deepEqual(f.claimKeys, [], 'the stale document never claimed a settlement');
+});
+
+test('pollLoop: a document written after the row was consumed still reaches the master', async () => {
+  const f = docFixture();
+  const events = [
+    () => { f.seed(1, { text: 'REPORT: first settle' }); return true; },
+    // The worker settles again on its own: a new document, no request behind it.
+    () => { f.seed(2, { text: 'REPORT: second settle', at: DOC_STARTED_MS + 5_000 }); return true; },
+    () => { f.waitState('exited'); return true; },
+  ];
+  f.onPark(async () => (events.shift() ?? (() => false))());
+  await start(f);
+  assert.deepEqual(f.notices.length, 2, `both settles are delivered: ${JSON.stringify(f.notices)}`);
+  assert.ok(f.notices[0]!.includes('REPORT: first settle'));
+  assert.ok(f.notices[1]!.includes('REPORT: second settle'), 'the later document has a reader (S6)');
+});
+
+test('pollLoop: a document with no text states the reason, never the stop word', async () => {
+  const f = docFixture();
+  const events = [
+    () => { f.seed(2, { text: null, stopReason: 'the survey tool call was refused by the role' }); return true; },
+    () => { f.waitState('exited'); return true; },
+  ];
+  f.onPark(async () => (events.shift() ?? (() => false))());
+  await start(f);
+  assert.equal(f.notices.length, 1);
+  const notice = f.notices[0]!;
+  assert.match(notice, /FAILED/);
+  assert.ok(notice.includes('the survey tool call was refused by the role'), 'the diagnosis is the stated reason (S8)');
+  assert.ok(!/Reason: stop/.test(notice), 'the stop word is not a diagnosis');
+});
+
+test('pollLoop: an exited pane holding a written report settles, it does not fail', async () => {
+  const f = docFixture();
+  f.seed(1, { text: 'REPORT: finished before the pane went' });
+  f.waitState('exited');
+  await start(f);
+  assert.equal(f.notices.length, 1, `one notice, not a pane-closed failure: ${JSON.stringify(f.notices)}`);
+  assert.ok(f.notices[0]!.includes('REPORT: finished before the pane went'));
+  assert.ok(!/stopped before settling/.test(f.notices[0]!));
+});
+
+test('pollLoop: an already-settled row whose pane closes announces no failure', async () => {
+  const f = docFixture();
+  const events = [
+    () => { f.seed(1); return true; },
+    () => { f.waitState('exited'); return true; },
+  ];
+  f.onPark(async () => (events.shift() ?? (() => false))());
+  await start(f);
+  assert.equal(f.notices.filter((n) => /stopped before settling|no progress for/.test(n)).length, 0);
+});
+
+test('pollLoop: a settlement the pipe already delivered is not re-announced from its document', async () => {
+  // The exact shape finding 1 named: the worker settled, the pipe push delivered the report and
+  // consumed the row, the master sent a follow-up (which clears the consume time), and the old
+  // document is still the only one the core holds. It must not read as the new request's answer.
+  const f = docFixture();
+  f.entry!.deliveredReportAt = DOC_STARTED_MS; // what consumeReply stamps
+  f.seed(1, { text: 'REPORT: already delivered by the pipe', at: DOC_STARTED_MS });
+  const events = [
+    () => true,
+    () => { f.waitState('exited'); return true; },
+  ];
+  f.onPark(async () => (events.shift() ?? (() => false))());
+  await start(f);
+  assert.equal(f.notices.filter((n) => /finished and will do no further work/.test(n)).length, 0,
+    `the earlier settlement is not announced again: ${JSON.stringify(f.notices)}`);
+  assert.ok(f.notices.every((n) => !n.includes('already delivered by the pipe')));
+});
+
+test('pollLoop: the next settle after a pipe delivery is delivered again', async () => {
+  const f = docFixture();
+  f.entry!.deliveredReportAt = DOC_STARTED_MS;
+  f.seed(1, { text: 'REPORT: already delivered by the pipe', at: DOC_STARTED_MS });
+  const events = [
+    () => { f.seed(2, { text: 'REPORT: the follow-up answer', at: DOC_STARTED_MS + 5_000 }); return true; },
+    () => { f.waitState('exited'); return true; },
+  ];
+  f.onPark(async () => (events.shift() ?? (() => false))());
+  await start(f);
+  assert.equal(f.notices.length, 1, `one settlement, the new one: ${JSON.stringify(f.notices)}`);
+  assert.ok(f.notices[0]!.includes('REPORT: the follow-up answer'));
 });

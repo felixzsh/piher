@@ -3,11 +3,13 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import extension from '../../src/index.ts';
-import { pipeNameFor, pipeRequestTo, startPipeServer, type PipeRequest } from '../../src/pipe-channel.ts';
+import { pipeNameFor, pipePathFor, pipeRequestTo, startPipeServer, type PipeRequest, type PipeResponse } from '../../src/pipe-channel.ts';
 import { sessionDirName } from '../../src/storage-layout.ts';
 import { WIDGET_MAX_LINES } from '../../src/tree-view.ts';
 import { fakePi, fire, jsonl, seedTaskDocuments, transcriptMessage, withCleanup, type CleanupContext, type FakePi } from '../test-utils.ts';
@@ -581,5 +583,151 @@ test('widget cap: overflow still renders one honest widget', withCleanup(async (
     assert.ok(!master.commands.has('piher-tree'), 'no tree command takes over the overflow');
   } finally {
     await fire(master, 'session_shutdown');
+  }
+}));
+
+/* ── P1: the worker writes its report document on every settle (spec S6, S8) ── */
+
+interface DocCall { method: string; params: Record<string, unknown> }
+
+/** A core socket that answers the calls a worker's settle makes, recording them in order. */
+async function withWorkerCore(
+  body: (socketPath: string, calls: DocCall[]) => Promise<void>,
+): Promise<void> {
+  const socketPath = join(mkdtempSync(join(tmpdir(), 'piher-worker-core-')), 's.sock');
+  const calls: DocCall[] = [];
+  const server = createServer((sock) => {
+    let buf = '';
+    sock.setEncoding('utf8');
+    sock.on('data', (chunk) => {
+      buf += chunk;
+      const idx = buf.indexOf('\n');
+      if (idx < 0) return;
+      const req = JSON.parse(buf.slice(0, idx)) as { id: number; method: string; params: Record<string, unknown> };
+      calls.push({ method: req.method, params: req.params });
+      const result = req.method === 'terminal.get'
+        ? { address: 't2', turn: 2, state: 'live', cwd: '/w', labels: {} }
+        : req.method === 'doc.get' ? { value: null, version: 0 }
+          : req.method === 'doc.set' ? { version: 1 }
+            : {};
+      sock.end(`${JSON.stringify({ jsonrpc: '2.0', id: req.id, result })}\n`);
+    });
+  });
+  const { promise: listening, resolve } = Promise.withResolvers<void>();
+  server.listen(socketPath, resolve);
+  await listening;
+  try {
+    await body(socketPath, calls);
+  } finally {
+    server.close();
+    if (process.platform !== 'win32') rmSync(dirname(socketPath), { recursive: true, force: true });
+  }
+}
+
+async function waitFor(cond: () => boolean, ms = 5_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!cond() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+}
+
+test('worker settle: the report document is written with no request pending, stating the reason when there are no words', withCleanup(async (cleanup) => {
+  const agentDir = cleanup.tempDir('piher-worker-agent').path;
+  const cwd = cleanup.tempDir('piher-worker-cwd').path;
+  const sessionFile = join(agentDir, '2026-01-01T00-00-00-000Z_ffffffff-0000-4000-8000-000000000000.jsonl');
+  // A refused tool and an ended turn with no words: the diagnosis, not the stop word, is the report.
+  writeFileSync(sessionFile, jsonl(
+    transcriptMessage('toolResult', 'Error: role "worker" does not permit tool "bash"', Date.now(), 'stop'),
+    { type: 'message', message: { role: 'assistant', content: [], timestamp: Date.now(), stopReason: 'stop' } },
+  ));
+  await withWorkerCore(async (socketPath, calls) => {
+    const pi = await mountIndex(cleanup, 'core-worker', {
+      HC_TERMINAL_SOCKET: socketPath,
+      HC_TERMINAL_ID: 't2',
+      PI_CODING_AGENT_DIR: agentDir,
+      PI_SESSION_FILE: sessionFile,
+      PIHER_DELEGATION: JSON.stringify({ taskId: 'task-doc-worker', description: 'doc worker', role: 'worker' }),
+    });
+    const ctx = { cwd, sessionManager: { getBranch: () => [], getSessionFile: () => sessionFile } };
+    try {
+      await fire(pi, 'session_start', { reason: 'new' }, ctx);
+      await fire(pi, 'turn_start');
+      await fire(pi, 'agent_settled', {}, ctx);
+      // No request is pending here (S6): the write is off the settle's critical path, so the test
+      // waits for it instead of assuming it already landed.
+      await waitFor(() => calls.some((c) => c.method === 'doc.set'));
+
+      const writes = calls.filter((c) => c.method === 'doc.set');
+      assert.equal(writes.length, 1, `the settle writes one report document: ${JSON.stringify(calls.map((c) => c.method))}`);
+      assert.equal(writes[0]!.params.name, 'piher.rep.t2', 'the document is named after the worker address (S9)');
+      const value = writes[0]!.params.value as { taskId: string; turn: number; stopReason: string; text: string | null };
+      assert.equal(value.taskId, 'task-doc-worker', 'the task id travels inside the value (S3)');
+      assert.equal(value.turn, 2, 'the turn comes from the core record');
+      assert.equal(value.text, null);
+      assert.match(value.stopReason, /does not permit `bash`/,
+        'a turn with no words states the reason, not the stop word (S8)');
+      assert.equal(writes[0]!.params.version, 0, 'the write is compare-and-swap against the read version (S11)');
+    } finally {
+      await fire(pi, 'session_shutdown');
+    }
+  });
+}));
+
+test('worker settle: a one-shot worker waits for its document write before shutting down', withCleanup(async (cleanup) => {
+  const agentDir = cleanup.tempDir('piher-oneshot-agent').path;
+  // The worker's pipe is derived from its cwd, so the harness owns a checkout of its own.
+  const cwd = cleanup.tempDir('piher-oneshot-cwd').path;
+  const sessionFile = join(agentDir, '2026-01-01T00-00-00-000Z_bbbbbbbb-0000-4000-8000-000000000000.jsonl');
+  const masterPipe = pipeNameFor(cwd, 'tm');
+  const replies: PipeRequest[] = [];
+  const master = startPipeServer(masterPipe, async (req) => {
+    replies.push(req);
+    return { type: 'ok', id: req.id };
+  });
+  await new Promise<void>((resolve) => master.once('listening', resolve));
+  try {
+    await withWorkerCore(async (socketPath, calls) => {
+      const pi = await mountIndex(cleanup, 'core-worker', {
+        HC_TERMINAL_SOCKET: socketPath,
+        HC_TERMINAL_ID: 't2',
+        PI_CODING_AGENT_DIR: agentDir,
+        PI_SESSION_FILE: sessionFile,
+        PIHER_DELEGATION: JSON.stringify({
+          taskId: 'task-one-shot', description: 'one-shot worker', role: 'worker', lifecycle: 'one-shot',
+        }),
+      });
+      const shutdowns: string[] = [];
+      const ctx = {
+        cwd,
+        shutdown: () => { shutdowns.push(calls.map((c) => c.method).join(',')); },
+        sessionManager: { getBranch: () => [], getSessionFile: () => sessionFile },
+      };
+      try {
+        await fire(pi, 'session_start', { reason: 'new' }, ctx);
+        // A master request over the worker's pipe: the settle push has somewhere to go, which is what
+        // S54 hangs the one-shot exit off.
+        let prompted: PipeResponse | null = null;
+        const deadline = Date.now() + 5_000;
+        while (prompted === null && Date.now() < deadline) {
+          prompted = await pipeRequestTo(cwd, 't2', { type: 'prompt', id: 'pr-1', text: 'do the thing', from: masterPipe }, 1_000)
+            .catch(() => null);
+        }
+        assert.equal(prompted?.type, 'ok', 'the worker served its pipe prompt');
+        // The transcript is written inside the request boundary, so the settle has words to deliver.
+        writeFileSync(sessionFile, jsonl(transcriptMessage('assistant', 'REPORT: one-shot done', Date.now())));
+
+        await fire(pi, 'turn_end', { message: { role: 'assistant', stopReason: 'stop' } }, ctx);
+        await fire(pi, 'agent_settled', {}, ctx);
+        await waitFor(() => shutdowns.length === 1);
+        assert.equal(shutdowns.length, 1, 'the one-shot worker exits once its report is out');
+        assert.match(shutdowns[0]!, /doc\.set/, 'the document write completed before the shutdown');
+        assert.ok(replies.some((r) => r.type === 'reply'), 'the pipe push went out too');
+        const value = calls.find((c) => c.method === 'doc.set')!.params.value as { text: string | null };
+        assert.equal(value.text, 'REPORT: one-shot done');
+      } finally {
+        await fire(pi, 'session_shutdown');
+      }
+    });
+  } finally {
+    await new Promise<void>((resolve) => master.close(() => resolve()));
+    if (process.platform !== 'win32') rmSync(pipePathFor(masterPipe), { force: true });
   }
 }));

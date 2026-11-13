@@ -707,7 +707,10 @@ export class CoreClient implements CoreClientLike {
 
   async docGet(name: string): Promise<{ value: unknown; version: number } | null> {
     const result = (await this.request('doc.get', { name })) as { value?: unknown; version?: unknown } | null;
-    return { value: result?.value ?? null, version: typeof result?.version === 'number' ? result.version : 0 };
+    // A frame without a version is not "version 0": every later write would compare against a
+    // number the core never reported and conflict forever. Refuse it instead.
+    if (typeof result?.version !== 'number') throw new CoreError('doc.get', 'internal', `no version for ${name}`, null);
+    return { value: result.value ?? null, version: result.version };
   }
 
   async docSet(name: string, value: unknown, version: number): Promise<number> {
