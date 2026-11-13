@@ -13,11 +13,13 @@
  * session (`settlement-<sessionId>.jsonl`) because the delivery cursor is per session: a session
  * replays its own settlements, and two sessions never write the same file.
  *
- * The one rule that makes delivery lossless: **`deliveredSeq` is written only after pi accepted the
- * message**. The notice buffer holds RAM, so anything it was given and did not hand to pi is not
- * delivered — no matter what the row says. Writing the fact here first and the cursor last means a
- * crash, a `/reload` or a compaction re-delivers what was never read (at least once, idempotent by
- * `(taskId, at)`), instead of losing it for good.
+ * Two rules make delivery lossless. **`deliveredSeq` is written only after pi accepted the message**:
+ * the notice buffer holds RAM, so anything it was given and did not hand to pi is not delivered — no
+ * matter what the row says. Writing the fact here first and the cursor last means a crash, a
+ * `/reload` or a compaction re-delivers what was never read (at least once, idempotent by
+ * `(taskId, at)`), instead of losing it for good. And the cursor is a **prefix, never a high-water
+ * mark**: acceptances arrive out of order (a refused notice is requeued while a later fact goes
+ * out), so a cursor that jumped to the highest accepted seq would skip the gap below it forever.
  *
  * File format — one JSON object per line, terminated by `\n`, fields in this order:
  * `{seq, at, taskId, pane, turn, kind, group?, payloadRef?}`. Line-delimited rather than one JSON
@@ -210,12 +212,15 @@ export interface SettlementLedger {
   readonly file: string | null;
   events(): readonly SettlementEvent[];
   lastSeq(): number;
-  /** The last seq pi accepted. Everything above it is re-delivered on the next start. */
+  /** Every seq at or below this one was accepted, and the one above it was not: the cursor is the
+   *  contiguous prefix of accepted facts, so an out-of-order acceptance cannot hide a pending one
+   *  below it. Everything above the prefix is re-delivered on the next start. */
   deliveredSeq(): number;
   /** Record one fact. Idempotent by `(taskId, at)` for settlement facts: a refused notice is
    *  retried with the same identity, so a retry never forks one settlement into two ledger lines. */
   append(input: Omit<SettlementEvent, 'seq'>): SettlementEvent;
-  /** Advance the cursor. Call it only after pi accepted the message — never before. */
+  /** Record one accepted seq and move the cursor over the prefix that is now whole. Call it only
+   *  after pi accepted the message — never before. */
   markDelivered(seq: number): void;
   /** Point this same ledger at another file and re-read it. One object serves the whole process, so
    *  the poller that captured it at mount keeps writing to whatever the session's checkout became. */
@@ -249,6 +254,10 @@ export function openSettlementLedger(opts: { file: string | null }): SettlementL
   let delivered = 0;
   /** Facts already appended, by `(taskId, at)`: the retry of a refused notice finds its own line. */
   const facts = new Map<string, SettlementEvent>();
+  /** Seqs pi accepted in this process, including ones above a gap that is still open. The cursor
+   *  crosses them only once every fact below is accepted too — and it never has to remember them
+   *  across a restart, because what it wrote was already a prefix. */
+  const accepted = new Set<number>();
 
   function load(next: string | null): void {
     file = next;
@@ -276,6 +285,7 @@ export function openSettlementLedger(opts: { file: string | null }): SettlementL
     // A cursor ahead of the file is not a fact about the file: the ledger was truncated or replaced,
     // so trust the events that are actually there.
     delivered = Math.min(delivered, lastSeq);
+    accepted.clear();
     facts.clear();
     for (const event of events) {
       if (isSettlementFact(event.kind)) facts.set(settlementKey(event.taskId, event.at), event);
@@ -316,9 +326,19 @@ export function openSettlementLedger(opts: { file: string | null }): SettlementL
       return event;
     },
     markDelivered(seq) {
-      if (!Number.isInteger(seq) || seq <= delivered) return;
-      delivered = seq;
-      if (cursorFile !== null) writeCursor(cursorFile, seq);
+      if (!Number.isInteger(seq) || seq < 1) return;
+      accepted.add(seq);
+      // Walk the file forward: a fact kind still waiting ends the prefix. A seq with no line behind
+      // it (a torn tail that lost one) is skipped, not waited for — nothing can ever deliver it.
+      let next = delivered;
+      for (const event of events) {
+        if (event.seq <= next) continue;
+        if (isSettlementFact(event.kind) && !accepted.has(event.seq)) break;
+        next = event.seq;
+      }
+      if (next <= delivered) return;
+      delivered = next;
+      if (cursorFile !== null) writeCursor(cursorFile, next);
     },
     repoint(next) {
       if (next === file) return;

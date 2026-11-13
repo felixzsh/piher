@@ -116,6 +116,7 @@ test('ledger file: the cursor is its own document, monotonic, and survives a re-
     const ledger = openSettlementLedger({ file: tmp.path });
     ledger.append({ at: 1_000, taskId: 'task-a', pane: 'pA', turn: 1, kind: 'settled' });
     ledger.append({ at: 2_000, taskId: 'task-a', pane: 'pA', turn: 2, kind: 'settled' });
+    ledger.markDelivered(1);
     ledger.markDelivered(2);
     ledger.markDelivered(1); // never backwards
     assert.equal(ledger.deliveredSeq(), 2);
@@ -350,6 +351,15 @@ async function runLoop(booted: Booted, world: World): Promise<Poller> {
 
 const recordOf = (world: World): TaskEntry => parseTaskRow(JSON.parse(world.records.get(TASK)!))!;
 
+/** What the durable cursor says; a cursor never written is zero, not an error. */
+const cursorOnDisk = (world: World): number => {
+  try {
+    return parseSettlementCursor(readFileSync(`${world.ledgerFile}.seq`, 'utf8'));
+  } catch {
+    return 0;
+  }
+};
+
 test('E1 (a): a settlement the master never read is re-delivered exactly once after a restart', async () => {
   const world = createWorld();
   try {
@@ -489,3 +499,49 @@ test('E1 (d): a settlement whose report document is gone is re-delivered as a po
     world.dispose();
   }
 });
+
+/* ── the cursor as a prefix, never a high-water mark ───────────── */
+
+test('E1 (a): an acceptance out of order does not hide the settlement below it', () => {
+  // Acceptances do not arrive in seq order: a refused notice is requeued and retried while a later
+  // fact's acceptance goes out. A cursor that jumped to the highest accepted seq would step over the
+  // gap, and the seq below it would never be replayed.
+  const world = createWorld();
+  try {
+    const first = boot(world, { busy: () => false });
+    const early = first.ledger.append({ at: 1_000, taskId: 'task-early', pane: 'p-early', turn: 1, kind: 'settled' });
+    const late = first.ledger.append({ at: 2_000, taskId: 'task-late', pane: 'p-late', turn: 1, kind: 'settled' });
+    first.ledger.markDelivered(late.seq);
+    assert.equal(early.seq, 1);
+    assert.equal(late.seq, 2);
+    assert.equal(first.ledger.deliveredSeq(), 0, 'the cursor does not cross a gap that is still open');
+    assert.equal(cursorOnDisk(world), 0, 'and the durable cursor says the same');
+
+    // ── a restart ──
+    const second = boot(world, { busy: () => false });
+    assert.equal(second.ledger.deliveredSeq(), 0, 'the restart sees the same open gap');
+    assert.deepEqual(
+      planLedgerReplay({
+        events: second.ledger.events(),
+        deliveredSeq: second.ledger.deliveredSeq(),
+        settledThroughAt: () => -1,
+      }).map((e) => e.seq),
+      [early.seq, late.seq],
+      'the settlement nobody accepted is still delivered after the restart',
+    );
+
+    // Once the gap closes here, the cursor crosses it — and it never goes back. The acceptance the
+    // dead process made for seq 2 is not remembered across the restart (only the prefix is durable),
+    // so seq 2 is delivered again: at-least-once, never a loss.
+    second.ledger.markDelivered(early.seq);
+    assert.equal(second.ledger.deliveredSeq(), early.seq);
+    second.ledger.markDelivered(late.seq);
+    assert.equal(second.ledger.deliveredSeq(), late.seq);
+    second.ledger.markDelivered(early.seq);
+    assert.equal(second.ledger.deliveredSeq(), late.seq, 'still monotonic');
+    assert.equal(cursorOnDisk(world), late.seq);
+  } finally {
+    world.dispose();
+  }
+});
+
