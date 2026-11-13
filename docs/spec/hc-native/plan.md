@@ -247,3 +247,16 @@ measurement (its own simulator section argues the opposite). One correction of o
 first task still enters by `terminal.send`, so the boot race was fixed at the symptom (ask the document
 before calling a boot a failure, L12); routing the brief through the mailbox is the structural fix to
 return to if the race reappears.
+L14. **Live re-run after L12, and why E1 must start with durability**: `16af9bc` + this line, parent
+`fdbe126`, Risk: none (a measurement), Route: parent. Ten `explorer` spawns in one batch with a 75 s
+blocking control, run after a `/reload` so the process carried the L12 fix: **zero false boot failures**
+(against two in L11), ten settlements, no failure notice at all, which closes L12's residual "no live
+burst has been re-run". Transport unchanged: one delivery of **889 B carrying 3 of 10**, seven withheld —
+cheaper than L11's 2.194 B only because two failure diagnostics no longer exist. New fact for the next
+unit, verified in source and not by inference: `handOver` calls `injectNotice(...)` and then
+`consume(now())` (`subagent-poller.ts:319-325`) while the notice buffer holds only RAM (no `writeFile` in
+`index-notices.ts`), so a `/reload` or a crash during a busy flush **loses the notice permanently while
+the row is already consumed on disk** — a silent, durable lie that `list` repeats. That is worse than
+the collapse, which at least says what it withheld. So E1 is not "rows by bytes": it is a durable ledger
+with `deliveredSeq` written only after pi accepts, a cursor that re-delivers after any restart, and
+then the budgeted row delivery on top. The budget without the ledger would make the loss prettier.
