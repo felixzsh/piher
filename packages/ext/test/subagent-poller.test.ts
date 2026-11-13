@@ -291,6 +291,64 @@ test('pollLoop: a one-shot worker is reclaimed at settlement by the pair close u
   assert.deepEqual(persistent.retired, [], 'a persistent worker stays reachable for the next send');
 });
 
+test('pollLoop: an acceptance the master deferred cannot spend a row a steer re-armed', async () => {
+  // A steer reaches the master only while it is busy — which is exactly when a settlement notice sits
+  // buffered, unaccepted. The acceptance then lands after `rearmAfterSteer` cleared `consumedAt` and
+  // armed a watch for the turn the steer opened. Stamped as the old request's settlement it would spend
+  // a one-shot on a report the master never read, retire the pane that is now running the steer, and
+  // the steer's own report — the one the row is waiting for — would never be delivered.
+  const f = fixture(makeEntry('p-steer', { lifecycle: 'one-shot' }));
+  /** The acceptances the master has not made yet: what the buffer holds while it is mid-turn. Only
+   *  the first settlement is deferred — a buffer flushed at the end of the turn accepts the rest, and
+   *  an unaccepted settle would leave the loop parking with nowhere to go. */
+  const held: Array<() => void> = [];
+  let deferNext = true;
+  f.host.injectNotice = async (content, _paneId, card, onAccepted) => {
+    f.notices.push(content);
+    f.cards.push(card ?? null);
+    if (!deferNext) { onAccepted?.(); return; }
+    deferNext = false;
+    if (onAccepted) held.push(onAccepted);
+  };
+  const poller = createPoller(f.host);
+  let atSteer: { consumedAt: number | null; notices: number } | null = null;
+  let atRelease: { consumedAt: number | null; retired: string[]; cursor: number } | null = null;
+  const steps = [
+    // Its turn ends: the notice reaches the buffer, and the master is still inside its own turn.
+    () => { f.seedDoc('piher.rep.p-steer', reportDoc('task-1', 'the first turn is done')); return false; },
+    // The master steers the worker it still believes running, then its turn ends and the buffer
+    // flushes: the deferred acceptance fires against a row that now belongs to the steer.
+    () => {
+      atSteer = { consumedAt: f.entry!.gen.consumedAt, notices: f.notices.length };
+      f.entry!.gen.consumedAt = null; // rearmAfterSteer
+      void poller.startPoller('p-steer', '/tmp', 20_000, 'desc'); // …and its own request
+      held.shift()?.();
+      atRelease = {
+        consumedAt: f.entry!.gen.consumedAt,
+        retired: [...f.retired],
+        cursor: f.host.ledger.deliveredSeq(),
+      };
+      // The steered turn's own settlement is what the row is waiting for now.
+      f.seedDoc('piher.rep.p-steer', reportDoc('task-1', 'the steer is done', { at: 21_000 }));
+      return false;
+    },
+  ];
+  f.onPark(() => (steps.shift() ?? (() => false))());
+  await poller.startPoller('p-steer', '/tmp', 10_000, 'desc');
+  await settleLoop(poller);
+
+  assert.equal(atSteer!.notices, 1, 'the first settlement was announced, and nobody had accepted it');
+  assert.equal(atSteer!.consumedAt, null, 'the row was unspent when the steer re-armed it');
+  assert.equal(atRelease!.consumedAt, null, 'the stale acceptance did not spend the row on an unread report');
+  assert.deepEqual(atRelease!.retired, [], 'nor did it reclaim the pane that now runs the steer');
+  assert.equal(atRelease!.cursor, 1, 'the delivery it really made is still recorded');
+  assert.equal(f.notices.length, 2, 'the steer\'s own settlement is delivered');
+  assert.ok(f.notices[1]!.includes('the steer is done'));
+  assert.equal(f.entry!.gen.consumedAt, 21_000, 'the row carries the settlement the master read last');
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(f.retired, ['kill:p-steer', 'remove:p-steer'], 'the one-shot is reclaimed by its own settlement');
+});
+
 test('pollLoop: two settlements that say the same words are both delivered', async () => {
   // Identity is the document instance (address + `at`), never the text: a worker that says the same
   // thing after two different requests made two settlements, and a text fingerprint would swallow the

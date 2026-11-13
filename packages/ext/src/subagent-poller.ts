@@ -245,20 +245,36 @@ export interface PollerHost {
  * the ledger cursor — and never anywhere earlier. Order matters: the row first, because a crash
  * between the two leaves a record that says accepted, which the replay recognises as its own
  * duplicate, while the reverse would leave a cursor that hides an undelivered settlement.
+ *
+ * An acceptance can land long after it was announced: a steer reaches the master only while it is
+ * busy, which is exactly when the notice is buffered. So the acceptance carries the request it
+ * answers and applies to the row only while that is still the pane's request — a row a steer re-armed
+ * belongs to the turn the steer opened, and stamping it with the old settlement's `at` would spend a
+ * one-shot on a report the master never read and retire the pane now running that steer. The delivery
+ * is recorded either way: pi really did read the notice.
  */
 function acceptSettlement(
   h: PollerHost,
-  input: { taskId: string; pane: string; at: number; seq: number },
+  input: {
+    taskId: string;
+    pane: string;
+    at: number;
+    seq: number;
+    /** Whether the row still answers the request this settlement was judged against. */
+    stillOwnsRow: () => boolean;
+  },
 ): void {
-  const row = h.tasks.get(input.taskId) ?? taskForPane(h.tasks, h.panes, input.pane);
-  if (row) {
-    row.gen.consumedAt = input.at;
-    h.writeRecord(row);
-    // S54: a one-shot worker exits once its report is written, so its pane is reclaimed here — the
-    // notice already carries the text, and the pane must not linger for the GC TTL.
-    if (row.lifecycle === 'one-shot') {
-      if (h.reclaim) h.reclaim(row);
-      else void retirePane(h.client, input.pane);
+  if (input.stillOwnsRow()) {
+    const row = h.tasks.get(input.taskId) ?? taskForPane(h.tasks, h.panes, input.pane);
+    if (row) {
+      row.gen.consumedAt = input.at;
+      h.writeRecord(row);
+      // S54: a one-shot worker exits once its report is written, so its pane is reclaimed here — the
+      // notice already carries the text, and the pane must not linger for the GC TTL.
+      if (row.lifecycle === 'one-shot') {
+        if (h.reclaim) h.reclaim(row);
+        else void retirePane(h.client, input.pane);
+      }
     }
   }
   h.ledger.markDelivered(input.seq);
@@ -270,15 +286,24 @@ export interface Poller {
   readonly pollers: Set<string>;
 }
 
+/** One request a pane's settle is judged against — its boundary, and the description that labels the
+ *  notice. `id` is what an acceptance carries: a steer registers a new request for the same pane, so
+ *  a notice buffered through the old one can tell that the row it announced is no longer its own. */
+export interface PaneRequest {
+  id: number;
+  injectTs: number;
+  description: string;
+}
+
 export function createPoller(h: PollerHost): Poller {
   const pollers = new Set<string>();
   const subScopes = new Map<string, { dispose: () => Promise<void> }>();
   /** Current tracked request per pane. startPoller refreshes it even while a poller runs: a
    * follow_up must judge settlement against its own injectTs, not the original request's. */
-  /** The request a pane's settle is judged against — its boundary and the description that labels
-   *  the notice. There is no request id: the settlement's identity is the document instance
-   *  (`address`, `at`), so an id here would be carried and never read (D50). */
-  const requestByPane = new Map<string, { injectTs: number; description: string }>();
+  const requestByPane = new Map<string, PaneRequest>();
+  /** Request identities, minted per registration: the settlement's own identity is still the
+   *  document instance (`address`, `at`) — this only says which request an acceptance answers. */
+  let requestIds = 0;
   /** Settlements already handed over from a report document, keyed by (`address`, `at`) — the
    *  document instance (spec S7). The address identifies the generation and `at` identifies the
    *  settle, so a re-read of the same document is a repeat while a revived worker's own settlement
@@ -330,11 +355,15 @@ export function createPoller(h: PollerHost): Poller {
     return { state: info.status, alive: true, turn: info.turn ?? null, blind: false };
   }
 
+  /** The row's owner is the request that opened it: a steer registers a new request for this pane
+   *  (`rearmAfterSteer`), so an acceptance carrying an older one has no row left to stamp. */
+  const ownsRow = (paneId: string, request: PaneRequest): boolean =>
+    requestByPane.get(paneId)?.id === request.id;
+
   async function pollLoop(
     paneId: string,
     cwd: string,
-    injectTs: number,
-    description: string,
+    armed: PaneRequest,
   ): Promise<void> {
     const startedAt = now();
     let lastActivityAt = now();
@@ -351,6 +380,9 @@ export function createPoller(h: PollerHost): Poller {
      */
     async function announce(input: {
       entry: TaskEntry;
+      /** The request this fact answers. A steer during the buffer window replaces it, and the
+       *  acceptance then leaves the row to the turn the steer opened. */
+      request: PaneRequest;
       at: number;
       kind: SettlementEventKind;
       turn: number | null;
@@ -374,7 +406,13 @@ export function createPoller(h: PollerHost): Poller {
         // until the flush actually delivers it.
         await h.injectNotice(input.notice, paneId, input.card, () => {
           awaitingAccept = false;
-          acceptSettlement(h, { taskId: input.entry.taskId, pane: paneId, at: event.at, seq: event.seq });
+          acceptSettlement(h, {
+            taskId: input.entry.taskId,
+            pane: paneId,
+            at: event.at,
+            seq: event.seq,
+            stillOwnsRow: () => ownsRow(paneId, input.request),
+          });
         }, input.row);
       } catch {
         awaitingAccept = false;
@@ -393,7 +431,7 @@ export function createPoller(h: PollerHost): Poller {
     async function handOver(
       entry: TaskEntry,
       closing: string | null,
-      request: { injectTs: number; description: string },
+      request: PaneRequest,
       /** The settlement's own identity: the document's `at` (or the observation's clock when there is
        *  no document). It is the `consumedAt` the row will carry and the ledger's dedupe key. */
       settledAt: number,
@@ -436,6 +474,7 @@ export function createPoller(h: PollerHost): Poller {
               };
       return announce({
         entry,
+        request,
         at: settledAt,
         kind: failure !== null ? 'failed' : 'settled',
         turn,
@@ -457,7 +496,7 @@ export function createPoller(h: PollerHost): Poller {
      *  - `absent` no report document yet: nothing to settle, the silence budget owns the wait. */
     async function deliverDocument(
       entry: TaskEntry,
-      request: { injectTs: number; description: string },
+      request: PaneRequest,
     ): Promise<'delivered' | 'retry' | 'duplicate' | 'stale' | 'foreign' | 'absent'> {
       const read = await readReportDocument(h.client, paneId);
       const value = read.kind === 'read' ? read.value : null;
@@ -515,7 +554,7 @@ export function createPoller(h: PollerHost): Poller {
     };
     try {
       while (true) {
-        const current = requestByPane.get(paneId) ?? { injectTs, description };
+        const current = requestByPane.get(paneId) ?? armed;
         const entry = taskForPane(h.tasks, h.panes, paneId);
         if (!entry || isClosed(entry) || isSpent(entry)) return;
         if (armedConsumed) return;
@@ -626,6 +665,7 @@ export function createPoller(h: PollerHost): Poller {
           // one, is recorded as delivered only when pi accepted it.
           await announce({
             entry,
+            request: current,
             at: now(),
             kind: 'pane-gone',
             turn,
@@ -664,6 +704,7 @@ export function createPoller(h: PollerHost): Poller {
             });
           await announce({
             entry,
+            request: current,
             at: now(),
             kind: 'failed',
             turn,
@@ -702,9 +743,11 @@ export function createPoller(h: PollerHost): Poller {
     description: string,
   ): Promise<boolean> {
     // Always refresh first: a follow_up arriving while the spawn poller still runs must move
-    // settlement judgment to the new request instead of being dropped by the has() guard.
+    // settlement judgment to the new request instead of being dropped by the has() guard. The new
+    // identity is the point: a notice buffered under the old request must not settle this one.
     const sinceTs = Math.max(0, injectTs - REQUEST_BOUNDARY_SLACK_MS);
-    requestByPane.set(paneId, { injectTs: sinceTs, description });
+    const request: PaneRequest = { id: (requestIds += 1), injectTs: sinceTs, description };
+    requestByPane.set(paneId, request);
     if (pollers.has(paneId)) return true; // an armed watch already reads this pane
     pollers.add(paneId);
     try {
@@ -721,7 +764,7 @@ export function createPoller(h: PollerHost): Poller {
     }
     void (async () => {
       try {
-        await pollLoop(paneId, cwd, sinceTs, description);
+        await pollLoop(paneId, cwd, request);
       } catch (err) {
         console.error(`piher: subagent poller ${paneId} crashed: ${(err as Error)?.message ?? err}`);
       } finally {
