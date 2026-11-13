@@ -60,13 +60,26 @@ const ENV_KNOBS: readonly ConfigKnob[] = OPTION_SPECS.map((option) => ({
 }));
 
 /** The `PIHER_*` namespace itself (any other prefix is somebody else's environment). */
-const PIHER_KEY = /^PIHER_[A-Z0-9_]+$/;
+const KNOB_NAME_RE = /^PIHER_[A-Z0-9_]+$/;
 
 /** Contracts handed to a child at spawn (named in `options.ts`): the code reads them, but they are
  *  not knobs a person sets, so the catalog must not report them as removed. */
 const SPAWN_CONTRACT_KEYS: readonly string[] = [
   'PIHER_SUBAGENT', 'PIHER_DELEGATION', 'PIHER_ROLE_MANIFEST', 'PIHER_ROLE_BASE',
 ];
+
+/** Knobs the code reads directly instead of through `OPTION_SPECS`: neither has a policy field, a
+ *  default or a bound, so the registry is not where they live. `PIHER_TUI` picks the spawn's TUI mode
+ *  (`subagent-core.ts`), `PIHER_PIPE_TRACE` turns the pipe trace on (`plugins/subagent.ts`). Every
+ *  name here is read by the source, and `test/config-catalog.test.ts` fails if this list falls
+ *  behind the source or the source grows a read this list does not know. */
+const DIRECT_READ_KEYS: readonly string[] = ['PIHER_TUI', 'PIHER_PIPE_TRACE'];
+
+/** Every `PIHER_*` name this build reads: the option registry, the spawn contracts and the direct
+ *  reads. Anything else in the environment is a knob nothing reads, which is what the check names. */
+export function knownEnvKeys(): readonly string[] {
+  return [...ENV_KNOBS.map((knob) => knob.key), ...SPAWN_CONTRACT_KEYS, ...DIRECT_READ_KEYS];
+}
 
 /** Every knob the catalog can resolve (roles is a per-file plane: its schema is the reference). */
 export const CONFIG_KNOBS: readonly ConfigKnob[] = Object.freeze([...ENV_KNOBS]);
@@ -127,12 +140,14 @@ export function checkEnvKnobs(env: Record<string, string | undefined> = {}): str
     }
   }
   // A removed knob is the one setting the runtime cannot tell you about: nothing reads it, so the
-  // value silently does nothing. Name it instead of leaving the export in place to be believed.
-  const registered = new Set(ENV_KNOBS.map((knob) => knob.key));
+  // value silently does nothing. Name it instead of leaving the export in place to be believed — and
+  // never name a knob the code does read: the list below is the whole set (registry, spawn contracts,
+  // direct reads), or this check would tell a user to unset something that works.
+  const known = new Set(knownEnvKeys());
   for (const [key, raw] of Object.entries(env)) {
     if (raw === undefined || raw === '') continue;
-    if (!PIHER_KEY.test(key)) continue;
-    if (registered.has(key) || SPAWN_CONTRACT_KEYS.includes(key)) continue;
+    if (!KNOB_NAME_RE.test(key)) continue;
+    if (known.has(key)) continue;
     issues.push(`${key}="${raw}" is set but no code reads it (a removed knob): unset it, or run \`piher config\` for the current names`);
   }
   return issues;

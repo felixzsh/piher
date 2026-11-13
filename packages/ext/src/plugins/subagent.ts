@@ -960,20 +960,22 @@ export default function subagentPlugin(ctx: Context): void {
   }
 
   /** Re-arm a row for the turn a steer started: keeping the old consume time would read as a worker
-   *  with nothing in flight, and the settlement (spec S5) is judged against this request. Rolled
-   *  back when no watch takes over. */
+   *  with nothing in flight, and the settlement (spec S5) is judged against this request. Rolled back
+   *  when no watch takes over — `startPoller` answers that, and a watch that could not arm would
+   *  otherwise leave the row re-armed with no reader, so the steer's report would never be delivered. */
   function rearmAfterSteer(entry: TaskEntry, requestId: string): void {
     const prevConsumedAt = entry.gen.consumedAt;
     entry.gen.consumedAt = null;
     writeRecord(entry);
-    try {
-      lastRequestIdByPane.set(entry.gen.paneId, requestId);
-      startPoller(entry.gen.paneId, entry.cwd, Date.now(), entry.description, requestId);
-    } catch (inner) {
+    lastRequestIdByPane.set(entry.gen.paneId, requestId);
+    const rollback = (): void => {
+      // Only the value this call cleared: a settlement that landed in between owns `consumedAt` now.
+      if (entry.gen.consumedAt !== null) return;
       entry.gen.consumedAt = prevConsumedAt;
       writeRecord(entry);
-      throw inner;
-    }
+    };
+    void startPoller(entry.gen.paneId, entry.cwd, Date.now(), entry.description, requestId)
+      .then((armed) => { if (!armed) rollback(); }, rollback);
   }
 
   /**

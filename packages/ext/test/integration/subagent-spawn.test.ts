@@ -371,7 +371,7 @@ interface PipeEnv {
  * tests; `pipes: false` starts no pipe server at all, which is the worker that never serves one. */
 async function withPipeEnv(
   fn: (env: PipeEnv) => Promise<void>,
-  opts: { childCwd?: string; paneSeq?: boolean; pipes?: boolean; gitRepo?: boolean; sessionFile?: string | ((cwd: string) => string); policy?: Partial<RuntimePolicy> } = {},
+  opts: { childCwd?: string; paneSeq?: boolean; pipes?: boolean; gitRepo?: boolean; sessionFile?: string | ((cwd: string) => string); policy?: Partial<RuntimePolicy>; brokenSessionRoot?: boolean } = {},
 ): Promise<void> {
   const home = new TempHome('piher-spawn-home-');
   const cwd = mkdtempSync(join(tmpdir(), 'piher-spawn-cwd-'));
@@ -549,11 +549,15 @@ async function withPipeEnv(
   const mount = async (): Promise<void> => {
     const mounted = await mountSubagent({
       client: clientOpts,
-      ...((sessionPath || opts.policy)
+      ...((sessionPath || opts.policy || opts.brokenSessionRoot)
         ? {
           deps: {
             ...(sessionPath ? { getSessionFile: () => sessionPath, getCwd: () => cwd } : {}),
             ...(opts.policy ? { policy: opts.policy } : {}),
+            // A session root that refuses to take a scope: no settlement watch can be armed.
+            ...(opts.brokenSessionRoot
+              ? { sessionRoot: { plugin: () => { throw new Error('the session root is gone'); } } as never }
+              : {}),
           },
         }
         : {}),
@@ -709,6 +713,29 @@ test('send: a follow-up to a worker in another checkout rides the core, and open
     assert.equal(env.frames[1]!.text, 'wrap up and report');
     assert.equal(env.pipeConnections.p2 ?? 0, 0, 'the send opened no connection to a pipe name');
   }, { childCwd: other });
+});
+
+test('send: a steer whose settlement watch cannot arm rolls the re-arm back', async () => {
+  await withPipeEnv(async (env) => {
+    env.parkPollers();
+    const spawned = await runSubagent(env.pi, { description: 'no watch', prompt: PROMPT }, env.cwd);
+    const paneId = spawned.details?.paneId as string;
+    const taskId = spawned.details?.taskId as string;
+    await waitFor(() => env.frames.length === 1);
+    env.port.current!.consumeReply(paneId, 'REPORT: first');
+    const consumedAt = readTaskRecord(env.cwd, taskId)?.gen.consumedAt ?? null;
+    assert.ok(consumedAt !== null, 'the worker had settled');
+    // The steer is delivered, but the watch that would read its report cannot arm: leaving the row
+    // re-armed would point the master at a report no one is reading.
+    const sent = await runSubagent(env.pi, { action: 'send', agentId: paneId, message: 'keep going' }, env.cwd);
+    assert.match(sent.content[0]!.text, /Message sent to subagent/);
+    await waitFor(() => (readTaskRecord(env.cwd, taskId)?.gen.consumedAt ?? null) === consumedAt, 2_000);
+    assert.equal(
+      readTaskRecord(env.cwd, taskId)?.gen.consumedAt,
+      consumedAt,
+      'the settlement time the steer cleared is restored when no watch took over',
+    );
+  }, { brokenSessionRoot: true });
 });
 
 test('send: a settled persistent worker is still reachable', async () => {

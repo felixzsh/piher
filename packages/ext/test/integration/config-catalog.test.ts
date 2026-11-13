@@ -2,11 +2,11 @@
  *  against the runtime env readers) and the command-side probe over injected deps. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  CONFIG_KNOBS, CONFIG_PLANES, checkEnvKnobs, formatValue, redactValue, renderCheck,
+  CONFIG_KNOBS, CONFIG_PLANES, checkEnvKnobs, formatValue, knownEnvKeys, redactValue, renderCheck,
   renderIndex, renderPlane, renderReport, resolveEnvKnobs, summarizePlane,
 } from '../../src/config-catalog-core.ts';
 import { OPTION_SPECS } from '../../src/options.ts';
@@ -28,23 +28,31 @@ const knobValue = (snapshot: ConfigGuideSnapshot, plane: string, key: string): s
 
 /* ── drift guards ───────────────────────────────────────────────────────── */
 
+/** Every source file under `dir`, concatenated: what the code actually reads. */
+function sourceText(dir: string): string {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(sourceText(path));
+    else if (/\.(ts|mjs|js|json)$/.test(entry.name)) out.push(readFileSync(path, 'utf8'));
+  }
+  return out.join('\n');
+}
+
 test('drift guards: the catalog mirrors the planes and every runtime env read is registered', () => {
   // The catalog has exactly the planes the command renders: roles is per-file, env is derived.
   assert.deepEqual(CONFIG_PLANES.map((p) => p.id), ['roles', 'env']);
   assert.deepEqual(knobsOfPlane('roles'), [], 'the roles plane is per-file: its schema is the reference');
   assert.deepEqual(knobsOfPlane('env'), OPTION_SPECS.map((o) => o.name), 'the env plane is the OPTION_SPECS registry');
 
-  // Runtime env reads must be registered as an option.
-  const sources = ['src/runtime-policy.ts', 'src/plugins/bg-job.ts', 'src/config-command.ts']
-    .map((rel) => readFileSync(join(repoRoot, 'packages', 'ext', rel), 'utf8'))
-    .join('\n');
-  const found = new Set((sources.match(/\bPI(_HERDR)?_[A-Z0-9_]+\b/g) ?? []).filter((n) => !n.endsWith('_')));
-  // Internal/pi-owned names that are not user configuration.
-  const allowlist = new Set(['PIHER_ROLE_MANIFEST', 'PIHER_SUBAGENT', 'PI_SESSION_FILE', 'PI_SESSION_ID', 'PI_CODING_AGENT_DIR']);
-  const registered = new Set(OPTION_SPECS.map((o) => o.name));
-  for (const name of found) {
-    if (!allowlist.has(name)) assert.equal(registered.has(name), true, `env var ${name} is read by the runtime but missing from the registry`);
-  }
+  // Every `PIHER_*` the WHOLE source tree reads must be known to the catalog: the registry, a spawn
+  // contract, or a direct read. A name this set does not know is reported by `checkEnvKnobs` as a
+  // removed knob, so the doctor would tell a user to unset a knob that changes behaviour.
+  const found = new Set(sourceText(join(repoRoot, 'packages', 'ext', 'src')).match(/\bPIHER_[A-Z0-9_]+\b/g) ?? []);
+  assert.ok(found.size >= OPTION_SPECS.length, 'the sweep found the source');
+  const known = new Set(knownEnvKeys());
+  assert.deepEqual([...found].filter((name) => !known.has(name)).sort(), [],
+    'every knob the code reads is in the catalog (OPTION_SPECS, a spawn contract, or DIRECT_READ_KEYS)');
 });
 
 /* ── pure catalog ───────────────────────────────────────────────────────── */
@@ -74,6 +82,15 @@ test('checkEnvKnobs names a removed knob instead of leaving it a silent no-op', 
   assert.match(issues.join(' | '), /PIHER_POLL_INTERVAL_MS/);
   // The spawn contracts are read by the code and are not knobs: they are never "removed".
   assert.deepEqual(checkEnvKnobs({ PIHER_SUBAGENT: '1', PIHER_DELEGATION: '{}', PIHER_ROLE_MANIFEST: '{}', PIHER_ROLE_BASE: '/r' }), []);
+});
+
+test('checkEnvKnobs: a knob the code reads is never reported as removed', () => {
+  // Read outside the option registry, and the first version of this guard called both of them
+  // removed: `PIHER_TUI` picks the spawn's TUI mode (`subagent-core.ts`) and `PIHER_PIPE_TRACE`
+  // turns the pipe trace on (`plugins/subagent.ts`). Telling a user to unset those would be wrong.
+  assert.deepEqual(checkEnvKnobs({ PIHER_TUI: 'regular', PIHER_PIPE_TRACE: '1' }), []);
+  const known = new Set(knownEnvKeys());
+  assert.ok(known.has('PIHER_TUI') && known.has('PIHER_PIPE_TRACE'), 'both are catalog-knowledgeable knobs');
 });
 
 test('secret-shaped keys are redacted and never rendered verbatim', () => {

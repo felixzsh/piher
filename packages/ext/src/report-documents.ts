@@ -265,6 +265,13 @@ export type SettleWritePlan =
  * with nothing to say" from "never settled". Skipping is reserved for a settle that reports nothing
  * at all and for a worker with no channel — the one case it cannot report itself, which the master
  * then diagnoses from the core's `turn` (spec S5) instead of calling it silence.
+ *
+ * The empty document cannot land in the middle of a run: `agent_settled` means "pi has no remaining
+ * automatic work for that session-level run", and a queued steer or a follow-up counts as remaining
+ * work that "can still continue" before it (pi 1.5.2, `docs/json.md:48` and `docs/extensions.md:336`,
+ * both read for this). A queued steer therefore keeps the run from settling, so no empty interim
+ * settle can fire between a finished turn and the turn the steer starts — the empty document means
+ * what it says: this run ended and had nothing to add.
  */
 export function planSettleWrite(input: {
   isSubagent: boolean;
