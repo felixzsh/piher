@@ -218,8 +218,6 @@ noted. `PIHER_*` is the only namespace.
 | `PIHER_SUBAGENT_TIMEOUT_MS` | `600000` | Inactivity budget before a subagent is terminated (a working turn renews it) |
 | `PIHER_READY_TIMEOUT_MS` | `90000` | How long to wait for a spawned pane to open its pipe (a dead pane fails fast) |
 | `PIHER_COMMAND_PICKUP_MS` | `1500` | Read-back budget of a steering command (`0`: no wait) |
-| `PIHER_SETTLE_WINDOW_MS` | `4000` | Debounce after a worker turn ends before it counts as settled |
-| `PIHER_POLL_INTERVAL_MS` | `30000` | Safety re-check when no core event arrives |
 | `PIHER_GC_TICK_MS` | `30000` | Idle GC sweep cadence |
 | `PIHER_SESSION_TTL_SECONDS` | `600` | Session retention after a worker exits, before GC |
 | `PIHER_GIT_TIMEOUT_MS` | `10000` | git command timeout (worktree creation, status probes) |

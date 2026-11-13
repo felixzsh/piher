@@ -7,9 +7,6 @@ import { OPTION_SPECS, optionValue, type PolicyField } from './options.ts';
 export interface RuntimePolicy {
   readonly subagentTimeoutMs: number
   readonly gcTickMs: number
-  readonly pollIntervalMs: number
-  /** Post-settle window before auto-consume */
-  readonly settleWindowMs: number
   readonly sessionTtlSeconds: number
   readonly gitTimeoutMs: number
   /** Subagent pane pipe readiness wait */

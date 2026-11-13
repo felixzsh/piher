@@ -4,20 +4,15 @@ import * as path from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  deriveSubSessionState, listSessionFiles, parseSessionEntries, sessionDirName, sessionFileById,
-  type SessionEntryLike, type SubSessionState,
+  listSessionFiles, parseSessionEntries, readTurnClosing, sessionDirName, sessionFileById,
+  type SessionEntryLike, type TurnClosing,
 } from '../src/session-tail.ts';
 import { planSettleWake, shouldPushSettleReply } from '../src/settle-wake-core.ts';
 import { jsonl, transcriptMessage, withCleanup } from './test-utils.ts';
 
 const msg = (role: string, text: string, ts: number, stopReason = 'stop') =>
   transcriptMessage(role, text, ts, stopReason) as SessionEntryLike;
-const toolCall = (ts: number, n = 1): SessionEntryLike => ({
-  type: 'message',
-  message: { role: 'assistant', content: Array.from({ length: n }, () => ({ type: 'toolCall' })), timestamp: ts, stopReason: 'toolUse' },
-});
-const toolResult = (ts: number): SessionEntryLike => ({ type: 'message', message: { role: 'toolResult', content: [], timestamp: ts } });
-const idle: SubSessionState = { text: null, pendingTool: false, activity: false, turnEnded: false, why: null };
+const idle: TurnClosing = { text: null, why: null };
 /** Writes a session transcript at `dir/name` (creating `dir`) and returns its path. */
 const writeTranscript = (dir: string, name: string): string => {
   const file = path.join(dir, name);
@@ -33,15 +28,15 @@ test('parseSessionEntries: tolerates malformed lines, blank lines and non-object
   assert.equal(entries[1].type, 'session');
 });
 
-test('deriveSubSessionState: role/stopReason/timestamp matrix → tail rows', async (t) => {
-  const tail = (over: Partial<SubSessionState>): SubSessionState => ({ ...idle, ...over });
-  const cases: Array<{ name: string; entries: SessionEntryLike[]; sinceTs: number; row: SubSessionState }> = [
-    { name: 'stop-finalized text wins over the toolUse intermediate', sinceTs: 0, row: tail({ text: 'final answer', activity: true, turnEnded: true }),
+test('readTurnClosing: the words a turn left behind, with no settlement verdict in them', async (t) => {
+  const tail = (over: Partial<TurnClosing>): TurnClosing => ({ ...idle, ...over });
+  const cases: Array<{ name: string; entries: SessionEntryLike[]; sinceTs: number; closing: TurnClosing }> = [
+    { name: 'finalized text wins over the toolUse intermediate', sinceTs: 0, closing: tail({ text: 'final answer' }),
       entries: [msg('user', 'task', 1), msg('assistant', 'thinking...', 2, 'toolUse'), msg('assistant', 'final answer', 3)] },
-    { name: 'sinceTs drops finalized text written before the injection point', entries: [msg('assistant', 'old', 100), msg('assistant', 'new', 200)], sinceTs: 150, row: tail({ text: 'new', activity: true, turnEnded: true }) },
-    { name: 'an ended turn reports its words even without a clean stop (token cap, abort)',
+    { name: 'sinceTs drops finalized text written before the boundary', entries: [msg('assistant', 'old', 100), msg('assistant', 'new', 200)], sinceTs: 150, closing: tail({ text: 'new' }) },
+    { name: 'a turn that ended without a clean stop still has words (token cap, abort)',
       entries: [msg('user', 'task', 1), msg('assistant', 'capped answer', 9, 'length')], sinceTs: 0,
-      row: tail({ text: 'capped answer', activity: true, turnEnded: true }) },
+      closing: tail({ text: 'capped answer' }) },
     { name: 'a run that stopped on a refused tool says which role refused which tool',
       entries: [
         msg('user', 'task', 1),
@@ -49,23 +44,17 @@ test('deriveSubSessionState: role/stopReason/timestamp matrix → tail rows', as
         { type: 'message', message: { role: 'toolResult', timestamp: 6, content: [{ type: 'text', text: 'role "reviewer" does not permit tool "ctx_execute" (manifest tools: bash, read).' }] } } as SessionEntryLike,
       ],
       sinceTs: 0,
-      row: tail({ text: null, activity: true, turnEnded: false, why: 'It stopped after a refused tool call: the `reviewer` manifest does not permit `ctx_execute`. Fix the role profile or the task, then continue it.' }) },
-    { name: 'an ended turn with no words at all stays silent (a legitimate empty settle)',
-      entries: [msg('user', 'task', 1), msg('assistant', '   ', 9, 'aborted')], sinceTs: 0,
-      row: tail({ text: null, activity: true, turnEnded: true, why: null }) },
-    { name: 'assistant timestamp at the injection point counts', entries: [msg('assistant', 'a', 100)], sinceTs: 100, row: tail({ text: 'a', activity: true, turnEnded: true }) },
-    { name: 'a timestamp older than the injection point is invisible', entries: [msg('assistant', 'a', 100)], sinceTs: 101, row: idle },
-    { name: 'no assistant message → idle row', entries: [msg('user', 'hi', 1)], sinceTs: 0, row: idle },
-    { name: 'toolUse-only assistant → activity without a finished turn', entries: [msg('assistant', 'mid', 1, 'toolUse')], sinceTs: 0, row: tail({ activity: true, why: null }) },
-    { name: 'tool result written but the next assistant not yet → still not ended', sinceTs: 1, row: tail({ activity: true }),
-      entries: [msg('user', 'task', 1), msg('assistant', 'thinking', 2, 'toolUse'), msg('toolResult', 'ok', 3)] },
-    { name: 'assistant without stopReason (streaming) → not ended', sinceTs: 1, row: tail({ activity: true }),
+      closing: tail({ why: 'It stopped after a refused tool call: the `reviewer` manifest does not permit `ctx_execute`. Fix the role profile or the task, then continue it.' }) },
+    { name: 'an ended turn with no words at all says nothing', entries: [msg('user', 'task', 1), msg('assistant', '   ', 9, 'aborted')], sinceTs: 0, closing: idle },
+    { name: 'assistant timestamp at the boundary counts', entries: [msg('assistant', 'a', 100)], sinceTs: 100, closing: tail({ text: 'a' }) },
+    { name: 'a timestamp older than the boundary is invisible', entries: [msg('assistant', 'a', 100)], sinceTs: 101, closing: idle },
+    { name: 'no assistant message → nothing', entries: [msg('user', 'hi', 1)], sinceTs: 0, closing: idle },
+    { name: 'a tool call in flight reads as no words: the caller decides what that means', entries: [msg('user', 'q', 1), msg('assistant', 'working', 10, 'toolUse')], sinceTs: 5, closing: tail({ text: 'working' }) },
+    { name: 'a tool result alone has no words', entries: [msg('user', 'q', 1), { type: 'message', message: { role: 'toolResult', content: [], timestamp: 11 } } as SessionEntryLike], sinceTs: 5, closing: idle },
+    { name: 'assistant without stopReason (streaming) still has its words', sinceTs: 1, closing: tail({ text: 'x' }),
       entries: [{ type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'x' }], timestamp: 6 } }] },
-    { name: 'pending tool call after injection → waiting on a human', entries: [msg('user', 'q', 1), toolCall(10)], sinceTs: 5, row: tail({ pendingTool: true, activity: true }) },
-    { name: 'parallel calls with only one result → still pending', entries: [toolCall(10, 2), toolResult(11)], sinceTs: 5, row: tail({ pendingTool: true, activity: true }) },
-    { name: 'tool call before the injection point does not count', entries: [toolCall(3)], sinceTs: 5, row: idle },
   ];
-  for (const c of cases) await t.test(c.name, () => assert.deepEqual(deriveSubSessionState(c.entries, c.sinceTs), c.row));
+  for (const c of cases) await t.test(c.name, () => assert.deepEqual(readTurnClosing(c.entries, c.sinceTs), c.closing));
 });
 
 test('sessionDirName: cwd → collision-resistant session dir', () => {

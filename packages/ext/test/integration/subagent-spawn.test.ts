@@ -518,7 +518,12 @@ async function withPipeEnv(
       })),
       park: (ms) => {
         if (parked) return new Promise<never>(() => {});
-        if (!env.gated) return false;
+        // A loop with nothing to settle parks on every pass, so an instant park would spin it: the
+        // wait runs out like the real client's, briefly and unref'd.
+        if (!env.gated) return new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => resolve(false), Math.min(ms, 20));
+          timer.unref?.();
+        });
         if (wake) { wake = false; return true; }
         // A gated loop waits for the turn event, briefly: long enough to stage it, short enough
         // that an unstaged loop never spins hot. Unref'd, so the gate cannot hold the process.
@@ -1410,8 +1415,8 @@ test('P1: the worker report document settles on the turn event — exactly once'
     await env.client.docSet(`piher.rep.${paneId}`, {
       taskId, turn: 1, stopReason: 'stop', session: null, text: DOC_TEXT, at: Date.now(),
     }, 0);
-    // The settle window is pushed beyond any test budget, so the transcript heuristic cannot fire:
-    // the settlement below can only come from the document, on the core's turn event.
+    // No transcript can settle this worker, and no settlement window exists any more: only the
+    // report document can, and only the core's turn event brings the loop back to read it.
     env.turns[paneId] = 1;
     env.wakeWorker();
     await waitFor(() => env.pi.userSent.length === 1);
@@ -1428,7 +1433,69 @@ test('P1: the worker report document settles on the turn event — exactly once'
     assert.equal(env.pi.userSent.length, 1, 'the same document value never settles twice');
     const listed = (await runSubagent(env.pi, { action: 'list' }, env.cwd)).content[0]!.text;
     assert.match(listed, /doc-probe@p2 \[idle\]/, 'the settlement consumed the row');
-  }, { policy: { settleWindowMs: 3_600_000, subagentTimeoutMs: 3_600_000, pollIntervalMs: 50 } });
+  }, { policy: { subagentTimeoutMs: 3_600_000 } });
+});
+
+/* ── P4: settlement is the core's turn plus the worker's report (spec S5) ────── */
+
+test('P4: a worker whose transcript is deleted mid-run still settles from its document', async () => {
+  await withPipeEnv(async (env) => {
+    // Event-driven: the loop only moves when the core reports a turn for the worker.
+    env.gated = true;
+    const spawned = await runSubagent(env.pi, { description: 'doc-only probe', prompt: PROMPT }, env.cwd);
+    const paneId = spawned.details?.paneId as string;
+    const taskId = spawned.details?.taskId as string;
+    await waitFor(() => env.frames.length === 1);
+    await waitFor(() => existsSync(env.workerSessionFile));
+
+    // Mid-run the worker's transcript disappears. Nothing the master could read remains — before P4
+    // this was the shape that stalled a finished worker until the silence budget called it `failed`.
+    rmSync(env.workerSessionFile);
+    assert.equal(existsSync(env.workerSessionFile), false, 'the transcript is gone before the settle');
+
+    // The worker settles and writes its own report document: the one settlement channel left.
+    const DOC_TEXT = 'REPORT: the document is the only settlement left';
+    await env.client.docSet(`piher.rep.${paneId}`, {
+      taskId, turn: 1, stopReason: 'stop', session: null, text: DOC_TEXT, at: Date.now(),
+    }, 0);
+    env.turns[paneId] = 1;
+    env.wakeWorker();
+    await waitFor(() => env.pi.userSent.length === 1, 8_000);
+
+    const notice = env.pi.userSent[0]?.content ?? '';
+    assert.ok(notice.includes(DOC_TEXT), `the settlement carries the document text: ${notice}`);
+    assert.match(notice, /finished and will do no further work/);
+    assert.doesNotMatch(notice, /left no closing message/);
+    assert.ok(
+      !env.pi.userSent.some((m) => /has shown no progress|stopped before settling/.test(m.content)),
+      'a report document is a settlement, not a silent or lost worker',
+    );
+    const listed = (await runSubagent(env.pi, { action: 'list' }, env.cwd)).content[0]!.text;
+    assert.match(listed, /doc-only-probe@p2 \[idle\]/, 'the settlement consumed the row');
+  }, { policy: { subagentTimeoutMs: 3_600_000 } });
+});
+
+test('P4: a closing message in the transcript alone settles nothing', async () => {
+  await withPipeEnv(async (env) => {
+    env.gated = true;
+    const spawned = await runSubagent(env.pi, { description: 'transcript-only probe', prompt: PROMPT }, env.cwd);
+    const paneId = spawned.details?.paneId as string;
+    await waitFor(() => env.frames.length === 1);
+    // The transcript holds a finalized assistant message (SUB_TEXT) and the core says the turn is
+    // over: exactly what the deleted derivation used to announce as a settlement.
+    assert.ok(existsSync(env.workerSessionFile), 'the transcript is there and readable');
+    env.turns[paneId] = 1;
+    env.wakeWorker();
+
+    // No report document was written, so there is nothing to settle: the silence budget is what ends
+    // supervision, and it says so.
+    await waitFor(() => env.pi.userSent.length > 0, 8_000);
+    assert.ok(
+      env.pi.userSent.every((m) => !m.content.includes(SUB_TEXT)),
+      `a transcript is never a report (spec S5): ${JSON.stringify(env.pi.userSent.map((m) => m.content))}`,
+    );
+    assert.match(env.pi.userSent.at(-1)!.content, /has shown no progress/, 'silence is reported as silence');
+  }, { policy: { subagentTimeoutMs: 300 } });
 });
 
 /* ── P2: the first task from the core (spec S14, S22) ───────────────── */
@@ -1561,7 +1628,7 @@ test('P2: a kept boot failure ends on its own, and a pane the core says is gone 
       assert.equal(readTaskRecord(env.cwd, taskId), null, 'and the row goes with it');
       env.sendError = null;
     });
-  }, { pipes: false, policy: { readinessTimeoutMs: 2_000, subagentTimeoutMs: 250, pollIntervalMs: 30, settleWindowMs: 0 } });
+  }, { pipes: false, policy: { readinessTimeoutMs: 2_000, subagentTimeoutMs: 250 } });
 });
 
 test('P2: a revive that cannot come up retires the pane no row will ever point at', async () => {

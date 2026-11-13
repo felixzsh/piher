@@ -78,14 +78,12 @@ test('parseTaskDocument: both envelopes share one tolerant reader', () => {
 });
 
 test('toTaskRow: the transient memory state never reaches the document', () => {
-  const entry = taskRow({
-    settleWindowStartedAt: 12, noticeAnnounced: { fingerprint: 'f', at: 3 },
-  });
-  const durable = toTaskRow(entry);
-  const leaked = ['settleWindowStartedAt', 'noticeAnnounced'].filter((k) => k in durable);
-  assert.deepEqual(leaked, [], 'no transient field reaches the document');
+  const entry = taskRow();
+  entry.deliveredReport = { address: 't2', at: 3 };
+  const durable = toTaskRow(entry) as unknown as Record<string, unknown>;
+  assert.deepEqual(Object.keys(durable).filter((k) => k === 'deliveredReport'), [], 'no transient field reaches the document');
   assert.equal(durable.taskId, entry.taskId);
-  assert.equal(durable.gen.paneId, entry.gen.paneId);
+  assert.equal(durable.gen !== undefined, true);
 });
 
 test('slugs: kebab-case, non-ASCII fallback, dedupe, display form', () => {

@@ -275,8 +275,6 @@ export default function subagentPlugin(ctx: Context): void {
   const lastRequestIdByPane = new Map<string, string>();
   /** Pane id → its in-flight boot (pipe readiness, prompt injection); a follow-up waits for it. */
   const boots = new Map<string, Promise<void>>();
-  /** Deduplicates gate notices while blocked but permits a later, distinct human question. */
-  const blockedGateNotified = new Set<string>();
 
   /** Write one task record: the task, its current generation and its decision. */
   function writeRecord(entry: TaskEntry): void {
@@ -448,7 +446,6 @@ export default function subagentPlugin(ctx: Context): void {
       const taskId = panes.get(paneId);
       if (taskId) noteObservation(taskId, obs);
     },
-    blockedGateNotified,
     session,
     injectNotice,
     claimSettleNotice: d.claimSettleNotice,
@@ -492,7 +489,10 @@ export default function subagentPlugin(ctx: Context): void {
       // A gone pane is resume work, not a re-arm.
       if (!liveTerminalIds.has(entry.gen.paneId)) continue;
       try {
-        await startPoller(entry.gen.paneId, entry.cwd, entry.gen.startedAt, entry.description, `recover-${via}-${entry.gen.paneId}`);
+        // Not awaited: a watch outlives the settlement that consumes its row (it keeps reading the
+        // worker's later reports, spec S6), so awaiting it here would hold the recovery notice for
+        // as long as the worker lives.
+        void startPoller(entry.gen.paneId, entry.cwd, entry.gen.startedAt, entry.description, `recover-${via}-${entry.gen.paneId}`);
         recovered.push(`${entry.gen.paneId} (${entry.description})`);
       } catch {
       }
@@ -1288,7 +1288,7 @@ export default function subagentPlugin(ctx: Context): void {
     // Transcript fallback: small worker panes show only the opaque status overlay, so the pane delta can never
     // carry the final report. No preferred file — start from the worker's `piher.session` label, not a stale registry value.
     readFinalReport: async (paneId: string, entryCwd: string) =>
-      (await session.subSessionState(paneId, entryCwd, 0)).text,
+      (await session.readTurnClosing(paneId, entryCwd, 0)).text,
     writeRecord,
   };
 

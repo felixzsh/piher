@@ -1,7 +1,8 @@
 /**
- * Background settlement watcher: blocked gate, settle window, vacuum — plus its per-subagent
- * Cordis scope. Each loop reads the worker from the master's `WorkerWatch` snapshot and parks on its
- * change counter, so a worker that is working, blocked or idle costs no RPCs between events.
+ * Background settlement watcher: the worker's report document, the silence budget and a report for a
+ * pane that closed — plus its per-subagent Cordis scope. Each loop reads the worker from the master's
+ * `WorkerWatch` snapshot and parks on its change counter, so a worker that is working, blocked or idle
+ * costs no RPCs between events. Nothing here derives settlement from a transcript or a timer (spec S5).
  */
 import { Context } from '@deepseek-ai/cordis';
 import type { CoreClientLike, CoreStatus, TerminalInfo } from './core-client.ts';
@@ -9,7 +10,7 @@ import {
   applyReportedSessionFile, isClosed, isSpent, taskForPane, type TaskEntry, type TaskObservation,
 } from './task-row.ts';
 import { runtimePolicy, type RuntimePolicy } from './runtime-policy.ts';
-import { formatFailureNotice, formatSettlementNotice, type SettlementNullReason } from './vocab.ts';
+import { formatFailureNotice, formatSettlementNotice } from './vocab.ts';
 import { settlementCard, type SettlementCard, type SettlementOutcome } from './settlement-card.ts';
 import { buildBlockedGateNotice, reportFingerprint } from './subagent-core.ts';
 import {
@@ -34,71 +35,37 @@ export function planBlockedGate(state: WaitState, alreadyNotified: boolean): Blo
   return { kind: 'pass' };
 }
 
-export type SettleWindowTickPlan =
-  | { kind: 'start-settle-window' }
-  | { kind: 'wait' }
-  | { kind: 'settle' };
+export type SilenceTickPlan = {
+  /** The worker said nothing to act on (working, or the watch is blind): this tick is a heartbeat. */
+  refreshActivity: boolean;
+  action: 'pane-closed' | 'silence-timeout' | 'continue';
+};
 
-/** The window delays settlement so a worker is not announced before its transcript settles; a
- *  finalized answer on a terminal that is not working skips it (the transcript cannot grow). */
-export function planSettleWindowTick(input: {
-  settleWindowStartedAt: number | null | undefined;
-  now: number;
-  windowMs: number;
-  /** The transcript already holds a finalized answer (stopReason 'stop', no pending tool call). */
-  finalized?: boolean;
-}): SettleWindowTickPlan {
-  if (!input.settleWindowStartedAt) return input.finalized ? { kind: 'settle' } : { kind: 'start-settle-window' };
-  if (input.now - input.settleWindowStartedAt < input.windowMs) return { kind: 'wait' };
-  return { kind: 'settle' };
-}
-
-export function planVacuumTick(input: {
+/**
+ * The silence budget: the only timer left in settlement, and it is not a settlement path. A worker
+ * that never reports anything DID fail to report, so its silence has to end somewhere — this decides
+ * where, and reports a pane that is simply gone (a native fact, not a guess).
+ */
+export function planSilenceTick(input: {
   waitState: WaitState;
   paneAlive: boolean;
   now: number;
   lastActivityAt: number;
   timeoutMs: number;
-}): { refreshActivity: boolean; action: 'pane-closed' | 'timeout' | 'continue' } {
+}): SilenceTickPlan {
   const refreshActivity = input.waitState === null;
   const lastActivityAt = refreshActivity ? input.now : input.lastActivityAt;
   if (!input.paneAlive) return { refreshActivity, action: 'pane-closed' };
-  if (input.now - lastActivityAt > input.timeoutMs) return { refreshActivity, action: 'timeout' };
+  if (input.now - lastActivityAt > input.timeoutMs) return { refreshActivity, action: 'silence-timeout' };
   return { refreshActivity, action: 'continue' };
 }
-
-/**
- * Closing text (only a terminal assistant message produces it) OR an ENDED turn settles; a mere
- * assistant message — the state between tool calls — must NOT qualify, or live workers get announced
- * as finished.
- *
- * The exception is an idle terminal with no tool in flight: a worker that stopped between calls is not
- * "between calls". Without it, a run that ended on a refused tool call (last message `toolUse`, result
- * already returned, nothing after) stayed invisible for the whole vacuum budget.
- */
-export function isSettlementCandidate(input: {
-  text: string | null;
-  pendingTool: boolean;
-  activity: boolean;
-  turnEnded?: boolean;
-  /** The pane itself is idle: nothing is being executed right now. */
-  terminalIdle?: boolean;
-}): boolean {
-  if (input.text) return true;
-  if (!input.pendingTool && input.turnEnded === true) return true;
-  return !input.pendingTool && input.activity === true && input.terminalIdle === true;
-}
-
-/** How long one closing text counts as announced for a pane (see noticeAnnounced). */
-const NOTICE_DEDUPE_WINDOW_MS = 5 * 60_000;
 
 export function buildSettlementNoticeText(
   agentLabel: string,
   closing: string | null,
-  nullReason: SettlementNullReason = 'silent',
   reportDeliveredAt: number | null = null,
 ): string {
-  return formatSettlementNotice(agentLabel, closing, nullReason, reportDeliveredAt);
+  return formatSettlementNotice(agentLabel, closing, reportDeliveredAt);
 }
 
 export function formatPaneClosedNotice(paneId: string, description: string): string {
@@ -116,9 +83,14 @@ export function formatSettleTimeoutNotice(input: {
 
 /* ── pane scope ─────────────────────────────────────────────────── */
 
-/** A revived pane can answer in the very second the poller starts. The transcript is read from the
- *  request boundary on, so an answer landing exactly on it used to read as no activity at all: the row
- *  then sat `running` until the settle timeout declared a worker that had finished to be `failed`. */
+/** A wake that has nothing to settle parks this long before retrying. Not a poll cadence: the core's
+ *  events drive the loop, and this only keeps a retry (a refused notice, a pane waiting on a person,
+ *  a blind watch) from waiting forever. */
+const RECHECK_PARK_MS = 1_000;
+
+/** A revived pane can answer in the very second the poller starts, and a report written on that same
+ *  second belongs to the new request. The boundary a document is judged against therefore carries a
+ *  slack, so an answer landing exactly on it is news instead of a stale read. */
 const REQUEST_BOUNDARY_SLACK_MS = 2_000;
 
 export interface ScopeHooks {
@@ -164,7 +136,6 @@ export interface PollerHost {
   writeRecord(e: TaskEntry): void;
   /** Refreshed from each observation the loop makes; feeds only the state text (S26). */
   noteObservation?: (paneId: string, obs: TaskObservation) => void;
-  blockedGateNotified: Set<string>;
   session: SessionIo;
   injectNotice(content: string, paneId?: string, card?: SettlementCard | null): Promise<void>;
   /** S54/S71: what a one-shot settlement reclaims — the pane, and any checkout its spawn created. */
@@ -191,10 +162,10 @@ export function createPoller(h: PollerHost): Poller {
    *  is still delivered. */
   const deliveredReports = new Set<string>();
   const now = h.now ?? Date.now;
-  const settleWindowMs = h.policy?.settleWindowMs ?? runtimePolicy.settleWindowMs;
   const timeoutMs = h.policy?.subagentTimeoutMs ?? runtimePolicy.subagentTimeoutMs;
-  /** Safety re-check while no event arrives; events, not this interval, drive the loop. */
-  const recheckMs = h.policy?.pollIntervalMs ?? runtimePolicy.pollIntervalMs;
+  /** How long a wake that has nothing to settle but cannot park on an event waits before retrying
+   *  (a refused notice, a pane waiting on a person). Not a poll cadence: events drive the loop. */
+  const recheckMs = RECHECK_PARK_MS;
   const watch = h.client.watchChildren();
 
   /**
@@ -215,7 +186,8 @@ export function createPoller(h: PollerHost): Poller {
 
   /** One `doc.get` for the worker's report document (spec S23): the `turn`/`status` event above
    *  is the trigger, this read is the settlement. Null when no document was written, when it is
-   *  not a report, or when the document store cannot answer — the transcript heuristic stays. */
+   *  not a report, or when the document store cannot answer — then there is nothing to settle, and
+   *  the silence budget (not a guess) owns the wait. */
   async function readReportDocument(paneId: string): Promise<ReportDocumentValue | null> {
     const name = reportDocName(paneId);
     if (!name) return null;
@@ -277,16 +249,11 @@ export function createPoller(h: PollerHost): Poller {
     async function handOver(
       entry: TaskEntry,
       closing: string | null,
-      activity: boolean,
       request: { injectTs: number; description: string; requestId: string },
-      /** The turn ended with no report: the transcript's own reason (an error, a refused tool). A
-       *  settlement notice over it would read as success. */
+      /** The report states a reason instead of a text (an error, a refused tool). A settlement
+       *  notice over it would read as success. */
       failure: string | null = null,
     ): Promise<'done' | 'retry'> {
-      // Null closing text is ambiguous — a mis-attributed transcript reads like a worker that died
-      // silent — so the transcript is the only signal: no readable candidate at all (activity false)
-      // makes "left no closing message" a lie.
-      const nullReason: SettlementNullReason = closing == null && !activity ? 'attribution-suspect' : 'silent';
       if (!entry.gen.sessionFile) {
         entry.gen.sessionFile = applyReportedSessionFile(
           entry.gen.sessionFile,
@@ -302,23 +269,16 @@ export function createPoller(h: PollerHost): Poller {
         }
         claimedKey = claimKey;
       }
-      // The same closing text, already announced for this pane, is one settlement: a recovery re-arm and
-      // a live request carry different ids, so the claim alone lets the master read it twice. The window
-      // keeps a genuinely new turn that happens to say the same words from being swallowed.
-      const fingerprint = closing === null ? null : reportFingerprint(closing);
-      const announced = entry.noticeAnnounced;
-      if (fingerprint !== null && announced && announced.fingerprint === fingerprint
-        && now() - announced.at < NOTICE_DEDUPE_WINDOW_MS) {
-        consume(now());
-        return 'done';
-      }
+      // The settlement identity is the document instance (spec S7): the claim above is per request, and
+      // `deliveredReport` plus `deliveredReports` name the document itself, so neither a re-armed watch
+      // nor a second request id can announce one settlement twice.
       // `subagent output` may already have returned this exact report: point there, don't repeat it.
       const delivered = closing && entry.gen.reportDelivered?.fingerprint === reportFingerprint(closing)
         ? entry.gen.reportDelivered.at
         : null;
       const notice = failure !== null
         ? formatFailureNotice(`${paneId} (${request.description})`, failure)
-        : buildSettlementNoticeText(`${paneId} (${request.description})`, closing, nullReason, delivered);
+        : buildSettlementNoticeText(`${paneId} (${request.description})`, closing, delivered);
       try {
         // Tag the pane: a notice buffered while the master is busy must keep its row GC-exempt
         // until the flush actually delivers it.
@@ -326,22 +286,19 @@ export function createPoller(h: PollerHost): Poller {
       } catch {
         return 'retry';
       }
-      if (fingerprint !== null) {
-        entry.noticeAnnounced = { fingerprint, at: now() };
-      }
       consume(now());
       return 'done';
     }
 
     /** Deliver this pane's report document when it holds an undelivered settlement of the current
-     *  request (spec S6–S8, S23): one `doc.get`, no transcript read, no settle window.
+     *  request (spec S6–S8, S23): one `doc.get`, no transcript read.
      *
      *  - `delivered` the report went out, the row is consumed;
      *  - `retry` the notice was refused (the master is mid-turn), so the next wake retries;
-     *  - `duplicate` this settlement was already delivered — the same (`address`, `turn`);
+     *  - `duplicate` this settlement was already delivered — the same document instance;
      *  - `stale` the document answers an earlier request, not this one;
      *  - `foreign` the document belongs to another task;
-     *  - `absent` no readable document: the transcript heuristic is the worker's channel. */
+     *  - `absent` no report document yet: nothing to settle, the silence budget owns the wait. */
     async function deliverDocument(
       entry: TaskEntry,
       request: { injectTs: number; description: string; requestId: string },
@@ -365,17 +322,16 @@ export function createPoller(h: PollerHost): Poller {
       // no closing message, and the diagnosis — never the turn's stop word — is what the master can
       // act on.
       const failure = value.text === null ? (value.stopReason ?? null) : null;
-      if (await handOver(entry, value.text, true, request, failure) === 'retry') return 'retry';
+      if (await handOver(entry, value.text, request, failure) === 'retry') return 'retry';
       deliveredReports.add(reportDeliveryKey(paneId, value.at));
       entry.deliveredReport = { address: paneId, at: value.at };
       return 'delivered';
     }
 
     await watch.ready();
-    /** Consecutive wakes that found this request's document already delivered: the first parks (the
-     *  settlement is out), the second lets the transcript heuristic take over — a worker whose
-     *  document channel broke still settles through the fallback. */
-    let duplicateWakes = 0;
+    /** One notice per blocked episode, scoped to this watch: the host-wide set existed only because a
+     *  re-armed watch could inherit another request's notice, and a watch cannot outlive its request. */
+    let blockedNotified = false;
     /** Whether the row was already settled when this watch was armed. Such a watch was armed for
      *  nothing and ends at once. A row settled WHILE the loop runs — by the pipe push, which is the
      *  normal path — does not end it: that worker's next settle (a person typing in its pane, a
@@ -405,16 +361,13 @@ export function createPoller(h: PollerHost): Poller {
             at: now(),
           });
         }
-        // Working is activity (vacuum heartbeat); `exited`/`unknown` carry no word to gate or settle on.
+        // Working is activity (the silence budget's heartbeat); `exited`/`unknown` carry no word to
+        // act on, and `idle`/`done`/`error` are the states a report arrives in.
         const waitState: WaitState = state === 'exited' || state === 'unknown' || state === 'working' ? null : state;
-        if (state === 'working' && entry.settleWindowStartedAt) {
-          // A new turn restarts the settle window from scratch.
-          entry.settleWindowStartedAt = null;
-        }
-        const gate = planBlockedGate(waitState, h.blockedGateNotified.has(paneId));
+        const gate = planBlockedGate(waitState, blockedNotified);
         if (gate.kind === 'stay-blocked') {
           if (gate.notify) {
-            h.blockedGateNotified.add(paneId);
+            blockedNotified = true;
             const question = await h.session.readAskFlag(paneId);
             try {
               await h.injectNotice(buildBlockedGateNotice({ paneId, description: current.description, question }));
@@ -426,15 +379,14 @@ export function createPoller(h: PollerHost): Poller {
           await park(recheckMs);
           continue;
         }
-        if (gate.kind === 'clear-gate') h.blockedGateNotified.delete(paneId);
+        if (gate.kind === 'clear-gate') blockedNotified = false;
 
         // A row settled while this loop ran — normally by the pipe push, which is the ordinary path —
         // keeps one reader and nothing else: the worker's next settle (a person typing in its
         // attachable pane, a queued steer) writes a document, and S6 says the master must read it.
-        // No heuristic, no vacuum, no gate here: those would re-announce or fail a worker that has
-        // already reported. The wait is the vacuum budget, not the poll interval — a new settle
-        // changes the core's status first, and that event wakes this park, so an idle worker costs
-        // no RPCs (a `doc` event is no help: spec S23 keeps them off this subscription).
+        // The wait is the silence budget, not a poll cadence — a new settle changes the core's status
+        // first, and that event wakes this park, so an idle worker costs no RPCs (a `doc` event is no
+        // help: spec S23 keeps them off this subscription).
         if (entry.gen.consumedAt !== null) {
           const landed = await deliverDocument(entry, current);
           if (isSpent(entry) || state === 'exited' || !alive) return;
@@ -456,77 +408,14 @@ export function createPoller(h: PollerHost): Poller {
             await park(recheckMs);
             continue;
           }
-          if (doc === 'delivered') {
-            duplicateWakes = 0;
-            continue; // the consumed-row reader above takes over on the next pass
-          }
-          if (doc === 'duplicate' && duplicateWakes === 0) {
-            // This request's settlement is already out. Park once: the next settle writes a new
-            // document, and on the wake after that the transcript heuristic takes over, so a row
-            // still awaiting its settlement is never stranded by a document channel that broke.
-            duplicateWakes += 1;
-            await park(recheckMs);
-            continue;
-          }
-          // `stale`, `foreign` and `absent` fall through: the document says nothing about THIS request,
-          // and the transcript heuristic below stays the worker's channel.
+          if (doc === 'delivered') continue; // the consumed-row reader above takes over on the next pass
+          // `duplicate`, `stale`, `foreign` and `absent` fall through: the document says nothing about
+          // THIS request, so the silence budget below owns the wait.
         }
 
-        if (state === 'idle' || state === 'done' || state === 'error') {
-          // Spawn can mis-attribute the generation's sessionFile (the `piher.session` label lags;
-          // the mtime fallback records the newest PRE-EXISTING session), freezing settlement
-          // detection until the vacuum timeout.
-          if (entry.gen.sessionFile) {
-            const fixed = await h.session.reattributeStaleSessionFile(paneId, cwd, current.injectTs, entry.gen.sessionFile);
-            if (fixed && fixed !== entry.gen.sessionFile) {
-              entry.gen.sessionFile = fixed;
-              h.writeRecord(entry);
-            }
-          } else {
-            entry.gen.sessionFile = applyReportedSessionFile(
-              entry.gen.sessionFile,
-              await h.session.resolveSessionFile(paneId, cwd, undefined, { minMtimeMs: current.injectTs - 2_000 }),
-            );
-          }
-          const s = await h.session.subSessionState(paneId, cwd, current.injectTs, entry.gen.sessionFile);
-
-          const terminalIdle = state === 'idle' || state === 'done' || state === 'error';
-          const candidate = isSettlementCandidate({ ...s, terminalIdle });
-          if (candidate) {
-            // With no closing words, a stated reason (refused tool, errored turn) IS the report.
-            const closing = s.text ?? s.why ?? null;
-            const tick = planSettleWindowTick({
-              settleWindowStartedAt: entry.settleWindowStartedAt,
-              now: now(),
-              windowMs: settleWindowMs,
-              finalized: closing != null && !s.pendingTool,
-            });
-            if (tick.kind === 'start-settle-window') {
-              entry.settleWindowStartedAt = now();
-              await park(settleWindowMs);
-              continue;
-            }
-            if (tick.kind === 'wait') {
-              await park(settleWindowMs - (now() - (entry.settleWindowStartedAt ?? now())));
-              continue;
-            }
-            entry.settleWindowStartedAt = null;
-            // No text but a stated reason means the turn died (a provider error, a refused tool): the
-            // reason is the diagnosis, never a report.
-            const failure = s.text === null ? (s.why ?? null) : null;
-            if (await handOver(entry, closing, s.activity, current, failure) === 'retry') {
-              // Notification refused (e.g. the master is mid-turn): leave the row running and
-              // re-detect the same closing text on the next wake.
-              await park(recheckMs);
-              continue;
-            }
-            return;
-          }
-        }
-
-        const vacuum = planVacuumTick({ waitState, paneAlive: alive, now: now(), lastActivityAt, timeoutMs });
-        if (vacuum.refreshActivity) lastActivityAt = now();
-        if (vacuum.action === 'pane-closed') {
+        const tick = planSilenceTick({ waitState, paneAlive: alive, now: now(), lastActivityAt, timeoutMs });
+        if (tick.refreshActivity) lastActivityAt = now();
+        if (tick.action === 'pane-closed') {
           consume(now());
           try {
             await h.injectNotice(formatPaneClosedNotice(paneId, current.description), paneId,
@@ -534,22 +423,10 @@ export function createPoller(h: PollerHost): Poller {
           } catch { /* non-fatal */ }
           return;
         }
-        if (vacuum.action === 'timeout') {
-          // The turn can end without a closing text readable after the request boundary (a revived
-          // pane answering in the same second, a transcript re-attributed mid-run). Before declaring
-          // `failed`, read the transcript once more with no boundary: an assistant answer sitting at
-          // the end of it IS the settlement, and "failed" for a worker that finished is a lie.
-          const late = await h.session.subSessionState(paneId, cwd, 0, entry.gen.sessionFile).catch(() => null);
-          const lateClosing = late?.text ?? late?.why ?? null;
-          if (late && lateClosing != null && !late.pendingTool) {
-            entry.settleWindowStartedAt = null;
-            const lateFailure = late.text === null ? (late.why ?? null) : null;
-            if (await handOver(entry, lateClosing, late.activity, current, lateFailure) === 'retry') {
-              await park(recheckMs);
-              continue;
-            }
-            return;
-          }
+        if (tick.action === 'silence-timeout') {
+          // Silence is the whole finding: the row ends here (its `consumedAt` is what the tab, pane
+          // and checkout sweeps wait on) and the master is told, rather than waiting for a report
+          // that is not coming.
           consume(now());
           const notice = formatSettleTimeoutNotice({
             paneId,

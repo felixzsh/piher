@@ -76,13 +76,6 @@ export type ResolvedTaskEntry = { entry: TaskEntry; foreign: boolean } | { error
  *  fields are stripped at the document seam (`toTaskRow`) and never reach disk. Liveness is
  *  not among them: it is observed from core per surface, never stored (S11, S12). */
 export interface TaskEntry extends TaskRow {
-  /** Settle window start (poller state): settlement waits until the transcript settles. */
-  settleWindowStartedAt?: number | null;
-  /** The closing text already announced for this pane (fingerprint + time). Two pollers can
-   *  settle the same transcript — a recovery re-arm and a live request carry different ids —
-   *  and the claim is per request, so this is what stops the master from reading one
-   *  settlement twice. */
-  noticeAnnounced?: { fingerprint: string; at: number } | null;
   /** The settlement last delivered for this row, by ANY path: the pipe push or a poller. It names
    *  the document instance (address + the worker's `at`), which is exactly what the pipe reports
    *  when it delivers, so a re-armed watch can never read the same report as news (spec S7). */
@@ -91,9 +84,7 @@ export interface TaskEntry extends TaskRow {
 
 /** The durable row alone: what a record file holds. */
 export function toTaskRow(entry: TaskEntry): TaskRow {
-  const { settleWindowStartedAt: _w, noticeAnnounced: _n, deliveredReport: _d, ...row } = entry;
-  void _w;
-  void _n;
+  const { deliveredReport: _d, ...row } = entry;
   void _d;
   const fingerprint = row.gen.reportDelivered ? { ...row.gen.reportDelivered } : null;
   const delivered = fingerprint ? { reportDelivered: fingerprint } : {};

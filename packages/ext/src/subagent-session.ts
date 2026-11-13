@@ -1,18 +1,20 @@
 /**
- * Child-session transcript I/O + pane-output reads for subagents. Path resolution, settlement
- * text and liveness probes share one candidate order (the worker's own `piher.session` label before
- * recent-file fallback, excluding the master's own session and sessions claimed by other live
- * terminals), so settlement text can never cross sessions.
+ * Child-session transcript I/O + pane-output reads for subagents. Path resolution, a worker's own
+ * closing words and liveness probes share one candidate order (the worker's own `piher.session`
+ * label before the recent-file fallback, excluding the master's own session and sessions claimed by
+ * other live terminals), so a transcript can never cross sessions.
+ *
+ * Nothing here decides that a task settled: no caller may infer it (spec S5).
  */
 import { accessSync, constants, statSync } from 'node:fs';
 import type { CoreClientLike, CoreStatus } from './core-client.ts';
 import {
   bareSessionId,
-  deriveSubSessionState,
   listSessionFiles,
   readSessionFile,
+  readTurnClosing,
   resolveSessionFileValue,
-  type SubSessionState,
+  type TurnClosing,
 } from './session-tail.ts';
 import { idParam, reportFingerprint, type AliveProbe } from './subagent-core.ts';
 import { isClosed, type ResolvedTaskEntry, type TaskEntry } from './task-row.ts';
@@ -221,11 +223,8 @@ export interface SessionIo {
   resolveSessionFile(paneId: string, cwd: string, preferred?: string | null, opts?: ResolveSessionFileOpts): Promise<string | null>;
   readAskFlag(paneId: string): Promise<string | null>;
   probeAlive(paneId: string, cwd: string): Promise<AliveProbe>;
-  subSessionState(paneId: string, cwd: string, sinceTs: number, preferred?: string | null): Promise<SubSessionState>;
-  /** Re-attribute a registry sessionFile with no writes since `sinceTs`: keep `preferred` when fresh,
-   * else accept herdr's per-pane report when fresh. An existing value is only replaced by the
-   * authoritative report; null means "keep the old one" (never an mtime guess). */
-  reattributeStaleSessionFile(paneId: string, cwd: string, sinceTs: number, preferred: string | null): Promise<string | null>;
+  /** The worker's own closing words, for its report and for `output`. Never a settlement decision. */
+  readTurnClosing(paneId: string, cwd: string, sinceTs: number, preferred?: string | null): Promise<TurnClosing>;
 }
 
 interface FileStamp {
@@ -270,7 +269,7 @@ class DerivedCache<T> {
 }
 
 export function createSessionIo(h: SessionIoHost): SessionIo {
-  const stateCache = new DerivedCache<SubSessionState>();
+  const closingCache = new DerivedCache<TurnClosing>();
 
   /** This terminal's `piher.session` label plus the sessions claimed by other terminals; one
    *  `terminal.list` serves both, so the poll hot paths pay a single RPC. */
@@ -340,31 +339,6 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     return null;
   }
 
-  async function reattributeStaleSessionFile(
-    paneId: string,
-    cwd: string,
-    sinceTs: number,
-    preferred: string | null,
-  ): Promise<string | null> {
-    // Tolerate fs timestamp granularity against the pre-injection injectTs capture.
-    const minMtimeMs = sinceTs - 2_000;
-    const own = bareSessionId(h.getSessionId());
-    const { reported, taken } = await reportedAndTaken(paneId);
-    // Own/taken exclusions apply to `preferred` too: a registry value pointing at the master's own
-    // transcript is always "fresh", so the gate cannot veto it and herdr's report takes over.
-    const preferredId = preferred ? bareSessionId(preferred) : null;
-    const preferredHeld = preferredId != null && ((own != null && preferredId === own) || taken.has(preferredId));
-    const preferredStamp = preferred ? stampOf(preferred) : null;
-    if (preferred && !preferredHeld && preferredStamp && preferredStamp.mtimeMs >= minMtimeMs) return preferred;
-    const file = resolveSessionFileValue(cwd, h.sessionsDir(), reported);
-    if (!file) return null;
-    const id = bareSessionId(file);
-    if (own && id === own) return null;
-    if (taken.has(id)) return null;
-    const stamp = stampOf(file);
-    return stamp && stamp.mtimeMs >= minMtimeMs ? file : null;
-  }
-
   /** The blocked question text: pi's OSC 7501 reporter carries it as the status message. */
   async function readAskFlag(paneId: string): Promise<string | null> {
     return readBlockedQuestion(h.client, paneId);
@@ -385,30 +359,29 @@ export function createSessionIo(h: SessionIoHost): SessionIo {
     return probe;
   }
 
-  async function subSessionState(
+  async function readTurnClosingFor(
     paneId: string,
     cwd: string,
     sinceTs: number,
     preferred?: string | null,
-  ): Promise<SubSessionState> {
+  ): Promise<TurnClosing> {
     for await (const { file, stamp } of readableCandidates(paneId, cwd, preferred)) {
-      const cached = stateCache.get(file, stamp, sinceTs);
+      const cached = closingCache.get(file, stamp, sinceTs);
       if (cached) return cached;
       const entries = readSessionFile(file);
       if (!entries?.length) continue;
-      const state = deriveSubSessionState(entries, sinceTs);
-      stateCache.set(file, stamp, sinceTs, state);
-      return state;
+      const closing = readTurnClosing(entries, sinceTs);
+      closingCache.set(file, stamp, sinceTs, closing);
+      return closing;
     }
-    return { text: null, pendingTool: false, activity: false, turnEnded: false, why: null };
+    return { text: null, why: null };
   }
 
   return {
     resolveSessionFile,
     readAskFlag,
     probeAlive,
-    subSessionState,
-    reattributeStaleSessionFile,
+    readTurnClosing: readTurnClosingFor,
   };
 }
 

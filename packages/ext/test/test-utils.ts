@@ -317,8 +317,6 @@ export type TaskSeed = Partial<Omit<TaskRow, 'gen' | 'lifecycle' | 'closedAt'>> 
   startedAt?: number;
   consumedAt?: number | null;
   reportDelivered?: { fingerprint: string; at: number } | null;
-  settleWindowStartedAt?: number | null;
-  noticeAnnounced?: { fingerprint: string; at: number } | null;
 };
 
 export function taskRow(over: TaskSeed = {}): TaskEntry {
@@ -331,8 +329,6 @@ export function taskRow(over: TaskSeed = {}): TaskEntry {
     launchCommand = [],
     consumedAt = null,
     reportDelivered = null,
-    settleWindowStartedAt,
-    noticeAnnounced,
     lifecycle = 'persistent',
     taskId = 'task-1',
     kind = 'task',
@@ -361,8 +357,6 @@ export function taskRow(over: TaskSeed = {}): TaskEntry {
       consumedAt,
       reportDelivered,
     },
-    ...(settleWindowStartedAt !== undefined ? { settleWindowStartedAt } : {}),
-    ...(noticeAnnounced !== undefined ? { noticeAnnounced } : {}),
     ...rest,
   };
 }

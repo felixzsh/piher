@@ -14,8 +14,6 @@
 export type PolicyField =
   | 'subagentTimeoutMs'
   | 'gcTickMs'
-  | 'pollIntervalMs'
-  | 'settleWindowMs'
   | 'sessionTtlSeconds'
   | 'gitTimeoutMs'
   | 'readinessTimeoutMs'
@@ -38,8 +36,6 @@ export const OPTION_SPECS: readonly OptionSpec[] = [
   { name: 'PIHER_SUBAGENT_TIMEOUT_MS', fallback: '300000', min: 1000, policy: 'subagentTimeoutMs', description: 'how long a subagent may stay silent before the master is told it never reported' },
   { name: 'PIHER_READY_TIMEOUT_MS', fallback: '90000', min: 1000, policy: 'readinessTimeoutMs', description: 'how long a spawned worker gets to report ready and take its first message (a dead pane fails fast)' },
   { name: 'PIHER_COMMAND_PICKUP_MS', fallback: '1500', min: 0, policy: 'commandPickupMs', description: 'how long a send waits for the worker to pick its steering command out of the core (0 reports the write alone)' },
-  { name: 'PIHER_SETTLE_WINDOW_MS', fallback: '4000', min: 0, policy: 'settleWindowMs', description: 'debounce after a subagent turn ends before it is called settled (a new turn cancels it)' },
-  { name: 'PIHER_POLL_INTERVAL_MS', fallback: '30000', min: 1000, policy: 'pollIntervalMs', description: 'safety re-check of a subagent when no core event arrives (events drive settlement)' },
   { name: 'PIHER_GC_TICK_MS', fallback: '30000', min: 1000, policy: 'gcTickMs', description: 'idle GC sweep cadence (panes)' },
   { name: 'PIHER_SESSION_TTL_SECONDS', fallback: '600', min: 0, policy: 'sessionTtlSeconds', description: 'session retention after a subagent exits, before GC' },
   { name: 'PIHER_WRITE_LOCK', fallback: '', description: '1 makes a conflicting write/edit block instead of warn (read by the lock layer)' },

@@ -57,7 +57,7 @@ function textOf(m: SessionMessageLike): string {
 }
 /** Latest finalized assistant text (`stopReason === 'stop'`), excluding toolUse intermediates;
  * `sinceTs` filters out messages predating the injection point. */
-export function lastAssistantText(
+function lastAssistantText(
   entries: readonly SessionEntryLike[],
   opts: { sinceTs?: number } = {},
 ): { text: string; timestamp: number } | null {
@@ -74,10 +74,10 @@ export function lastAssistantText(
 }
 /**
  * Newest assistant text after `sinceTs` with no stopReason filter: a turn can end by hitting the token
- * cap or by an abort, and those words are still the report the master should receive instead of
+ * cap or by an abort, and those words are still the report it produced instead of
  * "left no closing message".
  */
-export function lastAssistantAnyText(
+function lastAssistantAnyText(
   entries: readonly SessionEntryLike[],
   sinceTs: number,
 ): string | null {
@@ -94,64 +94,12 @@ export function lastAssistantAnyText(
   return best?.text ?? null;
 }
 
-/** Return whether any assistant message occurs after the injection point, regardless of stopReason. */
-export function hasAssistantAfter(
-  entries: readonly SessionEntryLike[],
-  sinceTs: number,
-): boolean {
-  return entries.some((e) => {
-    const m = messageOf(e);
-    return !!m && m.role === 'assistant' && (typeof m.timestamp === 'number' ? m.timestamp : 0) >= sinceTs;
-  });
-}
-/**
- * Whether the NEWEST assistant message after `sinceTs` ended its turn: a worker between tool calls
- * has "an assistant message" but has NOT finished, so announcing it settled loses supervision of
- * live work. `stopReason === 'toolUse'` means tools were requested; a non-string stopReason (still
- * streaming / older shapes) counts as "not ended" on purpose.
- */
-export function lastAssistantTurnEnded(
-  entries: readonly SessionEntryLike[],
-  sinceTs: number,
-): boolean {
-  let newest: { ts: number; stopReason: unknown } | null = null;
-  for (const entry of entries) {
-    const m = messageOf(entry);
-    if (!m || m.role !== 'assistant') continue;
-    const ts = typeof m.timestamp === 'number' ? m.timestamp : 0;
-    if (ts < sinceTs) continue;
-    if (!newest || ts >= newest.ts) newest = { ts, stopReason: m.stopReason };
-  }
-  if (!newest) return false;
-  const sr = newest.stopReason;
-  return typeof sr === 'string' && sr !== 'toolUse' && sr !== 'pending';
-}
-/** Whether an initiated toolCall still lacks a result after injection (a task waiting on the tool's
- * own completion), meaning settlement has not completed. */
-export function hasPendingToolCall(entries: readonly SessionEntryLike[], sinceTs: number): boolean {
-  let depth = 0;
-  for (const entry of entries) {
-    const m = messageOf(entry);
-    if (!m) continue;
-    const ts = typeof m.timestamp === 'number' ? m.timestamp : 0;
-    if (ts < sinceTs) continue;
-    if (m.role === 'assistant') {
-      const content = m.content;
-      if (Array.isArray(content)) {
-        depth += content.filter((c) => typeof c === 'object' && c !== null && (c as { type?: string }).type === 'toolCall').length;
-      }
-    }
-    if (m.role === 'toolResult') depth -= 1;
-  }
-  return depth > 0;
-}
-
 /**
  * Why a turn ended with nothing to say, in words the master can act on. A refused tool is the case
- * that matters: piher's gate refuses it, the model stops, and without this the master waited the whole
- * vacuum budget for a report that was never coming.
+ * that matters: piher's gate refuses it, the model stops, and the report would otherwise say nothing
+ * about why.
  */
-export function explainSilentEnd(
+function explainSilentEnd(
   entries: readonly SessionEntryLike[],
   sinceTs: number,
 ): string | null {
@@ -174,35 +122,28 @@ export function explainSilentEnd(
   return failed ? 'Its turn ended with an error and no message.' : null;
 }
 
-/** Derived settlement state of one child session, from the inject point onward. */
-export interface SubSessionState {
+/** The words one turn left behind. */
+export interface TurnClosing {
   text: string | null;
-  pendingTool: boolean;
-  activity: boolean;
-  turnEnded: boolean;
   /** Nothing to say, but there is a reason the master can act on: a refused tool, an errored turn. */
-  why?: string | null;
+  why: string | null;
 }
 
-/** Closing text is terminal by construction (lastAssistantText requires stopReason 'stop'); an
- * assistant message alone is not a settlement — the turn must have ENDED. */
-export function deriveSubSessionState(
-  entries: readonly SessionEntryLike[],
-  sinceTs: number,
-): SubSessionState {
-  const r = lastAssistantText(entries, { sinceTs });
-  if (r?.text) return { text: r.text, pendingTool: false, activity: true, turnEnded: true, why: null };
-  if (hasPendingToolCall(entries, sinceTs)) return { text: null, pendingTool: true, activity: true, turnEnded: false, why: null };
-  if (hasAssistantAfter(entries, sinceTs)) {
-    const turnEnded = lastAssistantTurnEnded(entries, sinceTs);
-    // An ended turn always has words to deliver, even when they did not come from a clean 'stop'
-    // (token cap, abort). Without this the poller saw "turn ended, no text" and announced
-    // "It left no closing message" for a worker that had answered.
-    const any = turnEnded ? lastAssistantAnyText(entries, sinceTs) : null;
-    if (any) return { text: any, pendingTool: false, activity: true, turnEnded: true, why: null };
-    return { text: null, pendingTool: false, activity: true, turnEnded, why: explainSilentEnd(entries, sinceTs) };
-  }
-  return { text: null, pendingTool: false, activity: false, turnEnded: false, why: null };
+/**
+ * What a turn said, read from a transcript the CALLER OWNS: the worker reading its own session for
+ * its own report (spec S8), and `output` showing a finished worker's last words.
+ *
+ * It answers "what did this turn say", never "did the turn end": no caller may settle, fail or
+ * supervise a task from it (spec S5 — settlement is the core's `turn` plus the worker's report
+ * document). `sinceTs` is the boundary the caller already knows: a turn that has ended.
+ */
+export function readTurnClosing(entries: readonly SessionEntryLike[], sinceTs: number): TurnClosing {
+  const finalized = lastAssistantText(entries, { sinceTs });
+  if (finalized?.text) return { text: finalized.text, why: null };
+  // A turn can end by hitting the token cap or by an abort, and those words are still its report.
+  const any = lastAssistantAnyText(entries, sinceTs);
+  if (any) return { text: any, why: null };
+  return { text: null, why: explainSilentEnd(entries, sinceTs) };
 }
 
 /** Newest `limit` session files under cwd's session dir (pi core's name first, then piher's old encodings). */

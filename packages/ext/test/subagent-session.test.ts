@@ -1,5 +1,5 @@
-/** Child-session I/O and output reads: candidate resolution, liveness probes, state
- * derivation with cache invalidation, the output delta, the `output` action and reply healing. */
+/** Child-session I/O and output reads: candidate resolution, liveness probes, a worker's closing
+ * words with cache invalidation, the output delta, the `output` action and reply healing. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
@@ -21,7 +21,7 @@ import {
 
 const TS = 1_800_000_000_000;
 const sessions = () => mkdtempSync(join(tmpdir(), 'piher-session-'));
-const NO_STATE = { text: null, pendingTool: false, activity: false, turnEnded: false, why: null };
+const NO_CLOSING = { text: null, why: null };
 
 /** Terminal id used by the single-worker session fixtures. */
 const PANE = 'tW';
@@ -46,20 +46,20 @@ const writeSession = (file: string, lines: unknown[], append = false): void => {
   writeFileSync(file, jsonl(...lines), append ? { flag: 'a' } : undefined);
 };
 
-test('subSessionState: a reported but not-yet-created session file is skipped, not fatal', async () => {
+test('readTurnClosing: a reported but not-yet-created session file is skipped, not fatal', async () => {
   const dir = sessions();
-  const state = await io(join(dir, 'not-created-yet.jsonl'), dir).subSessionState(PANE, dir, Date.now());
-  assert.deepEqual(state, NO_STATE);
+  const closing = await io(join(dir, 'not-created-yet.jsonl'), dir).readTurnClosing(PANE, dir, Date.now());
+  assert.deepEqual(closing, NO_CLOSING);
 });
 
-test('subSessionState: a readable session with terminal text settles', async () => {
+test('readTurnClosing: a readable session reports the turn\'s own words', async () => {
   const dir = sessions();
   const file = join(dir, 'child.jsonl');
   writeSession(file, [transcriptMessage('assistant', 'ok', TS + 10)]);
-  assert.deepEqual(await io(file, dir).subSessionState(PANE, dir, TS), { ...NO_STATE, text: 'ok', activity: true, turnEnded: true });
+  assert.deepEqual(await io(file, dir).readTurnClosing(PANE, dir, TS), { text: 'ok', why: null });
 });
 
-test('subSessionState: between tool calls the turn has NOT ended', async () => {
+test('readTurnClosing: a turn caught between tool calls reports only what it said, not a verdict', async () => {
   const dir = sessions();
   const file = join(dir, 'child-midflight.jsonl');
   writeSession(file, [
@@ -67,17 +67,17 @@ test('subSessionState: between tool calls the turn has NOT ended', async () => {
     { type: 'message', message: { role: 'assistant', content: [{ type: 'toolCall' }], timestamp: TS + 10, stopReason: 'toolUse' } },
     transcriptMessage('toolResult', 'ok', TS + 20),
   ]);
-  assert.deepEqual(await io(file, dir).subSessionState(PANE, dir, TS), { ...NO_STATE, activity: true });
+  assert.deepEqual(await io(file, dir).readTurnClosing(PANE, dir, TS), NO_CLOSING);
 });
 
-test('subSessionState: cache invalidates on append (a stale hit would hang pendingTool forever)', async () => {
+test('readTurnClosing: cache invalidates on append (a stale hit would hide the finished words)', async () => {
   const dir = sessions();
   const file = join(dir, 'child-growing.jsonl');
   writeSession(file, [{ type: 'message', message: { role: 'assistant', content: [{ type: 'toolCall' }], timestamp: TS + 10, stopReason: 'toolUse' } }]);
   const session = io(file, dir);
-  assert.deepEqual(await session.subSessionState(PANE, dir, TS), { ...NO_STATE, pendingTool: true, activity: true });
+  assert.deepEqual(await session.readTurnClosing(PANE, dir, TS), NO_CLOSING);
   writeSession(file, [transcriptMessage('assistant', 'finished', TS + 20)], true);
-  assert.deepEqual(await session.subSessionState(PANE, dir, TS), { ...NO_STATE, text: 'finished', activity: true, turnEnded: true });
+  assert.deepEqual(await session.readTurnClosing(PANE, dir, TS), { text: 'finished', why: null });
 });
 
 test('probeAlive: the terminal record decides liveness; a finished terminal is gone', async () => {
@@ -164,39 +164,6 @@ test('resolveSessionFile: the own label wins over the mtime order; a pipe self-r
   home.dispose();
 });
 
-test('reattributeStaleSessionFile: repairs a stale or poisoned value from the worker label, never guesses', async () => {
-  const agentDir = mkdtempSync(join(tmpdir(), 'piher-session-reattr-'));
-  const file = (name: string): string => {
-    const path = join(agentDir, name);
-    writeFileSync(path, '{}\n');
-    return path;
-  };
-  const ownFile = file('2026-09-21T06-00-00-000Z_11111111-1111-4111-8111-111111111111.jsonl');
-  const takenFile = file('2026-09-21T06-00-00-000Z_22222222-2222-4222-8222-222222222222.jsonl');
-  const foreignFile = file('2026-09-21T06-05-00-000Z_33333333-3333-4333-8333-333333333333.jsonl');
-  const stalePreferred = file('2026-09-16T07-15-46-751Z_44444444-4444-4444-8444-444444444444.jsonl');
-  utimesSync(stalePreferred, new Date(Date.now() - 3_600_000), new Date(Date.now() - 3_600_000));
-
-  const ioFor = (reported: string) => createSessionIo({
-    client: sessionClient({ 'tStale': reported, 'tOther': takenFile }),
-    getSessionId: () => ownFile,
-    sessionsDir: () => agentDir,
-  });
-  const reattribute = (reported: string, preferred: string | null) =>
-    ioFor(reported).reattributeStaleSessionFile('tStale', '/tmp/proj', Date.now(), preferred);
-
-  assert.equal(
-    await reattribute(ownFile, stalePreferred),
-    null,
-    'an own-transcript report is rejected even though the file is fresh',
-  );
-  assert.equal(await reattribute(foreignFile, stalePreferred), foreignFile);
-  assert.equal(await reattribute(foreignFile, foreignFile), foreignFile, 'a fresh preferred is kept as-is');
-  // The master rewrites its own transcript continuously, so freshness alone must not preserve poison;
-  // the report repairs it instead of returning null (= keep the old value).
-  assert.equal(await reattribute(foreignFile, ownFile), foreignFile);
-  assert.equal(await reattribute(foreignFile, takenFile), foreignFile);
-});
 
 /* ── output delta (pure) ────────────────────────────────────────── */
 
@@ -595,9 +562,7 @@ test('applyReplySession: a bare session id self-report repairs a poisoned sessio
 test('session recovery: a still-running subagent gets its settlement watch re-armed', async () => {
   const home = new TempHome('piher-recover-home-');
   const cwd = mkdtempSync(join(tmpdir(), 'piher-recover-cwd-'));
-  const dir = home.dir('sessions', sessionDirName(cwd));
-  const workerFile = join(dir, '2026-09-20T06-10-00-000Z_aaaa1111-2222-4333-8444-555555555555.jsonl');
-  writeFileSync(workerFile, jsonl(transcriptMessage('assistant', 'RECOVERED_REPORT: fix committed, 199 tests green', Date.now())));
+  void home.dir('sessions', sessionDirName(cwd));
 
   const notices: string[] = [];
   // The task's record belongs to a repository: the restore reads it from there.
@@ -606,14 +571,23 @@ test('session recovery: a still-running subagent gets its settlement watch re-ar
   const taskId = 'cccc3333-4444-4555-8666-777777777777';
   const createdAt = Date.now() - 120_000;
   seedTaskDocuments(viewFile, [{
-    taskId, paneId: 'pAlive', tabId: 't0', tabName: 'main',
+    taskId, paneId: 'p9', tabId: 't0', tabName: 'main',
     cwd, description: 'Fix bugs in a separate checkout',
     sessionFile: null, createdAt,
   }]);
+  // The worker's own report, written into the core: the only thing that settles a task now (spec S5).
+  const reportAt = Date.now();
+  const report = {
+    taskId, turn: 1, stopReason: 'stop', session: null,
+    text: 'RECOVERED_REPORT: fix committed, 199 tests green', at: reportAt,
+  };
   const { root, pi } = await mountSubagent({
     client: {
-      listTerminals: async () => [terminalInfo({ id: 'pAlive', status: 'idle', labels: { 'piher.session': workerFile } })],
-      getTerminal: async (id) => terminalInfo({ id, status: 'idle', labels: { 'piher.session': workerFile } }),
+      listTerminals: async () => [terminalInfo({ id: 'p9', status: 'idle', labels: {} })],
+      getTerminal: async (id) => terminalInfo({ id, status: 'idle', labels: {} }),
+      docGet: async (name) => (name === 'piher.rep.p9'
+        ? { value: report, version: 1 }
+        : { value: null, version: 0 }),
     },
     deps: {
       getSessionId: () => 'bbbb2222-3333-4444-8555-666666666666',
@@ -624,6 +598,11 @@ test('session recovery: a still-running subagent gets its settlement watch re-ar
   });
   try {
     await fire(pi, 'session_start', { reason: 'reload' }, {});
+    // The re-armed watch reads the core's document on its first tick; the restore itself is async.
+    const deadline = Date.now() + 5_000;
+    while (!notices.some((n) => n.includes('Its report, in its own words')) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     assert.ok(notices.some((n) => n.includes('settlement watch re-armed')), `missing recovery notice: ${JSON.stringify(notices)}`);
     const settle = notices.find((n) => n.includes('Its report, in its own words'));
     assert.ok(settle, `missing settlement notice: ${JSON.stringify(notices)}`);

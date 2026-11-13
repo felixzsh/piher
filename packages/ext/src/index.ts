@@ -17,7 +17,7 @@ import { installRenderers } from './renderers.ts';
 import { SETTLEMENT_CUSTOM_TYPE, sendSettlementNotice } from './settlement-card.ts';
 import { createCoreClient } from './core-client.ts';
 import type { DocWatch } from './core-client.ts';
-import { bareSessionId, deriveSubSessionState, readSessionFile, resolveSessionFileValue } from './session-tail.ts';
+import { bareSessionId, readSessionFile, readTurnClosing, resolveSessionFileValue } from './session-tail.ts';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { existsSync } from 'node:fs';
@@ -264,16 +264,18 @@ export default async function (pi: ExtensionAPI) {
   /** The worker's own closing words: the finalized text, else the reason the turn ended without
    *  one (a refused tool, an error). Shared by the pipe push and the report document so the two
    *  can never disagree about whether the worker said anything: a turn that ended by token cap or
-   *  abort still has words. A worker still thinking has neither, and its report stays withheld. */
+   *  abort still has words. A worker still thinking has neither, and its report stays withheld.
+   *
+   *  This reads the worker's OWN transcript for its OWN report; the master never derives settlement
+   *  from a transcript (spec S5), so this is not a busywork copy of a master-side heuristic. */
   function ownClosing(sinceTs: number): { text: string | null; why: string | null; file: string | null } {
     const ownFile = ownSessionFile
       ?? (sessionId ? resolveSessionFileValue(process.cwd(), agentSessionsDir(), sessionId) : null);
     if (!ownFile) return { text: null, why: null, file: null };
     const entries = readSessionFile(ownFile);
-    // Same derivation the master's poller uses, so the two paths can never disagree.
     if (!entries) return { text: null, why: null, file: ownFile };
-    const state = deriveSubSessionState(entries, sinceTs);
-    return { text: state.text, why: state.why ?? null, file: ownFile };
+    const closing = readTurnClosing(entries, sinceTs);
+    return { text: closing.text, why: closing.why, file: ownFile };
   }
 
   /** Everything one settle reports, resolved once: the closing words (or the reason the turn ended
@@ -335,7 +337,7 @@ export default async function (pi: ExtensionAPI) {
     }
     try {
       // A turn that ended with nothing to say but a reason — a refused tool, an error — must say
-      // it: staying silent left the master waiting the whole vacuum budget for a report that was
+      // it: staying silent left the master waiting its whole silence budget for a report that was
       // never coming.
       const reportText = report.text ?? report.why ?? null;
       if (reportText === null) {

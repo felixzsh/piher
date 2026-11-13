@@ -67,6 +67,6 @@ rehearse: run it before every commit and push, and let the result speak.
   and a stuck one must not become a stuck mutation.
 - `--test-timeout=120000` is what turns a hang into a failure instead of a blocked terminal.
 - Do not add real sleeps to a test to satisfy a timer. Set the budget the code reads
-  (`PIHER_SETTLE_WINDOW_MS`, `PIHER_READY_TIMEOUT_MS`, …) to something small in the harness instead.
+  (`PIHER_SUBAGENT_TIMEOUT_MS`, `PIHER_READY_TIMEOUT_MS`, …) to something small in the harness instead.
 - Anything long goes to `bg_job` (or an `hc` terminal when the role forbids it), never to a blocking
   shell call.
