@@ -20,7 +20,7 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit -p packages/ext/tsconfig.json",
-    "test": "npm run typecheck && node --test --test-timeout=120000 \"packages/*/test/**/*.test.ts\"",
+    "test": "npm run typecheck && timeout 240 node --test --test-timeout=120000 \"packages/*/test/**/*.test.ts\"",
     "test:mutation": "stryker run",
     "prepare": "git config core.hooksPath .githooks || true"
   },

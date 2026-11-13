@@ -45,10 +45,8 @@ interrupted pi session, send ESC to the pane (`pane.send_keys {keys:["escape"]}`
 
 ## Long commands
 
-Anything that compiles, builds, installs dependencies or runs a test suite goes to `bg_job` — or, when
-the role forbids it (a worker's manifest denies `bg_job`), to an `hc` terminal (`hc run --bg …`, then
-`hc wait`) — never to a blocking shell call. `bash` is for short, interactive or order-dependent
-commands.
+**Any command that may take a while goes to `bg_job`, always.** `bash` is for what finishes in seconds:
+if you are unsure how long it takes, it is `bg_job`. Never wait out a slow command in the foreground.
 
 ## Tests: `npm test`, and nothing else to decide
 
@@ -66,6 +64,10 @@ rehearse: run it before every commit and push, and let the result speak.
   passes it now. `stryker.conf.json` still does: a mutation run spawns the suite thousands of times,
   and a stuck one must not become a stuck mutation.
 - `--test-timeout=120000` is what turns a hang into a failure instead of a blocked terminal.
+- **A test that takes long is unacceptable**, whatever the framework: a unit, an integration, a module.
+  The only exceptions are a full suite, an e2e run or a complete integration pass — those may take
+  minutes, and even they have a wall clock (`timeout 240` in the `npm test` script). A slow test is a
+  defect to fix, not a cost to absorb.
 - Do not add real sleeps to a test to satisfy a timer. Set the budget the code reads
   (`PIHER_SUBAGENT_TIMEOUT_MS`, `PIHER_READY_TIMEOUT_MS`, …) to something small in the harness instead.
 - Anything long goes to `bg_job` (or an `hc` terminal when the role forbids it), never to a blocking
