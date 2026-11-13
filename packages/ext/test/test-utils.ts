@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
 import { cordisProvide } from '../src/cordis-services.ts';
 import type { CoreClientLike, CoreEnv, TerminalInfo, WorkerWatch } from '../src/core-client.ts';
+import { CoreError } from '../src/core-client.ts';
 import { PiSurface } from '../src/pi-surface.ts';
 import type { DisposeLedger } from '../src/ledger.ts';
 import subagentPlugin from '../src/plugins/subagent.ts';
@@ -265,9 +266,12 @@ function timeout(ms: number): Promise<boolean> {
   });
 }
 
-/** CoreClientLike with inert defaults; pass only the methods a test cares about. */
+/** CoreClientLike with inert defaults; pass only the methods a test cares about. Documents live in
+ *  a per-client map with compare-and-swap versions, so report-document tests exercise the real
+ *  conflict path (`conflict` on a stale version, `doc.get` + retry). */
 export function fakeCore(over: Partial<CoreClientLike> = {}): CoreClientLike {
   const noop = async () => undefined;
+  const docs = new Map<string, { value: unknown; version: number }>();
   return {
     available: true,
     setLabels: noop,
@@ -283,6 +287,15 @@ export function fakeCore(over: Partial<CoreClientLike> = {}): CoreClientLike {
     waitForOutput: async () => ({ matched: false, reason: 'timeout' }),
     kill: noop,
     remove: noop,
+    docGet: async (name) => docs.get(name) ?? { value: null, version: 0 },
+    docSet: async (name, value, version) => {
+      const current = docs.get(name)?.version ?? 0;
+      if (current !== version) {
+        throw new CoreError('doc.set', 'conflict', `version ${version} is stale (now ${current})`, 'read doc.get and retry with its version');
+      }
+      docs.set(name, { value, version: version + 1 });
+      return version + 1;
+    },
     serverVersion: async () => '0.1.16',
     ...over,
   };

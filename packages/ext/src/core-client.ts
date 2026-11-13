@@ -163,6 +163,13 @@ export interface CoreClientLike {
   kill(id: string): Promise<void>;
   /** Remove a finished terminal; a missing one is not an error. */
   remove(id: string): Promise<void>;
+  /** Read a core-global JSON document and its version (version 0 = never written). Null when there
+   *  is no core to read from. */
+  docGet(name: string): Promise<{ value: unknown; version: number } | null>;
+  /** Write a document guarded by its version (compare-and-swap): stale versions fail with a
+   *  `conflict` CoreError — answer with `docGet` and a retry, never an overwrite. Resolves the
+   *  new version. */
+  docSet(name: string, value: unknown, version: number): Promise<number>;
   serverVersion(): Promise<string | null>;
 }
 
@@ -250,6 +257,8 @@ export class NoopCoreClient implements CoreClientLike {
   async waitForOutput(): Promise<WaitForOutputResult> { return { matched: false, reason: 'unavailable' }; }
   async kill(): Promise<void> {}
   async remove(): Promise<void> {}
+  async docGet(): Promise<null> { return null; }
+  async docSet(): Promise<number> { throw new Error(`subagents and terminals: ${CORE_REQUIRED}`); }
   async serverVersion(): Promise<null> { return null; }
 }
 
@@ -694,6 +703,17 @@ export class CoreClient implements CoreClientLike {
       if (isCoreErrorKind(err, 'not_found')) return;
       throw err;
     }
+  }
+
+  async docGet(name: string): Promise<{ value: unknown; version: number } | null> {
+    const result = (await this.request('doc.get', { name })) as { value?: unknown; version?: unknown } | null;
+    return { value: result?.value ?? null, version: typeof result?.version === 'number' ? result.version : 0 };
+  }
+
+  async docSet(name: string, value: unknown, version: number): Promise<number> {
+    const result = (await this.request('doc.set', { name, value, version })) as { version?: unknown } | null;
+    if (typeof result?.version !== 'number') throw new Error(`hc doc.set: bad version frame for ${name}`);
+    return result.version;
   }
 
   async serverVersion(): Promise<string | null> {

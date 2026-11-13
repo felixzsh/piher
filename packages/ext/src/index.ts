@@ -23,6 +23,7 @@ import { existsSync } from 'node:fs';
 import { platformPaths } from './platform-paths.ts';
 import { WRITE_LOCK_ENV } from './lock-core.ts';
 import { ABORT_STOP_REASON, planSettleWake, shouldPushSettleReply } from './settle-wake-core.ts';
+import { writeReportDocument } from './report-documents.ts';
 import { parseRuntimeManifest } from './tool-gate.ts';
 import { planIndexMode } from './index-runtime.ts';
 import { emptySubagentPortBox, sleepWhileSubsRunningNote } from './subagent-core.ts';
@@ -247,6 +248,21 @@ export default async function (pi: ExtensionAPI) {
     pipeWatchdog.unref?.();
   }
 
+  /** The worker's own closing words: the finalized text, else the reason the turn ended without
+   *  one (a refused tool, an error). Shared by the pipe push and the report document so the two
+   *  can never disagree about whether the worker said anything: a turn that ended by token cap or
+   *  abort still has words. A worker still thinking has neither, and its report stays withheld. */
+  function ownClosing(sinceTs: number): { text: string | null; why: string | null; file: string | null } {
+    const ownFile = ownSessionFile
+      ?? (sessionId ? resolveSessionFileValue(process.cwd(), agentSessionsDir(), sessionId) : null);
+    if (!ownFile) return { text: null, why: null, file: null };
+    const entries = readSessionFile(ownFile);
+    // Same derivation the master's poller uses, so the two paths can never disagree.
+    if (!entries) return { text: null, why: null, file: ownFile };
+    const state = deriveSubSessionState(entries, sinceTs);
+    return { text: state.text, why: state.why ?? null, file: ownFile };
+  }
+
   /** Returns whether a settlement reply actually went out: a worker whose report never reached the
    *  master must not exit as if it had (S54 — the push comes first, the shutdown after). */
   async function pushSettleReply(aborted = false): Promise<boolean> {
@@ -262,31 +278,21 @@ export default async function (pi: ExtensionAPI) {
     }
     pendingMachineRequest = null;
     try {
-      const ownFile = ownSessionFile
-        ?? (sessionId ? resolveSessionFileValue(process.cwd(), agentSessionsDir(), sessionId) : null);
-      let text: string | null = null;
-      if (ownFile) {
-        const entries = readSessionFile(ownFile);
-        // Same derivation the master's poller uses, so the two paths can never disagree about whether
-        // the worker said anything: a turn that ended by token cap or abort still has words.
-        if (entries) {
-          const state = deriveSubSessionState(entries, req.sinceTs);
-          // A turn that ended with nothing to say but a reason — a refused tool, an error — must say
-          // it: staying silent left the master waiting the whole vacuum budget for a report that was
-          // never coming. A worker still thinking has no reason, and its push stays withheld.
-          text = state.text ?? state.why ?? null;
-        }
-      }
-      if (text === null) {
+      // A turn that ended with nothing to say but a reason — a refused tool, an error — must say
+      // it: staying silent left the master waiting the whole vacuum budget for a report that was
+      // never coming.
+      const { text, why, file } = ownClosing(req.sinceTs);
+      const report = text ?? why ?? null;
+      if (report === null) {
         return false;
       }
       await pipeRequest(req.from, {
         type: 'reply',
         id: req.id,
         paneId: env?.terminalId ?? '',
-        text,
+        text: report,
         // Push the resolved PATH when readable; fall back to the bare id for the master-side mapping.
-        sessionFile: ownFile ?? (sessionId || null),
+        sessionFile: file ?? (sessionId || null),
       }, 5000);
     } catch (err) {
       /* The requester's pollLoop is the fallback; surface the dead letter for triage. */
@@ -294,6 +300,38 @@ export default async function (pi: ExtensionAPI) {
       return false;
     }
     return true;
+  }
+
+  /** P1 (spec S6): write the settlement report document on every settle, whether or not the
+   *  master asked — the pipe push above is gated on a pending request, which is the reason a
+   *  master-side guess had to exist at all. Best effort like the push: a failed write is logged,
+   *  never thrown, and an aborted or errored turn still reports nothing. */
+  async function writeSettleDocument(aborted = false): Promise<boolean> {
+    if (!isSubagent || !client.available || !env?.terminalId || !delegation) return false;
+    if (!shouldPushSettleReply({ aborted, lastStopReason })) return false;
+    const { text, why, file } = ownClosing(pendingMachineRequest?.sinceTs ?? 0);
+    // A worker still thinking has no closing text and no reason: withhold like the pipe push.
+    if (text === null && why === null) return false;
+    let turn: number | null = null;
+    try {
+      turn = (await client.getTerminal(env.terminalId))?.turn ?? null;
+    } catch {
+      /* fall through to the logged skip below */
+    }
+    if (turn === null) {
+      console.error(`piher: settle document for ${env.terminalId} skipped: the core would not report its turn`);
+      return false;
+    }
+    const written = await writeReportDocument(client, env.terminalId, {
+      taskId: delegation.taskId,
+      turn,
+      stopReason: lastStopReason,
+      session: file ?? (sessionId || null),
+      text,
+      at: Date.now(),
+    });
+    if (!written) console.error(`piher: settle document for ${env.terminalId} was not written`);
+    return written !== null;
   }
 
   pi.on('session_start', async (event, ctx) => {
@@ -412,6 +450,8 @@ export default async function (pi: ExtensionAPI) {
     }
     if (lastStopReason !== ABORT_STOP_REASON && !aborted) void notices.flush('followUp');
     const pushed = pushSettleReply(aborted);
+    // P1: the report document goes out on every settle regardless of the pipe push above.
+    void writeSettleDocument(aborted);
     // S54: a role-declared `one-shot` worker exits once its report is in the master's hands. The
     // ordering is the whole risk — shutting down first loses the report the parent waits for — so the
     // exit hangs off the push, and never off an aborted turn (S52: an interrupted turn reports nothing).

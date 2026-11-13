@@ -12,6 +12,10 @@ import { runtimePolicy, type RuntimePolicy } from './runtime-policy.ts';
 import { formatFailureNotice, formatSettlementNotice, type SettlementNullReason } from './vocab.ts';
 import { settlementCard, type SettlementCard, type SettlementOutcome } from './settlement-card.ts';
 import { buildBlockedGateNotice, reportFingerprint } from './subagent-core.ts';
+import {
+  isReportDocumentValue, planReportDelivery, reportDeliveryKey, reportDocName,
+  type ReportDocumentValue,
+} from './report-documents.ts';
 import { retirePane } from './subagent-gc.ts';
 import type { SessionIo } from './subagent-session.ts';
 
@@ -181,6 +185,10 @@ export function createPoller(h: PollerHost): Poller {
   /** Current tracked request per pane. startPoller refreshes it even while a poller runs: a
    * follow_up must judge settlement against its own injectTs, not the original request's. */
   const requestByPane = new Map<string, { injectTs: number; description: string; requestId: string }>();
+  /** Settlements already handed over from a report document, by (`taskId`, `turn`) (spec S7).
+   *  Survives follow_up re-arms within this mount, so a second `turn` event for the same document
+   *  value never delivers a second notice. */
+  const deliveredReports = new Set<string>();
   const now = h.now ?? Date.now;
   const settleWindowMs = h.policy?.settleWindowMs ?? runtimePolicy.settleWindowMs;
   const timeoutMs = h.policy?.subagentTimeoutMs ?? runtimePolicy.subagentTimeoutMs;
@@ -203,6 +211,21 @@ export function createPoller(h: PollerHost): Poller {
     outcome,
     now: now(),
   });
+
+  /** One `doc.get` for the worker's report document (spec S23): the `turn`/`status` event above
+   *  is the trigger, this read is the settlement. Null when no document was written, when it is
+   *  not a report, or when the document store cannot answer — the transcript heuristic stays. */
+  async function readReportDocument(paneId: string): Promise<ReportDocumentValue | null> {
+    const name = reportDocName(paneId);
+    if (!name) return null;
+    try {
+      const got = await h.client.docGet(name);
+      if (got && isReportDocumentValue(got.value)) return got.value;
+    } catch {
+      /* a blind document store must not kill the loop */
+    }
+    return null;
+  }
 
   /** The worker as the watch sees it. A blind watch (disconnected) never settles or fails anything. */
   async function observe(paneId: string): Promise<{ state: CoreStatus | 'exited' | null; alive: boolean }> {
@@ -357,6 +380,27 @@ export function createPoller(h: PollerHost): Poller {
         if (gate.kind === 'clear-gate') h.blockedGateNotified.delete(paneId);
 
         if (state === 'idle' || state === 'done' || state === 'error') {
+          // P1 (spec S6–S7): the worker's own report document settles the task on the core's
+          // `turn` event — no settle window, no transcript derivation. The heuristic below stays
+          // as the fallback for workers that never wrote one, but a document already delivered
+          // (this loop or an earlier arming) is never announced twice.
+          const report = await readReportDocument(paneId);
+          if (report && entry
+            && planReportDelivery({ value: report, taskId: entry.taskId, delivered: deliveredReports }).kind === 'deliver') {
+            if (!entry.gen.sessionFile && report.session) {
+              entry.gen.sessionFile = report.session;
+              h.writeRecord(entry);
+            }
+            // No text but a stop reason means the turn died (a refused tool, an errored turn):
+            // the reason is the diagnosis, never a report.
+            const failure = report.text === null ? (report.stopReason ?? null) : null;
+            if (await handOver(entry, report.text, true, current, failure) === 'retry') {
+              await park(recheckMs);
+              continue;
+            }
+            deliveredReports.add(reportDeliveryKey(report.taskId, report.turn));
+            return;
+          }
           // Spawn can mis-attribute the generation's sessionFile (the `piher.session` label lags;
           // the mtime fallback records the newest PRE-EXISTING session), freezing settlement
           // detection until the vacuum timeout.

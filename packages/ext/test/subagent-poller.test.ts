@@ -12,6 +12,7 @@ import type { TaskEntry } from '../src/task-row.ts';
 import type { SettlementCard } from '../src/settlement-card.ts';
 import { fakeWatch, taskRow, terminalInfo, type TaskSeed } from './test-utils.ts';
 import type { CoreClientLike, CoreStatus } from '../src/core-client.ts';
+import { CoreError } from '../src/core-client.ts';
 import type { SubSessionState } from '../src/session-tail.ts';
 import type { SessionIo } from '../src/subagent-session.ts';
 
@@ -122,6 +123,8 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
   /** Extra behavior around a park: advance the scripted state, or hold the wait open. */
   let parkHook: ((ms: number) => boolean | Promise<boolean>) | null = null;
   const paneId = entry?.gen.paneId ?? 'p-none';
+  /** Core-global documents, with compare-and-swap versions like the real core. */
+  const docs = new Map<string, { value: unknown; version: number }>();
 
   const buildWatch = () => fakeWatch({
     connected,
@@ -151,6 +154,13 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
     watchChildren: () => watch,
     kill: async (id: string) => { retired.push(`kill:${id}`); },
     remove: async (id: string) => { retired.push(`remove:${id}`); },
+    docGet: async (name: string) => docs.get(name) ?? { value: null, version: 0 },
+    docSet: async (name: string, value: unknown, version: number) => {
+      const current = docs.get(name)?.version ?? 0;
+      if (current !== version) throw new CoreError('doc.set', 'conflict', 'stale', 'retry');
+      docs.set(name, { value, version: version + 1 });
+      return version + 1;
+    },
   } as unknown as CoreClientLike;
 
   const session = {
@@ -191,6 +201,10 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
     setInSnapshot: (v: boolean) => { inSnapshot = v; },
     setConnected: (v: boolean) => { connected = v; watch = buildWatch(); },
     onPark: (fn: (ms: number) => boolean | Promise<boolean>) => { parkHook = fn; },
+    seedDoc: (name: string, value: unknown) => {
+      const version = docs.get(name)?.version ?? 0;
+      docs.set(name, { value, version: version + 1 });
+    },
   };
 }
 
@@ -576,4 +590,95 @@ test('pollLoop: before declaring a timeout, a closing text found without the bou
   assert.equal(f.writes.length, 1, 'a settlement, not a poll-timeout');
   assert.match(f.notices[0]!, /REPORT: the pair is fixed/);
   assert.match(f.notices[0]!, /finished and will do no further work/, 'the notice is the settlement one');
+});
+
+/* ── P1: settlement from the report document (spec S6–S7) ────────────────── */
+
+const DOC_TEXT = 'REPORT: the document is the settlement';
+
+function docFixture(paneId = 'p-doc', taskId = 'task-doc-1') {
+  const f = fixture(makeEntry(paneId, { taskId }));
+  // The settle window is pushed beyond any test budget, and the transcript holds no candidate
+  // at all: only the report document can settle this row.
+  f.host.policy = { settleWindowMs: 3_600_000, subagentTimeoutMs: 3_600_000, pollIntervalMs: 500 };
+  f.state({ text: null, pendingTool: false, activity: false, turnEnded: false });
+  f.host.session.resolveSessionFile = async () => null;
+  const seed = (turn: number) => f.seedDoc(`piher.rep.${paneId}`, {
+    taskId, turn, stopReason: 'stop', session: '/worker/s.jsonl', text: DOC_TEXT, at: 13_000,
+  });
+  return { ...f, seed };
+}
+
+test('pollLoop: the report document settles on the turn event with no settle window', async () => {
+  const f = docFixture();
+  let seeded = false;
+  f.onPark(async () => {
+    if (!seeded) {
+      seeded = true;
+      f.seed(3);
+      return true; // the core's turn event lands with the document write
+    }
+    return false;
+  });
+  await start(f);
+  assert.equal(f.notices.length, 1, 'one delivery, from the document');
+  const notice = f.notices[0]!;
+  assert.match(notice, /Background subagent p-doc \(desc\) finished and will do no further work/);
+  assert.ok(notice.includes(DOC_TEXT), 'the notice carries the exact document text');
+  assert.ok(!notice.includes('left no closing message'));
+  assert.equal(f.entry!.gen.sessionFile, '/worker/s.jsonl', 'the document carries the session (S10)');
+  assert.ok(f.entry!.gen.consumedAt !== null, 'the settlement consumes the row');
+  assert.equal(f.entry!.settleWindowStartedAt ?? null, null, 'the transcript heuristic never fired');
+  assert.deepEqual(f.claimKeys, ['p-doc:req-1']);
+});
+
+test('pollLoop: a second turn for the same document value delivers nothing twice', async () => {
+  const f = docFixture();
+  // One poller for both runs, as in production: the mount outlives the re-arm, so the
+  // (`taskId`, `turn`) delivery set survives it.
+  const poller = createPoller(f.host);
+  const begin = (requestId: string) => poller.startPoller(f.entry!.gen.paneId, '/tmp', 10_000, 'desc', requestId);
+  let seeded = false;
+  f.onPark(async () => {
+    if (!seeded) {
+      seeded = true;
+      f.seed(3);
+      return true;
+    }
+    return false;
+  });
+  await begin('req-1');
+  assert.equal(f.notices.filter((n) => /finished and will do no further work/.test(n)).length, 1);
+
+  // A follow_up re-arms the row, and the core replays the turn event with the same document
+  // value (the worker wrote nothing new). The settlement must not go out again.
+  f.entry!.gen.consumedAt = null;
+  f.waitState('idle');
+  let wakes = 0;
+  f.onPark(async () => {
+    wakes += 1;
+    if (wakes === 1) return true;
+    f.waitState('exited');
+    return true;
+  });
+  await begin('req-2');
+  assert.equal(
+    f.notices.filter((n) => /finished and will do no further work/.test(n)).length,
+    1,
+    'the same (taskId, turn) never settles twice',
+  );
+  assert.deepEqual(f.claimKeys, ['p-doc:req-1'], 'no second claim for the same document');
+});
+
+test('pollLoop: a report document from another task is ignored, the transcript still settles', async () => {
+  const f = docFixture();
+  f.seedDoc('piher.rep.p-doc', {
+    taskId: 'some-other-task', turn: 1, stopReason: 'stop', session: null, text: 'REPORT: not mine', at: 13_000,
+  });
+  f.state({ text: 'REPORT: mine', pendingTool: false, activity: true, turnEnded: true });
+  f.entry!.settleWindowStartedAt = 10_000; // the window already elapsed on the virtual clock
+  await start(f);
+  assert.equal(f.notices.length, 1);
+  assert.ok(f.notices[0]!.includes('REPORT: mine'), 'a stale foreign document never shadows the transcript');
+  assert.ok(!f.notices[0]!.includes('not mine'));
 });

@@ -133,6 +133,23 @@ test('coreUnavailableHint: transport failures get a hint, domain errors do not',
   assert.equal(coreUnavailableHint(new Error('invalid regex')), null);
 });
 
+test('docGet/docSet: values round-trip, a stale version fails as conflict', async () => {
+  let version = 0;
+  await withCore((c) => {
+    if (c.method === 'doc.get') return { result: { value: { taskId: 't' }, version } };
+    if (version !== (c.params.version as number)) return { error: { kind: 'conflict', message: 'stale' } };
+    version += 1;
+    return { result: { version } };
+  }, async (client) => {
+    assert.deepEqual(await client.docGet('piher.rep.t2'), { value: { taskId: 't' }, version: 0 });
+    assert.equal(await client.docSet('piher.rep.t2', { taskId: 't' }, 0), 1);
+    await assert.rejects(
+      client.docSet('piher.rep.t2', { taskId: 't' }, 0),
+      (err: unknown) => err instanceof CoreError && err.kind === 'conflict',
+    );
+  });
+});
+
 /* ── contract: requests stay inside the hc 0.1.16 OpenRPC snapshot ── */
 
 interface OpenRpc { methods: Array<{ name: string; params: Array<{ name: string; required?: boolean }> }> }
@@ -145,6 +162,8 @@ test('contract: every request piher sends names a real method, known params, and
     if (c.method === 'terminal.wait') return { result: { terminal: 't2', ended: true, reason: 'status', turn: 0, children: [], status: 'idle' } };
     if (c.method === 'terminal.interrupt') return { result: { outcome: 'stopped', key: 'esc' } };
     if (c.method === 'server.status') return { result: { version: '0.1.16' } };
+    if (c.method === 'doc.get') return { result: { value: null, version: 0 } };
+    if (c.method === 'doc.set') return { result: { version: 1 } };
     return { result: terminal() };
   }, async (client, calls) => {
     await client.setLabels({ a: 'b' });
@@ -160,6 +179,8 @@ test('contract: every request piher sends names a real method, known params, and
     await client.waitForOutput('t2', 'x', 1000);
     await client.kill('t2');
     await client.remove('t2');
+    assert.deepEqual(await client.docGet('piher.rep.t2'), { value: null, version: 0 });
+    assert.equal(await client.docSet('piher.rep.t2', { taskId: 'task-1', turn: 1 }, 0), 1);
     await client.serverVersion();
     for (const call of calls) {
       const method = schema.methods.find((m) => m.name === call.method);

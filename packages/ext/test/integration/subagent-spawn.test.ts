@@ -10,6 +10,7 @@ import type { Server, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { CoreClientLike } from '../../src/core-client.ts';
+import type { RuntimePolicy } from '../../src/runtime-policy.ts';
 import { pipeNameFor, startPipeServer, type PipeRequest } from '../../src/pipe-channel.ts';
 import {
   readTaskRecord, repoTasksDir, taskRecordPath, TASK_VIEW_NAME,
@@ -90,6 +91,19 @@ interface PipeEnv {
   rejectPrompt: boolean;
   /** Milliseconds every pipe answer is delayed: a spawn must not wait for the child. */
   pipeDelayMs: number;
+  /** Core `turn` per pane, as the children watch reports it. */
+  turns: Record<string, number>;
+  /** Wake a gated poll loop once, simulating the core's turn event. */
+  wakeWorker(): void;
+  /** Gate the children watch: parks wait for a wake (or time out) instead of resolving at once. */
+  gated: boolean;
+  /** Transcript text the pipe server appends on a prompt; null appends nothing, so no transcript
+   *  settlement can fire and only a report document settles the worker. */
+  transcript: string | null;
+  /** The fake core client, with its document store: the worker's report documents live here. */
+  client: CoreClientLike;
+  /** The worker session file the pipe server appends to. */
+  workerSessionFile: string;
   /** Simulate a master restart: dispose the session, mount fresh, and restore from the documents. */
   remount?: (reason: string) => Promise<void>;
 }
@@ -99,7 +113,7 @@ interface PipeEnv {
  * `paneSeq` hands out p2, p3, … (one pipe server per id) for multi-worker tests. */
 async function withPipeEnv(
   fn: (env: PipeEnv) => Promise<void>,
-  opts: { childCwd?: string; paneSeq?: boolean; gitRepo?: boolean; sessionFile?: string | ((cwd: string) => string) } = {},
+  opts: { childCwd?: string; paneSeq?: boolean; gitRepo?: boolean; sessionFile?: string | ((cwd: string) => string); policy?: Partial<RuntimePolicy> } = {},
 ): Promise<void> {
   const home = new TempHome('piher-spawn-home-');
   const cwd = mkdtempSync(join(tmpdir(), 'piher-spawn-cwd-'));
@@ -108,9 +122,13 @@ async function withPipeEnv(
   if (opts.gitRepo !== false) mkdirSync(join(cwd, '.git'));
   const sessionFile = join(cwd, 'sub-session.jsonl');
   let parked = false;
+  /** A gated poll loop parks until `wakeWorker` simulates the core's turn event. */
+  let wake = false;
   const env: PipeEnv = {
     cwd, home, pi: undefined as never, port: undefined as never, frames: [], retired: [], spawnEnvs: [], spawnLabels: [],
     parkPollers: () => { parked = true; }, rejectPrompt: false, pipeDelayMs: 0, paneGone: false, deadPipes: 0,
+    turns: {}, wakeWorker: () => { wake = true; }, gated: false, transcript: SUB_TEXT,
+    client: undefined as never, workerSessionFile: sessionFile,
   };
   let paneCounter = 0;
   const nextPaneId = (): string => (opts.paneSeq ? `p${2 + paneCounter++}` : 'p2');
@@ -122,7 +140,7 @@ async function withPipeEnv(
       const isPrompt = req.type === 'prompt' || req.type === 'follow_up';
       if (isPrompt) {
         env.frames.push(req);
-        writeFileSync(sessionFile, jsonl(transcriptMessage('assistant', SUB_TEXT, Date.now())));
+        if (env.transcript !== null) writeFileSync(sessionFile, jsonl(transcriptMessage('assistant', env.transcript, Date.now())));
         if (env.rejectPrompt) return { type: 'error', id: req.id, message: 'sim rejected' };
       }
       return { type: 'ok', id: req.id };
@@ -154,9 +172,20 @@ async function withPipeEnv(
       terminals: () => ['p2', 'p3', 'p4', 'p5', 'p6'].map((id) => terminalInfo({
         id,
         status: parked ? 'working' : 'idle',
+        turn: env.turns[id] ?? 0,
         labels: { 'piher.session': sessionFile },
       })),
-      park: () => (parked ? new Promise<never>(() => {}) : false),
+      park: (ms) => {
+        if (parked) return new Promise<never>(() => {});
+        if (!env.gated) return false;
+        if (wake) { wake = false; return true; }
+        // A gated loop waits for the turn event, briefly: long enough to stage it, short enough
+        // that an unstaged loop never spins hot. Unref'd, so the gate cannot hold the process.
+        return new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => resolve(wake ? (wake = false, true) : false), Math.min(ms, 20));
+          timer.unref?.();
+        });
+      },
     }),
     read: async () => ({ text: '', complete: true }),
     run: async (o) => {
@@ -171,10 +200,18 @@ async function withPipeEnv(
   const mount = async (): Promise<void> => {
     const mounted = await mountSubagent({
       client: clientOpts,
-      ...(sessionPath ? { deps: { getSessionFile: () => sessionPath, getCwd: () => cwd } } : {}),
+      ...((sessionPath || opts.policy)
+        ? {
+          deps: {
+            ...(sessionPath ? { getSessionFile: () => sessionPath, getCwd: () => cwd } : {}),
+            ...(opts.policy ? { policy: opts.policy } : {}),
+          },
+        }
+        : {}),
     });
     env.pi = mounted.pi;
     env.port = mounted.port;
+    env.client = mounted.client;
     root = mounted.root;
   };
   await mount();
@@ -905,4 +942,43 @@ test('tasks: no transcript path keeps the view in memory, records still land (S2
     assert.equal(row?.taskId, taskId, 'the task record still lands under the repository');
     assert.equal(row?.description, 'memory-view probe');
   });
+});
+
+/* ── P1: settlement from the report document (spec S6–S7) ─────────────── */
+
+test('P1: the worker report document settles on the turn event — exactly once', async () => {
+  await withPipeEnv(async (env) => {
+    // No transcript settlement is possible here: the pipe server appends nothing, so only the
+    // report document can settle this worker.
+    env.transcript = null;
+    env.gated = true;
+    const spawned = await runSubagent(env.pi, { description: 'doc probe', prompt: PROMPT }, env.cwd);
+    const paneId = spawned.details?.paneId as string;
+    const taskId = spawned.details?.taskId as string;
+    await waitFor(() => env.frames.length === 1);
+
+    // The worker's own write, on its settle: the exact value the master must deliver.
+    const DOC_TEXT = 'REPORT: the document is the settlement';
+    await env.client.docSet(`piher.rep.${paneId}`, {
+      taskId, turn: 1, stopReason: 'stop', session: null, text: DOC_TEXT, at: Date.now(),
+    }, 0);
+    // The settle window is pushed beyond any test budget, so the transcript heuristic cannot fire:
+    // the settlement below can only come from the document, on the core's turn event.
+    env.turns[paneId] = 1;
+    env.wakeWorker();
+    await waitFor(() => env.pi.userSent.length === 1);
+    const notice = env.pi.userSent[0]!.content;
+    assert.match(notice, /Background subagent p2 \(doc probe\) finished and will do no further work/);
+    assert.ok(notice.includes(DOC_TEXT), 'the settlement carries exactly the stored document text');
+
+    // A second turn for the same document value delivers nothing twice.
+    env.turns[paneId] = 2;
+    env.wakeWorker();
+    // The poll loop is gone (the settlement consumed the row), so no code path can deliver again;
+    // one loop quantum passes to prove no straggler was already in flight.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(env.pi.userSent.length, 1, 'the same document value never settles twice');
+    const listed = (await runSubagent(env.pi, { action: 'list' }, env.cwd)).content[0]!.text;
+    assert.match(listed, /doc-probe@p2 \[idle\]/, 'the settlement consumed the row');
+  }, { policy: { settleWindowMs: 3_600_000, subagentTimeoutMs: 3_600_000, pollIntervalMs: 50 } });
 });
