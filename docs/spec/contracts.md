@@ -16,6 +16,14 @@ removed concept (`settled`, the ledger, `/piher-tree`) is rewritten.
 - Resume on a spent one-shot:
   `Error: task <taskId> was a one-shot and already delivered its verdict; there is nothing to resume. Spawn a new one-shot for new work.`
 - Resume whose transcript is gone: names the task, the path it expected, and offers `retry` as the way out.
+- Resume with no session anywhere (P5): names the three places it looked — the core's `hresume` label on
+the record's address, the `session` field the settlement document reported, and the record itself — and
+says that reviving without one starts a fresh conversation. It reports only what it established: a null
+from the label read is "no label, no terminal, or the core did not answer", and the document is read
+before the refusal is printed. Fixed shape, extended by P5: `Error: task <taskId> has no session to
+resume: its core terminal is gone, its settlement document reported no session, and its record carries
+none — reviving it would start a fresh conversation. Use action "spawn" for new work, or "retry" to
+start a new task from the same brief.`
 - Unknown id: `Error: unknown subagent id "<raw>" (see action list)` — printed only after the view, the
   records of this repository, and the id forms of S17 have all missed.
 
@@ -73,7 +81,11 @@ the decision, and the owning session drops the row on its next read (**S24**).
 ## resume
 
 `taskId` (prefix accepted). Requires an unresolved task whose transcript still exists. Revives a new
-generation in the checkout the record names and answers with the new ref.
+generation in the checkout the record names and answers with the new ref. Three answers, not two: the
+session was restored from the document's own report, the session was restored from the core's `hresume`
+label, or there was no session and the refusal above was printed. The label's `agent` must be `pi` and the
+terminal must still be the task's own — an address alone never identifies a conversation (**S18**,
+**S26**).
 
 ## help
 
