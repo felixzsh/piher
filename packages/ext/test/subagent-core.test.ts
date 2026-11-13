@@ -261,7 +261,7 @@ test('planReadyAttempt: ready wins; a gone pane fails fast; an unknown probe kee
   assert.deepEqual(plan({ elapsedMs: 120_000, attempt: 9, alive: false }), { kind: 'give-up', reason: 'pane-gone' });
 });
 
-test('readyFailureText: crash, working-but-slow and never-registered are distinguishable', () => {
+test('readyFailureText: crash, blocked, working-but-slow and never-reported are distinguishable', () => {
   const crashed = readyFailureText({
     paneId: 'wX:p9',
     reason: 'pane-gone',
@@ -269,17 +269,22 @@ test('readyFailureText: crash, working-but-slow and never-registered are disting
     timeoutMs: 90_000,
     tail: "TypeError: Cannot read properties of undefined (reading 'total')",
   });
-  assert.match(crashed, /wX:p9 exited before its pipe became ready/);
+  assert.match(crashed, /wX:p9 exited before its agent reported ready/);
   assert.match(crashed, /last output of wX:p9/);
 
   const slow = readyFailureText({
     paneId: 'wX:p9', reason: 'timeout', elapsedMs: 90_000, timeoutMs: 90_000, lastStatus: 'working',
   });
-  assert.match(slow, /pipe not ready within 90s/);
+  assert.match(slow, /was not ready within 90s/);
   assert.match(slow, /alive and working/);
 
+  const blocked = readyFailureText({
+    paneId: 'wX:p9', reason: 'timeout', elapsedMs: 90_000, timeoutMs: 90_000, lastStatus: 'blocked',
+  });
+  assert.match(blocked, /blocked on a dialog/);
+
   const stuck = readyFailureText({ paneId: 'wX:p9', reason: 'timeout', elapsedMs: 90_000, timeoutMs: 90_000, lastStatus: 'idle' });
-  assert.match(stuck, /never registered its pipe/);
+  assert.match(stuck, /never reported `idle`/);
   assert.ok(!stuck.includes('last output'));
 });
 

@@ -413,7 +413,7 @@ export default function subagentPlugin(ctx: Context): void {
   gc.startTicker(ctx);
   scoped.on('turn_start', () => gc.onTurnStart());
   const { probeAlive } = session;
-  const { spawnPaneInTaskTab, launchParts, approveFor, waitSubReady, findExistingPane } = spawn;
+  const { spawnPaneInTaskTab, launchParts, approveFor, waitReady, findExistingPane } = spawn;
 
   /** Re-arm settlement watches after a restart: only rows still awaiting a report whose pane core
    *  still lists. A delivered report needs no watch; a closed task is final; a gone pane is
@@ -551,7 +551,7 @@ export default function subagentPlugin(ctx: Context): void {
       },
       argv,
     ));
-    const ready = await waitSubReady(entry.cwd, spawned.paneId);
+    const ready = await waitReady(spawned.paneId);
     if (!ready.ok) throw new Error(ready.message);
     const previousPaneId = entry.gen.paneId;
     Object.assign(entry.gen, {
@@ -860,7 +860,7 @@ export default function subagentPlugin(ctx: Context): void {
         const revived = await ensureLive(entry);
         trace(revived ? 'recovered-liveness' : 'alive-no-pipe');
         if (revived) {
-          const ready = await waitSubReady(entry.cwd, entry.gen.paneId);
+          const ready = await waitReady(entry.gen.paneId);
           trace('recovered-ready');
           if (!ready.ok) throw new Error(ready.message);
         }

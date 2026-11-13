@@ -92,6 +92,21 @@ test('an unreported or unknown status word decodes as unknown', async () => {
     });
 });
 
+test('send: the core\'s own started/status/turn come back, and a missing word is null', async () => {
+  const answers: Answer[] = [
+    { result: { started: true, status: 'working', turn: 1 } },
+    // The measured lost send (spec S22): null started, idle status, turn unchanged.
+    { result: { started: null, status: 'idle', turn: 0 } },
+    // A frame that says nothing usable is not a delivery either.
+    { result: {} },
+  ];
+  await withCore(() => answers.shift()!, async (client) => {
+    assert.deepEqual(await client.send('t2', 'go'), { started: true, status: 'working', turn: 1 });
+    assert.deepEqual(await client.send('t2', 'go'), { started: null, status: 'idle', turn: 0 });
+    assert.deepEqual(await client.send('t2', 'go'), { started: null, status: null, turn: 0 });
+  });
+});
+
 test('waitForOutput: output → matched, check-in → timeout, a core refusal → unavailable', async () => {
   const answers: Answer[] = [
     { result: { terminal: 't2', ended: true, reason: 'output', turn: 0, children: [] } },

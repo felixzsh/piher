@@ -9,16 +9,16 @@ import {
 import type { Server, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import type { CoreClientLike } from '../../src/core-client.ts';
+import type { CoreClientLike, CoreStatus, SendResult } from '../../src/core-client.ts';
 import type { RuntimePolicy } from '../../src/runtime-policy.ts';
-import { pipeNameFor, startPipeServer, type PipeRequest } from '../../src/pipe-channel.ts';
+import { pipeNameFor, pipePathFor, startPipeServer } from '../../src/pipe-channel.ts';
 import {
   readTaskRecord, repoTasksDir, taskRecordPath, TASK_VIEW_NAME,
 } from '../../src/task-store.ts';
 import { sessionStatePath } from '../../src/session-state.ts';
 import type { SubagentPortBox } from '../../src/subagent-core.ts';
 import type { TaskRow } from '../../src/task-row.ts';
-import { NodeGitAdapter, createSpawner, type GitExecFile } from '../../src/subagent-spawn.ts';
+import { NodeGitAdapter, createSpawner, planTaskSend, type GitExecFile } from '../../src/subagent-spawn.ts';
 import {
   TempHome, fakeCore, fakeWatch, fire, jsonl, mountSubagent, readTaskView, runSubagent, runSubagentRejects,
   seedTaskDocuments, terminalInfo, transcriptMessage, type FakePi,
@@ -34,32 +34,77 @@ const spawnerFor = (client: Partial<CoreClientLike>, over: Record<string, unknow
   ...over,
 } as Parameters<typeof createSpawner>[0]);
 
-test('waitSubReady: a gone terminal and a live-but-unregistered one are distinguished', async (t) => {
+test('waitReady/planTaskSend: the core decides readiness, and only a started turn is delivery', async (t) => {
   await t.test('a gone terminal fails fast with its last output instead of waiting out the timeout', async () => {
     const spawner = spawnerFor({
       getTerminal: async () => null,
       read: async () => ({ text: 'TypeError: boom at footer.render', complete: true }),
     });
     const started = Date.now();
-    const out = await spawner.waitSubReady('/tmp/piher-a14-nonexistent', 'tA14');
+    const out = await spawner.waitReady('tA14');
     assert.equal(out.ok, false);
     if (out.ok) return;
-    assert.match(out.message, /exited before its pipe became ready/);
+    assert.match(out.message, /exited before its agent reported ready/);
     assert.match(out.message, /TypeError: boom at footer\.render/);
     assert.ok(Date.now() - started < 10_000, 'a gone terminal must not wait for the readiness timeout');
   });
 
-  await t.test('a live terminal that never opened its pipe is alive-but-not-ready, not gone', async () => {
+  await t.test('a live terminal whose agent never reports idle is alive-but-not-ready, not gone', async () => {
     const terminalId = 'tH';
     const spawner = spawnerFor({
       getTerminal: async (id) => terminalInfo({ id, status: 'unknown' }),
       read: async () => ({ text: 'booting', complete: true }),
     }, { readinessTimeoutMs: 50 });
-    const out = await spawner.waitSubReady('/tmp/piher-unknown-shell', terminalId);
+    const out = await spawner.waitReady(terminalId);
     assert.equal(out.ok, false);
     if (out.ok) return;
-    assert.match(out.message, /pipe not ready within/);
-    assert.match(out.message, /never registered its pipe/, 'a live terminal means "still booting", not "gone"');
+    assert.match(out.message, /was not ready within/);
+    assert.match(out.message, /never reported `idle`/, 'a live terminal means "still booting", not "gone"');
+  });
+
+  await t.test('an agent blocked on a dialog is told to answer it, not to retry blindly', async () => {
+    const spawner = spawnerFor({
+      getTerminal: async (id) => terminalInfo({ id, status: 'blocked' }),
+    }, { readinessTimeoutMs: 20 });
+    const out = await spawner.waitReady('tB');
+    assert.equal(out.ok, false);
+    if (out.ok) return;
+    assert.match(out.message, /blocked on a dialog/);
+  });
+
+  await t.test('planTaskSend: a null or false result is not delivery, and the budget ends the retries', () => {
+    assert.deepEqual(planTaskSend({ started: true, elapsedMs: 5, attempt: 3, timeoutMs: 1000 }), { kind: 'delivered' });
+    assert.deepEqual(planTaskSend({ started: null, elapsedMs: 5, attempt: 0, timeoutMs: 1000 }), { kind: 'retry', delayMs: 500 });
+    assert.deepEqual(planTaskSend({ started: false, elapsedMs: 5, attempt: 2, timeoutMs: 1000 }), { kind: 'retry', delayMs: 2000 });
+    assert.deepEqual(planTaskSend({ started: null, elapsedMs: 1000, attempt: 4, timeoutMs: 1000 }), { kind: 'give-up' });
+  });
+
+  await t.test('deliverFirstTask: a send that started no turn is retried once the agent is idle again', async () => {
+    const sent: string[] = [];
+    let reads = 0;
+    let turn = 0;
+    const spawner = spawnerFor({
+      getTerminal: async (id) => terminalInfo({ id, status: 'idle' }),
+      // The measured loss (spec S22): the first send leaves the text in the composer and no turn runs.
+      send: async (_id, text) => {
+        sent.push(text);
+        reads += 1;
+        if (reads === 1) return { started: null, status: 'idle', turn };
+        turn += 1;
+        return { started: true, status: 'working', turn };
+      },
+    }, { readinessTimeoutMs: 2_000 });
+    await spawner.deliverFirstTask('t2', 'do the thing');
+    assert.deepEqual(sent, ['do the thing', 'do the thing'], 'the same task is sent again, not a new one');
+    assert.equal(turn, 1, 'the turn happened');
+  });
+
+  await t.test('deliverFirstTask: a core that refuses the send fails the spawn instead of looping', async () => {
+    const spawner = spawnerFor({
+      getTerminal: async (id) => terminalInfo({ id, status: 'idle' }),
+      send: async () => { throw new Error('blocked: the program is waiting on a dialog'); },
+    }, { readinessTimeoutMs: 2_000 });
+    await assert.rejects(() => spawner.deliverFirstTask('t2', 'x'), /refused its first message: blocked:/);
   });
 });
 
@@ -68,12 +113,25 @@ test('waitSubReady: a gone terminal and a live-but-unregistered one are distingu
 const SUB_TEXT = 'REPORT: all channel-fee contact points mapped';
 const PROMPT = 'Read-only survey: in the apnv3-backend repository, map where channel fees are touched. Write the full report.';
 
+/** One task or follow-up as the worker received it, with the channel that carried it: the core's own
+ *  `terminal.send` (every first task since P2) or the private pipe (still the follow-up channel until
+ *  P3 moves steering to the core). */
+interface Delivery {
+  channel: 'core' | 'pipe';
+  type: string;
+  id: string;
+  text: string;
+  /** The reply pipe a pipe frame named; empty for a core send, where the core knows the caller. */
+  from: string;
+}
+
 interface PipeEnv {
   cwd: string;
   home: TempHome;
   pi: FakePi;
   port: SubagentPortBox;
-  frames: PipeRequest[];
+  /** Every task and follow-up the worker received, in delivery order, with its channel. */
+  frames: Delivery[];
   /** Terminals retired after a failed spawn (kill), in call order. */
   retired: string[];
   /** env blocks handed to `terminal.run` in spawn order. */
@@ -87,10 +145,17 @@ interface PipeEnv {
   /** Uncancellable poll loop: make the children watch's `changed` never resolve, so a row it holds
    *  stays `running` for the rest of the test. */
   parkPollers(): void;
-  /** Flipped per subtest: the next prompt frame is answered with an error. */
-  rejectPrompt: boolean;
-  /** Milliseconds every pipe answer is delayed: a spawn must not wait for the child. */
-  pipeDelayMs: number;
+  /** Flipped per subtest: the core refuses the next send (a blocked program, say). */
+  rejectSend: boolean;
+  /** Milliseconds the core takes to answer one `send`: a spawn must not sit through it. */
+  sendDelayMs: number;
+  /** Answers the fake core gives its next sends, one per send; empty means "went working at once".
+   *  `started: null` is the measured lost send (spec S22). */
+  sendResults: SendResult[];
+  /** Panes whose agent never reports `idle`, so readiness has to wait for the core. */
+  notReady: Set<string>;
+  /** The status word the core reports per pane; a missing entry means an idle agent. */
+  statuses: Record<string, CoreStatus>;
   /** Core `turn` per pane, as the children watch reports it. */
   turns: Record<string, number>;
   /** Wake a gated poll loop once, simulating the core's turn event. */
@@ -108,12 +173,13 @@ interface PipeEnv {
   remount?: (reason: string) => Promise<void>;
 }
 
-/** Mounts the plugin with a loopback pipe server standing in for the worker pane (p2): it records
- * the frames piher sends and answers ok, so the real `pipeRequestTo` path is exercised end to end.
- * `paneSeq` hands out p2, p3, … (one pipe server per id) for multi-worker tests. */
+/** Mounts the plugin with a fake core plus a loopback pipe server standing in for the worker pane
+ * (p2): the pipe records the follow-up frames piher still sends and answers ok, while the first task
+ * of every spawn rides the core's own `send` (spec S14). `paneSeq` hands out p2, p3, … for multi-worker
+ * tests; `pipes: false` starts no pipe server at all, which is the worker that never serves one. */
 async function withPipeEnv(
   fn: (env: PipeEnv) => Promise<void>,
-  opts: { childCwd?: string; paneSeq?: boolean; gitRepo?: boolean; sessionFile?: string | ((cwd: string) => string); policy?: Partial<RuntimePolicy> } = {},
+  opts: { childCwd?: string; paneSeq?: boolean; pipes?: boolean; gitRepo?: boolean; sessionFile?: string | ((cwd: string) => string); policy?: Partial<RuntimePolicy> } = {},
 ): Promise<void> {
   const home = new TempHome('piher-spawn-home-');
   const cwd = mkdtempSync(join(tmpdir(), 'piher-spawn-cwd-'));
@@ -126,7 +192,8 @@ async function withPipeEnv(
   let wake = false;
   const env: PipeEnv = {
     cwd, home, pi: undefined as never, port: undefined as never, frames: [], retired: [], spawnEnvs: [], spawnLabels: [],
-    parkPollers: () => { parked = true; }, rejectPrompt: false, pipeDelayMs: 0, paneGone: false, deadPipes: 0,
+    parkPollers: () => { parked = true; }, rejectSend: false, sendDelayMs: 0, paneGone: false, deadPipes: 0,
+    sendResults: [], notReady: new Set<string>(), statuses: {},
     turns: {}, wakeWorker: () => { wake = true; }, gated: false, transcript: SUB_TEXT,
     client: undefined as never, workerSessionFile: sessionFile,
   };
@@ -136,12 +203,10 @@ async function withPipeEnv(
   const servers: Server[] = [];
   const ensureServer = (paneId: string): void => {
     const server = startPipeServer(pipeNameFor(opts.childCwd ?? cwd, paneId), async (req) => {
-      if (env.pipeDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, env.pipeDelayMs));
       const isPrompt = req.type === 'prompt' || req.type === 'follow_up';
       if (isPrompt) {
-        env.frames.push(req);
+        env.frames.push({ channel: 'pipe', type: req.type, id: req.id, text: req.text, from: req.from ?? '' });
         if (env.transcript !== null) writeFileSync(sessionFile, jsonl(transcriptMessage('assistant', env.transcript, Date.now())));
-        if (env.rejectPrompt) return { type: 'error', id: req.id, message: 'sim rejected' };
       }
       return { type: 'ok', id: req.id };
     });
@@ -158,14 +223,37 @@ async function withPipeEnv(
     });
     server.unref();
   };
-  ensureServer('p2');
-  if (opts.paneSeq) { for (const id of ['p3', 'p4', 'p5', 'p6']) ensureServer(id); }
-  await Promise.all(servers.map((s) => new Promise<void>((resolve) => s.once('listening', resolve))));
+  if (opts.pipes !== false) {
+    ensureServer('p2');
+    if (opts.paneSeq) { for (const id of ['p3', 'p4', 'p5', 'p6']) ensureServer(id); }
+    await Promise.all(servers.map((s) => new Promise<void>((resolve) => s.once('listening', resolve))));
+  }
   const clientOpts: Partial<CoreClientLike> = {
     getTerminal: async (id: string) => env.paneGone ? null : terminalInfo({
       id,
+      // S14: the core's status word is the readiness gate, so an agent that has not said `idle` yet is
+      // reported as never having reported — what `run --bg` shows before the worker boots.
+      status: env.notReady.has(id) ? 'unknown' : env.statuses[id] ?? 'idle',
       labels: ['p2', 'p3', 'p4', 'p5', 'p6'].includes(id) ? { 'piher.session': sessionFile } : {},
     }),
+    // S14/S22: the first task rides the core's own `send`, and its result is the only delivery proof.
+    send: async (id: string, text: string) => {
+      if (env.rejectSend) throw new Error('blocked: the program is waiting on a dialog');
+      if (env.sendDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, env.sendDelayMs));
+      // The text went in either way; only a started turn means the agent took it as a task.
+      env.frames.push({ channel: 'core', type: 'prompt', id: `send-${env.frames.length + 1}`, text, from: '' });
+      const scripted = env.sendResults.shift();
+      const started = scripted ? scripted.started : true;
+      if (started === true) env.turns[id] = (env.turns[id] ?? 0) + 1;
+      if (started === true && env.transcript !== null) {
+        writeFileSync(sessionFile, jsonl(transcriptMessage('assistant', env.transcript, Date.now())));
+      }
+      return {
+        started,
+        status: scripted?.status ?? (started === true ? 'working' : 'idle'),
+        turn: env.turns[id] ?? 0,
+      };
+    },
     // The poller parks on the children watch: while parked, `changed` never resolves and the
     // snapshot reports the worker as working, so the row stays running with no polling.
     watchChildren: () => fakeWatch({
@@ -191,6 +279,8 @@ async function withPipeEnv(
     run: async (o) => {
       env.spawnEnvs.push(o.env ?? {});
       env.spawnLabels.push(o.labels ?? {});
+      // A new pane exists, so the old pane's disappearance no longer describes this worker.
+      env.paneGone = false;
       return terminalInfo({ id: nextPaneId(), cwd: o.cwd, labels: o.labels });
     },
     kill: async (id) => { env.retired.push(id); },
@@ -231,7 +321,7 @@ async function withPipeEnv(
     home.dispose();
   }
 }
-/** The spawn acknowledgement leaves boot (readiness, prompt injection) off the caller's turn. */
+/** The spawn acknowledgement leaves boot (readiness, first task, poller) off the caller's turn. */
 async function waitFor(cond: () => boolean, ms = 5000): Promise<void> {
   const deadline = Date.now() + ms;
   while (!cond() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -242,7 +332,7 @@ test('spawn action: an acknowledgement now, the prompt later, the report as a no
     await t.test('the call returns an acknowledgement without waiting for the child', async () => {
       env.parkPollers(); // no poll loop spinning while the assertions run
       // A child that answers slowly is exactly the case a spawn must not sit through.
-      env.pipeDelayMs = 1000;
+      env.sendDelayMs = 1000;
       const started = Date.now();
       const result = await runSubagent(env.pi, { description: 'probe', prompt: PROMPT }, env.cwd);
       const elapsed = Date.now() - started;
@@ -250,17 +340,18 @@ test('spawn action: an acknowledgement now, the prompt later, the report as a no
       assert.match(text, /^started subagent [a-z0-9-]+@p2 \(task [0-9a-f-]+, persistent — stays until you close it\)/);
       assert.match(text, /settlement notice/);
       assert.doesNotMatch(text, /REPORT:/, 'the acknowledgement is not the report');
-      // The child takes ≥2s to answer here (readiness ping + prompt): a blocking spawn would show it.
+      // The core takes a second to answer its `send` here: a blocking spawn would show it.
       assert.ok(elapsed < 900, `a spawn must not wait for its child (took ${elapsed}ms)`);
       assert.equal(result.details?.paneId, 'p2');
 
       await waitFor(() => env.frames.length === 1);
-      assert.equal(env.frames.length, 1, 'the prompt is injected exactly once, off the caller turn');
-      assert.equal((env.frames[0] as { text?: string }).text, PROMPT, 'the whole prompt reaches the worker');
+      assert.equal(env.frames.length, 1, 'the prompt is delivered exactly once, off the caller turn');
+      assert.equal(env.frames[0]!.channel, 'core', 'the first task rides the core, not the private pipe');
+      assert.equal(env.frames[0]!.text, PROMPT, 'the whole prompt reaches the worker');
     });
 
     await t.test('list shows the child while it runs, and the row stays running', async () => {
-      env.pipeDelayMs = 0;
+      env.sendDelayMs = 0;
       const result = await runSubagent(env.pi, { description: 'long probe', prompt: PROMPT }, env.cwd);
       assert.equal(result.details?.paneId, 'p2');
       assert.equal(result.details?.role, 'task');
@@ -271,26 +362,27 @@ test('spawn action: an acknowledgement now, the prompt later, the report as a no
       assert.deepEqual(running.map((s) => s.description).sort(), ['long probe', 'probe']);
       assert.ok(running.some((s) => s.paneId === 'p2' && s.description === 'long probe'));
       const listed = (await runSubagent(env.pi, { action: 'list' }, env.cwd)).content[0]!.text;
-      // The harness panes never report an agent status, so the contract reads `no report` here —
-      // the row is still listed as actionable, which is what this subtest proves.
+      // The harness panes never report a turn, so the contract reads `no report` here — the row is
+      // still listed as actionable, which is what this subtest proves.
       assert.match(listed, /p2 \[no report/);
       assert.match(listed, /long probe/);
     });
 
-    await t.test('a rejected prompt injection retires the terminal and reports the failed start', async () => {
-      env.rejectPrompt = true;
+    await t.test('a refused first send retires the terminal and reports the failed start', async () => {
+      env.rejectSend = true;
       const text = (await runSubagent(env.pi, { description: 'probe', prompt: PROMPT }, env.cwd)).content[0]!.text;
-      assert.match(text, /^started subagent/, 'the start is acknowledged before the pipe answers');
+      assert.match(text, /^started subagent/, 'the start is acknowledged before the core answers');
       const slug = /started subagent ([a-z0-9-]+)@/.exec(text)![1];
       const failedTaskId = /\(task ([0-9a-f-]+),/.exec(text)![1];
       await waitFor(() => env.retired.length === 1 && env.pi.userSent.length > 0);
       assert.deepEqual(env.retired, ['p2'], 'the failed terminal is killed');
       const notice = env.pi.userSent.at(-1)?.content ?? '';
       assert.match(notice, /failed to start/);
-      assert.match(notice, /sim rejected/);
+      assert.match(notice, /blocked: the program is waiting on a dialog/);
       // Scoped by slug: earlier subtests parked their workers on the same harness pane id.
       assert.ok(!(env.port.current?.listRunningSubs() ?? []).some((s) => s.slug === slug), 'no ghost running row for the failed start');
       assert.equal(readTaskRecord(env.cwd, failedTaskId), null, 'a spawn that never started leaves no record');
+      env.rejectSend = false;
     });
   });
 });
@@ -322,13 +414,15 @@ test('spawn/send: the reply pipe is scoped by the master session cwd, not the wo
     const spawned = await runSubagent(env.pi, { description: 'cross-repo task', prompt: PROMPT, cwd: other }, env.cwd);
     assert.match(spawned.content[0]!.text, /^started subagent [a-z0-9-]+@p2 /);
     await waitFor(() => env.frames.length === 1);
-    const expected = pipeNameFor(env.cwd, 't0');
-    assert.equal((env.frames[0] as { from?: string }).from, expected, 'spawn replies to the master session pipe');
-    assert.notEqual((env.frames[0] as { from?: string }).from, pipeNameFor(other, 't0'));
+    // The first task rides the core, so the core knows the caller; only the follow-up names a pipe.
+    assert.equal(env.frames[0]!.channel, 'core');
 
     const sent = await runSubagent(env.pi, { action: 'send', agentId: 'p2', message: 'wrap up and report' }, env.cwd);
     assert.match(sent.content[0]!.text, /Message sent to subagent [a-z0-9-]+@p2/);
-    assert.equal((env.frames[1] as { from?: string }).from, expected, 'follow_up replies to the same master pipe');
+    // The follow-up still names the master session pipe — the worker's own cwd would name a dead one.
+    const expected = pipeNameFor(env.cwd, 't0');
+    assert.equal(env.frames[1]!.from, expected, 'follow_up replies to the same master pipe');
+    assert.notEqual(env.frames[1]!.from, pipeNameFor(other, 't0'));
   }, { childCwd: other });
 });
 
@@ -337,7 +431,7 @@ test('send: a settled persistent worker is still reachable', async () => {
     env.parkPollers();
     const spawned = await runSubagent(env.pi, { description: 'hola', prompt: PROMPT }, env.cwd);
     const paneId = spawned.details?.paneId as string;
-    // The spawn's own boot (readiness ping + prompt) must be over, so the dead pipe the send meets is
+    // The spawn's own boot (readiness + first task) must be over, so the dead pipe the send meets is
     // the send's, not the boot's.
     await waitFor(() => env.frames.length === 1);
     env.port.current!.consumeReply(paneId, 'REPORT: hola');
@@ -362,7 +456,7 @@ test('send: a persistent worker whose pane was reclaimed is revived, not refused
     env.parkPollers();
     const spawned = await runSubagent(env.pi, { description: 'hola', prompt: PROMPT }, env.cwd);
     const paneId = spawned.details?.paneId as string;
-    // The spawn's own boot (readiness ping + prompt) must be over, so the dead pipe the send meets is
+    // The spawn's own boot (readiness + first task) must be over, so the dead pipe the send meets is
     // the send's, not the boot's.
     await waitFor(() => env.frames.length === 1);
     env.port.current!.consumeReply(paneId, 'REPORT: hola');
@@ -388,10 +482,12 @@ test('send/resume: short prefixes resolve at four characters and report ambiguit
 
     const sent8 = await runSubagent(env.pi, { action: 'send', agentId: short8, message: '8-char prefix message' }, env.cwd);
     assert.match(sent8.content[0]!.text, /Message sent to subagent [a-z0-9-]+@p2/);
-    assert.equal((env.frames[1] as { text?: string }).text, '8-char prefix message');
+    assert.equal(env.frames[1]!.text, '8-char prefix message');
 
     await runSubagent(env.pi, { action: 'send', agentId: short4, message: '4-char prefix message' }, env.cwd);
     assert.equal(env.frames.length, 3);
+    // Two follow-ups in, the worker is mid-turn, which is what `resume` must refuse.
+    env.statuses.p2 = 'working';
 
     assert.match(await runSubagentRejects(env.pi, { action: 'send', agentId: fullTaskId.slice(0, 3), message: 'x' }, env.cwd), /too short \(minimum 4 characters\)/);
     assert.match(await runSubagentRejects(env.pi, { action: 'send', agentId: '00000000', message: 'x' }, env.cwd), /unknown subagent id "00000000"/);
@@ -400,6 +496,7 @@ test('send/resume: short prefixes resolve at four characters and report ambiguit
     assert.match(live.content[0]!.text, /already running as pane/);
     assert.equal(live.details?.taskId, fullTaskId);
     env.port.current?.consumeReply('p2', 'done');
+    delete env.statuses.p2;
     const resumed = await runSubagent(env.pi, { action: 'resume', taskId: short8 }, env.cwd);
     assert.match(resumed.content[0]!.text, /resumed subagent/);
     assert.equal(resumed.details?.taskId, fullTaskId, 'resume reports the full taskId');
@@ -449,8 +546,12 @@ test('resume: a task spawned from a linked worktree lives in the repository task
     );
     assert.equal(repoTasksDir(wt), repoLedger, 'the worktree itself holds no tasks');
 
+    // The worker holds its first turn, so `resume` must refuse it; once the report is read, the row is
+    // a collected task whose pane is gone and a revive is the honest answer.
+    env.statuses.p2 = 'working';
     assert.match(await runSubagent(env.pi, { action: 'resume', taskId }, env.cwd).then((r) => r.content[0]!.text), /already running as pane/);
     env.port.current?.consumeReply(paneId, 'done');
+    delete env.statuses.p2;
     const resumed = await runSubagent(env.pi, { action: 'resume', taskId }, env.cwd);
     assert.match(resumed.content[0]!.text, /resumed subagent/);
     assert.equal(resumed.details?.taskId, taskId);
@@ -465,7 +566,7 @@ test('resume: a task spawned from a linked worktree lives in the repository task
   }, { childCwd: wt });
 });
 
-test('admission: resumes waiting for their pipe cannot hold a spawn behind them', async () => {
+test('admission: resumes waiting for their pane cannot hold a spawn behind them', async () => {
   await withPipeEnv(async (env) => {
     env.parkPollers();
     const first = await runSubagent(env.pi, { description: 'task that settles first', prompt: PROMPT }, env.cwd);
@@ -474,10 +575,10 @@ test('admission: resumes waiting for their pipe cannot hold a spawn behind them'
     env.port.current?.consumeReply(String(first.details?.paneId), 'done');
     const panesBefore = env.spawnLabels.length;
 
-    // Every revive now waits ~400ms for its pane's pipe: a slow boot that DOES finish, so the wait is
-    // the only thing the four calls are doing when the spawn arrives. The cap is four, so a cap that
-    // covered readiness would leave no slot for the spawn.
-    env.pipeDelayMs = 400;
+    // Every revive now waits for its pane's agent to report `idle` from the core: a slow boot that
+    // DOES finish, so the wait is the only thing the four calls are doing when the spawn arrives. The
+    // cap is four, so a cap that covered readiness would leave no slot for the spawn.
+    env.notReady.add('p2');
     let finished = 0;
     const resumes = [1, 2, 3, 4].map(() => {
       const call = runSubagent(env.pi, { action: 'resume', taskId }, env.cwd);
@@ -485,16 +586,16 @@ test('admission: resumes waiting for their pipe cannot hold a spawn behind them'
       return call;
     });
     await waitFor(() => env.spawnLabels.length === panesBefore + 4);
-    assert.equal(finished, 0, 'all four resumes are past pane creation and waiting for their pipes');
+    assert.equal(finished, 0, 'all four resumes are past pane creation and waiting for the core');
 
     const started = Date.now();
     const spawn = await runSubagent(env.pi, { description: 'task queued behind it', prompt: PROMPT }, env.cwd);
     const elapsed = Date.now() - started;
     assert.match(spawn.content[0]!.text, /^started subagent/);
     assert.ok(elapsed < 150, `a spawn must not queue behind a resume that waits for readiness (took ${elapsed}ms)`);
-    assert.equal(finished, 0, 'the spawn returned while every resume was still waiting for its pipe');
+    assert.equal(finished, 0, 'the spawn returned while every resume was still waiting for its agent');
 
-    env.pipeDelayMs = 0;
+    env.notReady.delete('p2');
     for (const resumed of await Promise.all(resumes)) {
       assert.match(resumed.content[0]!.text, /resumed subagent .* from task/);
     }
@@ -725,10 +826,12 @@ test('ownership: foreign rows list marked, close final, retry starts new', async
     if (!w1 || !w2 || !w3 || !w4) throw new Error('four workers were not spawned');
 
     // B also spawns (a retry below needs it): its own pane ids and pipe, parked pollers.
-    const bFrames: PipeRequest[] = [];
+    const bFrames: Delivery[] = [];
     const bSockets = new Set<Socket>();
     const qServer = startPipeServer(pipeNameFor(env.cwd, 'q2'), async (req) => {
-      if (req.type === 'prompt' || req.type === 'follow_up') bFrames.push(req);
+      if (req.type === 'prompt' || req.type === 'follow_up') {
+        bFrames.push({ channel: 'pipe', type: req.type, id: req.id, text: req.text, from: req.from ?? '' });
+      }
       return { type: 'ok', id: req.id };
     });
     qServer.on('connection', (sock) => {
@@ -750,6 +853,11 @@ test('ownership: foreign rows list marked, close final, retry starts new', async
           terminals: () => [], park: () => new Promise<never>(() => {}),
         }),
         run: async (o) => terminalInfo({ id: `q${2 + bPaneSeq++}`, cwd: o.cwd, labels: o.labels }),
+        // S14: B's retry spawns, so its first task rides B's own core client.
+        send: async (_id: string, text: string) => {
+          bFrames.push({ channel: 'core', type: 'prompt', id: `send-${bFrames.length + 1}`, text, from: '' });
+          return { started: true, status: 'working', turn: 1 };
+        },
         kill: async (id: string) => { bKilled.push(`kill:${id}`); },
         remove: async (id: string) => { bKilled.push(`remove:${id}`); },
       },
@@ -847,7 +955,7 @@ test('ownership: foreign rows list marked, close final, retry starts new', async
       assert.deepEqual(readTaskView(bSession), [newTaskId], 'B’s view gains only the new id');
       assert.equal(readTaskRecord(env.cwd, newTaskId)?.description, 'shared worker one');
       await waitFor(() => bFrames.length === 1);
-      assert.equal((bFrames[0] as { text?: string }).text, PROMPT, 'the stored brief is re-sent');
+      assert.equal(bFrames[0]!.text, PROMPT, 'the stored brief is re-sent');
       assert.deepEqual(
         stableRowFields(readTaskRecord(env.cwd, w1!.taskId)!), aRecordBefore, 'A’s row is untouched');
     } finally {
@@ -981,4 +1089,42 @@ test('P1: the worker report document settles on the turn event — exactly once'
     const listed = (await runSubagent(env.pi, { action: 'list' }, env.cwd)).content[0]!.text;
     assert.match(listed, /doc-probe@p2 \[idle\]/, 'the settlement consumed the row');
   }, { policy: { settleWindowMs: 3_600_000, subagentTimeoutMs: 3_600_000, pollIntervalMs: 50 } });
+});
+
+/* ── P2: the first task from the core (spec S14, S22) ───────────────── */
+
+test('P2: the first task rides the core, gated on readiness and on the send result', async (t) => {
+  // No pipe server at all: this worker never serves one, and the spawn must not care.
+  await withPipeEnv(async (env) => {
+    env.parkPollers();
+
+    await t.test('a worker that never serves a pipe still receives its task, and its turn goes up', async () => {
+      const spawned = await runSubagent(env.pi, { description: 'core-first task', prompt: PROMPT }, env.cwd);
+      const paneId = spawned.details?.paneId as string;
+      await waitFor(() => env.turns[paneId] === 1);
+      assert.equal(env.frames.length, 1, 'the task is delivered exactly once');
+      assert.equal(env.frames[0]!.channel, 'core', "the first task is the core's own send");
+      assert.equal(env.frames[0]!.text, PROMPT, 'the whole brief reaches the worker');
+      assert.equal(env.turns[paneId], 1, 'the send started a turn');
+      // The socket the old readiness ping needed never exists for this worker.
+      assert.equal(existsSync(pipePathFor(pipeNameFor(env.cwd, paneId))), false, 'no worker pipe was opened');
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(env.frames.length, 1, 'a started turn is never re-sent');
+    });
+
+    await t.test('a send whose result is `started: null` is retried, and the turn happens', async () => {
+      // The measured loss (spec S22): the text goes in before the agent reports `idle` and no turn
+      // ever runs. The same send after readiness does start one.
+      env.sendResults = [{ started: null, status: 'idle', turn: 0 }];
+      const spawned = await runSubagent(env.pi, { description: 'lost first send', prompt: PROMPT }, env.cwd);
+      const paneId = spawned.details?.paneId as string;
+      const before = env.turns[paneId] ?? 0;
+      await waitFor(() => env.turns[paneId] === before + 1);
+      const sent = env.frames.filter((f) => f.channel === 'core').slice(-2);
+      assert.equal(sent.length, 2, 'the unstarted send is tried again');
+      assert.deepEqual(sent.map((f) => f.text), [PROMPT, PROMPT], 'the same brief, not a rewritten one');
+      assert.equal(env.turns[paneId], before + 1, 'the retried send started the turn');
+      assert.equal(existsSync(pipePathFor(pipeNameFor(env.cwd, paneId))), false, 'still no worker pipe');
+    });
+  }, { pipes: false });
 });

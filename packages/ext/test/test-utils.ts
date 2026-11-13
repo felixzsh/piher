@@ -279,7 +279,7 @@ export function fakeCore(over: Partial<CoreClientLike> = {}): CoreClientLike {
     getTerminal: async () => null,
     listTerminals: async () => [],
     run: async (opts) => terminalInfo({ id: 't2', cwd: opts.cwd ?? '/test/cwd', labels: { ...opts.labels } }),
-    send: noop,
+    send: async () => ({ started: null, status: null, turn: 0 }),
     keys: noop,
     interrupt: async () => 'unknown',
     read: async () => ({ text: '', complete: true }),

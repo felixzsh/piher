@@ -83,6 +83,17 @@ export interface ReadBuffer {
   complete: boolean;
 }
 
+/** `terminal.send`'s own verdict: the core pastes the text and then says whether the program went
+ *  `working` because of it. `started: null` means nobody reported status, so nothing is proven
+ *  (spec S22) — a caller must not read a paste as a delivered task. */
+export interface SendResult {
+  started: boolean | null;
+  /** The program's status word when the text went in (null: it never said). */
+  status: string | null;
+  /** The turn when the text went in. */
+  turn: number;
+}
+
 export type InterruptOutcome = 'stopped' | 'exited' | 'still_working' | 'unknown';
 
 export class CoreError extends Error {
@@ -152,8 +163,9 @@ export interface CoreClientLike {
   getTerminal(id: string): Promise<TerminalInfo | null>;
   listTerminals(opts?: { labels?: Record<string, string>; all?: boolean }): Promise<TerminalInfo[]>;
   run(opts: RunOptions): Promise<TerminalInfo>;
-  /** Paste text and press Enter (core waits for ~3 s of human quiet). */
-  send(id: string, text: string, opts?: { force?: boolean }): Promise<void>;
+  /** Paste text and press Enter (core waits for ~3 s of human quiet), and report whether a turn
+   *  started (`SendResult`): the paste alone is not delivery. */
+  send(id: string, text: string, opts?: { force?: boolean }): Promise<SendResult>;
   keys(id: string, keys: readonly string[]): Promise<void>;
   interrupt(id: string): Promise<InterruptOutcome>;
   read(id: string, opts?: { lines?: number }): Promise<ReadBuffer>;
@@ -239,6 +251,16 @@ export function decodeTerminal(raw: unknown): TerminalInfo {
   };
 }
 
+/** A `SendResult` frame; anything the core did not say stays explicit (null / 0), never a guess. */
+export function decodeSendResult(raw: unknown): SendResult {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  return {
+    started: typeof r.started === 'boolean' ? r.started : null,
+    status: str(r.status),
+    turn: typeof r.turn === 'number' ? r.turn : 0,
+  };
+}
+
 /* ── Noop ────────────────────────────────────────────────────────────── */
 
 /** Stand-in outside an hc terminal: queries answer empty, creation throws, labels are a no-op. */
@@ -249,7 +271,7 @@ export class NoopCoreClient implements CoreClientLike {
   async getTerminal(): Promise<null> { return null; }
   async listTerminals(): Promise<TerminalInfo[]> { return []; }
   async run(): Promise<TerminalInfo> { throw new Error(`subagents and terminals: ${CORE_REQUIRED}`); }
-  async send(): Promise<void> {}
+  async send(): Promise<SendResult> { return { started: null, status: null, turn: 0 }; }
   async keys(): Promise<void> {}
   async interrupt(): Promise<InterruptOutcome> { return 'unknown'; }
   async read(): Promise<ReadBuffer> { return { text: '', complete: false }; }
@@ -637,13 +659,13 @@ export class CoreClient implements CoreClientLike {
     return decodeTerminal(await this.request('terminal.run', params));
   }
 
-  async send(id: string, text: string, opts: { force?: boolean } = {}): Promise<void> {
-    await this.request('terminal.send', {
+  async send(id: string, text: string, opts: { force?: boolean } = {}): Promise<SendResult> {
+    return decodeSendResult(await this.request('terminal.send', {
       terminal: id,
       text,
       caller: this.env.terminalId,
       ...(opts.force ? { force: true } : {}),
-    }, 30_000);
+    }, 30_000));
   }
 
   async keys(id: string, keys: readonly string[]): Promise<void> {

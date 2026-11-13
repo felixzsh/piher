@@ -9,13 +9,12 @@ import { stat as statCb } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, resolve as pathResolve } from 'node:path';
 import { promisify } from 'node:util';
-import { childEnvironment, type CoreClientLike, type CoreEnv } from './core-client.ts';
+import { childEnvironment, type CoreClientLike, type CoreEnv, type SendResult } from './core-client.ts';
 import { delegationEnv } from './delegation-core.ts';
 import { saveTaskPrompt } from './prompt-store.ts';
 import { bareSessionId } from './session-tail.ts';
 import { mainWorktreeRoot } from './storage-layout.ts';
 import { checkoutAckLine, checkoutSpaceId, ensureCheckout, planWorktree, releaseCheckout, type CheckoutIo, type CheckoutSpace, type WorktreeRecord } from './worktree.ts';
-import { pipeNameCandidates, pipeNameFor, pipeRequest, pipeRequestTo } from './pipe-channel.ts';
 import { composeForRole } from './manifest-compose.ts';
 import type { Lifecycle } from './role-manifest.ts';
 import { runtimePolicy } from './runtime-policy.ts';
@@ -145,12 +144,12 @@ export function createGitIo(git: GitAdapter = defaultGitAdapter): GitIo {
   };
 }
 
-/* ── readiness wait (pure planners) ─────────────────────────────── */
+/* ── readiness and first-task delivery (pure planners) ─────────── */
 
 const READY_BASE_INTERVAL_MS = 500;
 const READY_MAX_INTERVAL_MS = 4000;
-/** Liveness/agent sampling is far more expensive than a ping, so it runs on its own cadence. */
-const READY_LIVENESS_SAMPLE_MS = 2500;
+/** The screen tail only explains a failure, so it is sampled far less often than the core's status. */
+const READY_TAIL_SAMPLE_MS = 2500;
 /** Enough of the pane tail to carry a stack trace head into the failure text. */
 const READY_TAIL_CHARS = 1200;
 
@@ -167,6 +166,13 @@ type ReadyAttemptPlan =
   | { readonly kind: 'ready' }
   | { readonly kind: 'retry'; readonly delayMs: number }
   | { readonly kind: 'give-up'; readonly reason: 'pane-gone' | 'timeout' };
+
+/** Readiness for the first message: the agent is up and its composer takes input, which is the
+ *  core's own `status` word `idle` (spec S14). A terminal that never reported has none, so it is not
+ *  ready however long it lives. */
+export function isReadyStatus(status: string | null | undefined): boolean {
+  return status === 'idle';
+}
 
 /** Decide one readiness attempt. `alive` is tri-state on purpose: an unavailable liveness probe
  * (`null`) must not be read as death, or a slow herdr socket fails spawns that are merely slow. */
@@ -189,20 +195,57 @@ export function readyBackoffMs(attempt: number, baseMs = READY_BASE_INTERVAL_MS,
   return Math.min(capMs, baseMs * 2 ** n);
 }
 
-/** Failure text for the model; the three cases stay distinguishable: pane died (the tail carries the
- * reason), pane alive but never opened its pipe, pane alive and just slower than the timeout. */
+/** Failure text for the model; the cases stay distinguishable: pane died (the tail carries the
+ *  reason), pane alive and working anyway, pane alive but its agent never said `idle`, pane alive and
+ *  blocked on a dialog, pane alive and just slower than the timeout. */
 export function readyFailureText(failure: ReadyFailure): string {
   const seconds = Math.round(failure.elapsedMs / 1000);
   const head = failure.reason === 'pane-gone'
-    ? `subagent pane ${failure.paneId} exited before its pipe became ready (waited ${seconds}s)`
-    : `subagent pane ${failure.paneId} pipe not ready within ${seconds}s (limit ${Math.round(failure.timeoutMs / 1000)}s)`;
+    ? `subagent pane ${failure.paneId} exited before its agent reported ready (waited ${seconds}s)`
+    : `subagent pane ${failure.paneId} was not ready within ${seconds}s (limit ${Math.round(failure.timeoutMs / 1000)}s)`;
   const why = failure.reason === 'pane-gone'
     ? 'The child process is gone — its last output below usually carries the reason.'
     : failure.lastStatus === 'working'
       ? 'The pane is alive and working, so the prompt may simply be slow to boot; retrying the same call is safe.'
-      : 'The pane is alive but never registered its pipe — the child pi process may still be starting, or it failed to load the piher extension.';
+      : failure.lastStatus === 'blocked'
+        ? 'The pane is alive but its agent is blocked on a dialog (trust, auth or a question) — answer it in the pane, then retry the same call.'
+        : `The pane is alive but its agent never reported \`idle\` (last status: ${failure.lastStatus ?? 'none'}) — the child pi process may still be starting, or it failed to load the piher extension.`;
   const tail = failure.tail ? `\nlast output of ${failure.paneId}:\n${failure.tail}` : '';
   return `${head}\n${why}${tail}`;
+}
+
+/** What one `terminal.send` proved (spec S22). Only `started: true` is delivery: `null` means the
+ *  program never reported status and `false` that it stayed out of `working`, and in both the text
+ *  sat in the composer without a turn. */
+export type TaskSendPlan =
+  | { readonly kind: 'delivered' }
+  | { readonly kind: 'retry'; readonly delayMs: number }
+  | { readonly kind: 'give-up' };
+
+export function planTaskSend(opts: {
+  started: boolean | null;
+  elapsedMs: number;
+  attempt: number;
+  timeoutMs: number;
+}): TaskSendPlan {
+  if (opts.started === true) return { kind: 'delivered' };
+  if (opts.elapsedMs >= opts.timeoutMs) return { kind: 'give-up' };
+  return { kind: 'retry', delayMs: readyBackoffMs(opts.attempt) };
+}
+
+/** The send never became a turn: name what the core answered, so the model can decide (a dead
+ *  agent answers nothing, a slow one answers later). */
+export function taskNotStartedText(opts: {
+  paneId: string;
+  attempts: number;
+  elapsedMs: number;
+  last: { started: boolean | null; status: string | null; turn: number };
+}): string {
+  const seconds = Math.round(opts.elapsedMs / 1000);
+  const started = opts.last.started === null ? 'null (the agent never reported status)' : String(opts.last.started);
+  return `subagent pane ${opts.paneId} took no turn from its first message: ${opts.attempts} sends in ${seconds}s, `
+    + `last result started ${started}, status ${opts.last.status ?? 'none'}, turn ${opts.last.turn}. `
+    + 'The pane is alive and the text went in without starting a turn, so the task is still unsent — retrying the same call is safe.';
 }
 
 /* ── spawner ────────────────────────────────────────────────────── */
@@ -233,7 +276,10 @@ export interface Spawner {
   ): Promise<{ tabId: string; paneId: string; tabName: string }>;
   launchParts(resumeFile?: string | null, roleModel?: string | null, roleThinking?: string | null, approve?: boolean): string[];
   approveFor(cwd: string, masterCwd: string): Promise<boolean>;
-  waitSubReady(cwd: string, paneId: string): Promise<ReadyOutcome>;
+  /** Wait for the core to say the worker's agent is up and idle (never a ping on a private socket). */
+  waitReady(paneId: string): Promise<ReadyOutcome>;
+  /** Send the first task through the core, retrying until its own result reports a started turn. */
+  deliverFirstTask(paneId: string, text: string): Promise<void>;
   findExistingPane(sessionFile: string | null): Promise<{ paneId: string; tabId: string } | null>;
 }
 
@@ -246,13 +292,12 @@ export function createSpawner(h: SpawnerHost): Spawner {
     return zone.zone === 'worktree';
   }
 
-  /** Wait for the child's pipe with backoff; give up early when the pane is gone. The screen tail
+  /** Wait for the core's readiness with backoff; give up early when the pane is gone. The screen tail
    * is sampled while the pane exists so a crash that leaves a shell still explains itself. */
-  async function waitSubReady(cwd: string, paneId: string): Promise<ReadyOutcome> {
-    const names = pipeNameCandidates(cwd, paneId);
+  async function waitReady(paneId: string): Promise<ReadyOutcome> {
     const startedAt = Date.now();
     let attempt = 0;
-    let lastProbeAt = 0;
+    let lastTailAt = 0;
     let alive: boolean | null = null;
     let lastStatus: string | null = null;
     let tail: string | null = null;
@@ -260,15 +305,17 @@ export function createSpawner(h: SpawnerHost): Spawner {
     while (true) {
       const now = Date.now();
       const elapsedMs = now - startedAt;
-      if (now - lastProbeAt >= READY_LIVENESS_SAMPLE_MS || attempt === 0) {
-        lastProbeAt = now;
-        const probe = await probeChildPane(paneId);
-        alive = probe.alive;
-        lastStatus = probe.status;
-        if (probe.tail) tail = probe.tail;
+      const probe = await probeChildPane(paneId);
+      alive = probe.alive;
+      lastStatus = probe.status;
+      if (now - lastTailAt >= READY_TAIL_SAMPLE_MS || attempt === 0) {
+        lastTailAt = now;
+        const sampled = await paneTail(paneId);
+        if (sampled) tail = sampled;
       }
-      const pinged = await pingAnyName(names);
-      const plan = planReadyAttempt({ elapsedMs, attempt, timeoutMs: readyTimeoutMs, alive, ready: pinged });
+      const plan = planReadyAttempt({
+        elapsedMs, attempt, timeoutMs: readyTimeoutMs, alive, ready: isReadyStatus(lastStatus),
+      });
       if (plan.kind === 'ready') return { ok: true };
       if (plan.kind === 'give-up') {
         const failure: ReadyFailure = {
@@ -286,37 +333,55 @@ export function createSpawner(h: SpawnerHost): Spawner {
     }
   }
 
-  /** One ping round over every candidate pipe name (mixed-version peers register different names). */
-  async function pingAnyName(names: readonly string[]): Promise<boolean> {
-    for (const name of names) {
+  /** Hand the worker its first task through the core and believe only a started turn (spec S14,
+   * S22). A send the core did not report as started left the text unsubmitted, so the same text is
+   * sent again once the agent reports `idle` — inside one readiness budget, so a dead agent still
+   * fails the spawn instead of looping. */
+  async function deliverFirstTask(paneId: string, text: string): Promise<void> {
+    const startedAt = Date.now();
+    let attempt = 0;
+    while (true) {
+      let result: SendResult;
       try {
-        const res = await pipeRequest(name, { type: 'ping', id: `ping-${Date.now()}` }, 3000);
-        if (res.type === 'ok') return true;
-      } catch { /* not ready on this name */ }
+        result = await h.client.send(paneId, text);
+      } catch (err) {
+        throw new Error(`subagent pane ${paneId} refused its first message: ${(err as Error)?.message ?? String(err)}`);
+      }
+      const plan = planTaskSend({ started: result.started, elapsedMs: Date.now() - startedAt, attempt, timeoutMs: readyTimeoutMs });
+      if (plan.kind === 'delivered') return;
+      if (plan.kind === 'give-up') {
+        throw new Error(taskNotStartedText({ paneId, attempts: attempt + 1, elapsedMs: Date.now() - startedAt, last: result }));
+      }
+      await sleep(plan.delayMs);
+      // Readiness before every retry: the measured failure is a send issued before the agent reports
+      // `idle`, and the identical send after it starts the turn. The budget is the caller's clock.
+      const ready = await waitReady(paneId);
+      if (!ready.ok) throw new Error(ready.message);
+      attempt += 1;
     }
-    return false;
   }
 
-  /** Pane liveness + last visible output; socket failures degrade to "unknown", never "dead". */
-  async function probeChildPane(paneId: string): Promise<{ alive: boolean | null; status: string | null; tail: string | null }> {
-    let alive: boolean | null = null;
-    let status: string | null = null;
+  /** The core's facts about the pane: liveness and its own status word. A core failure degrades to
+   * "unknown", never "dead". */
+  async function probeChildPane(paneId: string): Promise<{ alive: boolean | null; status: string | null }> {
     try {
-      // A terminal that core marks finished is gone; a live one may still be booting its pipe.
       const terminal = await h.client.getTerminal(paneId);
-      alive = terminal != null && terminal.state !== 'finished';
-      status = terminal?.status ?? null;
+      return { alive: terminal != null && terminal.state !== 'finished', status: terminal?.status ?? null };
     } catch {
       /* core unreachable: liveness stays unknown, never "dead" */
+      return { alive: null, status: null };
     }
-    let tail: string | null = null;
+  }
+
+  /** Last visible output, for the failure text only: a screen read never decides anything (spec S16). */
+  async function paneTail(paneId: string): Promise<string | null> {
     try {
       const read = await h.client.read(paneId, { lines: 40 });
-      if (read.text) tail = read.text.slice(-READY_TAIL_CHARS);
+      return read.text ? read.text.slice(-READY_TAIL_CHARS) : null;
     } catch {
-      /* reaped terminal or socket blip — caller keeps the last cached tail */
+      /* reaped terminal or socket blip: the caller keeps the last cached tail */
+      return null;
     }
-    return { alive, status, tail };
   }
 
   /**
@@ -422,7 +487,8 @@ export function createSpawner(h: SpawnerHost): Spawner {
     spawnPaneInTaskTab,
     launchParts: (resumeFile, roleModel, roleThinking, approve) => buildLaunchParts(h.runtime, { resumeFile, roleModel, roleThinking, approve: approve ?? false }),
     approveFor,
-    waitSubReady,
+    waitReady,
+    deliverFirstTask,
     findExistingPane,
   };
 }
@@ -440,7 +506,7 @@ interface SpawnActionHost {
   /** A spawn that never started leaves no record and no view id behind. */
   dropTask?(taskId: string): void;
   lastRequestIdByPane: Map<string, number | string>;
-  /** Pane id → its in-flight boot (pipe readiness, session resolution, prompt injection). */
+  /** Pane id → its in-flight boot (readiness, first task, session resolution). */
   boots: Map<string, Promise<void>>;
   /** A spawn whose pane never came up: the only report a failed start can make off the turn. */
   notifySpawnFailed: (content: string) => Promise<void>;
@@ -459,7 +525,7 @@ interface SpawnActionHost {
 export function createSpawnAction(h: SpawnActionHost) {
   const { client, env, git, tasks, panes } = h;
   const { resolveSessionFile } = h.session;
-  const { spawnPaneInTaskTab, launchParts, waitSubReady } = h.spawn;
+  const { spawnPaneInTaskTab, launchParts, waitReady, deliverFirstTask } = h.spawn;
   const { startPoller } = h.poller;
 
   return async function executeSubagentSpawn(
@@ -616,26 +682,19 @@ export function createSpawnAction(h: SpawnActionHost) {
       saveTaskPrompt(taskId, spec.prompt);
       const injectId = `prompt-${taskId}`;
       const boot = (async (): Promise<void> => {
-        const ready = await waitSubReady(cwd, paneId);
+        // S14: the core's own status is the readiness gate — the worker's private pipe is not asked.
+        const ready = await waitReady(paneId);
         if (!ready.ok) throw new Error(ready.message);
         // The `piher.session` label lags right after spawn, so the mtime fallback would otherwise adopt
         // the newest PRE-EXISTING session in cwd; only a file written after the terminal existed counts.
         entry.gen.sessionFile = await resolveSessionFile(paneId, cwd, undefined, { minMtimeMs: spawnedAt - 2_000 });
         h.writeRecord(entry);
-        // M11: inject through the extension pipe, reserving the PTY keyboard channel for the human;
-        // injection and injectTs must stay together or the spawn leaves a ghost running row.
+        // M11: the first task goes through the core's own `send`, reserving the PTY keyboard channel
+        // for the human; injection and injectTs must stay together or the spawn leaves a ghost row.
+        // S22: only a `started: true` result is delivery, so a send that left the text in the composer
+        // is retried instead of believed.
         const injectTs = Date.now();
-        const injected = await pipeRequestTo(cwd, paneId, {
-          type: 'prompt',
-          id: injectId,
-          text: spec.prompt,
-          // The pipe name MUST be scoped by the MASTER's cwd: the server binds pipeNameFor(master
-          // session cwd, own terminal); the worker's cwd names a pipe nobody listens on.
-          from: pipeNameFor(masterCwd, env?.terminalId ?? ''),
-        });
-        if (injected.type !== 'ok') {
-          throw new Error(`pipe prompt rejected: ${injected.type === 'error' ? injected.message : 'unknown response'}`);
-        }
+        await deliverFirstTask(paneId, spec.prompt);
         h.lastRequestIdByPane.set(paneId, injectId);
         void startPoller(paneId, cwd, injectTs, spec.description, injectId);
         h.writeRecord(entry);
