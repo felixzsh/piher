@@ -281,3 +281,23 @@ it, i.e. they asserted a delivery they had not made; every assertion they guarde
 the live replay after a real `/reload` (proven against a fake host only), and `spawned | booted |
 steered | closed` exist in the format but nothing emits them yet. E1 stays open: durability is done,
 delivery and `inbox` are not.
+L16. **E1b and E13: every settlement gets a row, and a working child is ready**: `39c63e1` + `aabc8a5`
+(E1b) and `a33b116` (E13), parent `ef393ea`, Risk: item 5 + item 3 (the delivery format changed and a
+readiness verdict changed), `tsc` clean + `npm test` **597 tests, 591 pass, 6 skipped, 0 fail** on
+`aabc8a5`, Route: two workers in parallel on disjoint files. Measured by the parent, not only claimed:
+N=10 with median bodies delivers **10 of 10 in 4,090 B**; N=10 with p90 bodies delivers **10 rows, 0
+bodies, 1,027 B and one batch pointer** — against 1,739 B carrying **3 of 10** on the base. `collapseNotices`
+and `NOTICE_MAX_SHOWN` are deleted rather than kept as dead code, and their test was replaced by the
+byte-budget ones. The delivery rule: a row per settlement (`id · description · outcome · size`), the
+body budgeted first-fit in arrival order (4 KB, `PIHER_NOTICE_BODY_BUDGET_BYTES`), a withheld body
+replaced by the exact `output` call, and one `reports { ids }` line for all of them so N pointers no
+longer cost N turns. A lone settlement keeps its text and its card byte for byte. E13: `planReadyAttempt`
+now accepts **working** or `turn >= 1` as readiness (blocked and error still outrank it), and the boot
+failure text may not claim "did not take its first message" when the pane has a turn — the live defect
+of L14. The brief reaching a busy child is proven **queued**, not dropped, in a harness that models pi's
+queue. Incident, recorded because it happened: E1b's `git commit --amend` briefly rewrote E13's commit;
+the worker reset to it and the parent verified `a33b116` still holds exactly its three files (292/35).
+Residuals: no live master run of a ten-settlement batch; `reports` is untested against a real core's
+`docGet`; the `timeout` readiness verdict is now unreachable through the core's vocabulary and is kept
+only as the wait loop's terminator; E1 still needs `inbox`, E6 still needs a session-wide budget, and
+the review's critical finding (a deferred acceptance stamping a row it no longer owns) is still open.

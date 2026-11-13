@@ -1,4 +1,4 @@
-# Invariantes de piher como herramienta de orquestación (E1–E12)
+# Invariantes de piher como herramienta de orquestación (E1–E13)
 
 Una regla decide qué pertenece a piher y qué no: **piher es dueña de la contabilidad; el modelo,
 del juicio.** Todo lo que sigue se puede afirmar o negar con una medición, y ninguno de los doce
@@ -10,7 +10,7 @@ test se muda al fichero que posee ese comportamiento y este documento cambia de 
 
 | # | invariante | estado | qué lo mide |
 |---|---|---|---|
-| E1 | todo settlement se anuncia, exactamente una vez, con su identidad | **abierto** | durabilidad cerrada en `0062166` (ledger + cursor, probado a través de un reinicio); la **entrega** sigue en 3 de 10: `test/settlement-transport.test.ts` |
+| E1 | todo settlement se anuncia, exactamente una vez, con su identidad | **abierto** | durabilidad cerrada en `0062166`; **entrega cerrada en `39c63e1`** (10 de 10 en 4.090 B, medido). Falta `inbox` |
 | E2 | un worker que hizo su trabajo nunca se reporta como fallo | **cerrado** | `test/integration/subagent-spawn.test.ts`: un hijo que contesta y sale settlea con su informe; el fallo de arranque solo queda cuando no hay documento |
 | E3 | el estado que ves es el del core, nunca una conjetura | **cerrado** | settle = `turn` + documento; `test/subagent-poller.test.ts` |
 | E4 | el informe íntegro es alcanzable sin el pane | **cerrado** | `test/subagent-session.test.ts`; probado en vivo tras `/reload` (L9) |
@@ -22,6 +22,7 @@ test se muda al fichero que posee ese comportamiento y este documento cambia de 
 | E10 | el coste por worker no crece con N en el core | **abierto** | una suscripción `events.subscribe` sin filtro por worker |
 | E11 | el roster refleja la realidad, incluido un pane matado por fuera | **abierto** | un pane muerto por fuera no es un settle |
 | E12 | el master nunca re-hace trabajo ya hecho | **cerrado** | `test/integration/subagent-spawn.test.ts`: el aviso de un hijo que settleó no invita a relanzar; uno que nunca arrancó sí |
+| E13 | un hijo que ya está trabajando es ready, y el aviso no puede negarlo | **cerrado** (`a33b116`) | nacido en vivo en L14: 86 s de espera y "did not take its first message" sobre un pane que estaba trabajando |
 
 ## Por qué estos y no otros
 
