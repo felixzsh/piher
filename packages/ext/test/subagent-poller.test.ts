@@ -10,6 +10,7 @@ import {
 } from '../src/subagent-poller.ts';
 import type { TaskEntry } from '../src/task-row.ts';
 import type { SettlementCard } from '../src/settlement-card.ts';
+import type { NoticeRow } from '../src/index-notices.ts';
 import { fakeWatch, taskRow, terminalInfo, type TaskSeed } from './test-utils.ts';
 import type { CoreClientLike, CoreStatus } from '../src/core-client.ts';
 import { CoreError } from '../src/core-client.ts';
@@ -103,6 +104,8 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
   }
   const writes: RecordWrite[] = [];
   const notices: string[] = [];
+  /** The identity each notice handed over: what a batch keeps of a settlement (E1). */
+  const noticeRows: Array<NoticeRow | undefined> = [];
   const livePanes: string[] = entry ? [entry.gen.paneId] : [];
   /** Every pane the loop had to resolve through `getTerminal` because the watch snapshot lacked it. */
   const getTerminalCalls: string[] = [];
@@ -181,8 +184,9 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
     ledger: openSettlementLedger({ file: null }),
     // The host says when pi took the notice: resolving means "the buffer has it", `onAccepted`
     // means "the master read it", and only the second one records a delivery.
-    injectNotice: async (content, _paneId, card, onAccepted) => {
+    injectNotice: async (content, _paneId, card, onAccepted, row) => {
       notices.push(content);
+      noticeRows.push(row);
       cards.push(card ?? null);
       onAccepted?.();
     },
@@ -191,7 +195,7 @@ function fixture(entry: TaskEntry | null, initialTime = 13_000) {
   };
 
   return {
-    host, entry, writes, notices, cards, virtual, panes: livePanes, getTerminalCalls, retired,
+    host, entry, writes, notices, noticeRows, cards, virtual, panes: livePanes, getTerminalCalls, retired,
     parks: () => watch.parks,
     waitState: (s: CoreStatus | 'exited' | null) => { waitState = s; },
     setTurn: (n: number) => { turn = n; },
@@ -329,7 +333,27 @@ test('pollLoop: a blocked report keeps its BLOCKED: first line and reads as the 
   assert.ok(f.writes[0]!.entry.gen.consumedAt !== null, 'the settlement still lands in the record');
 });
 
-test('pollLoop: a closing message `subagent output` already returned is pointed at, not repeated', async () => {
+test('pollLoop: the settlement hands over the row a batch keeps — pane, description, outcome, report', async () => {
+  // The buffer turns a batch into rows, so the settlement has to hand the row over; a notice without
+  // one would fall back to its full text and the budget could never apply to it.
+  const f = fixture(makeEntry('p-row'));
+  docSettle(f, 'p-row', reportDoc('task-1', 'finished all the work'));
+  await start(f);
+  assert.deepEqual(f.noticeRows[0], {
+    id: 'p-row', description: 'desc', outcome: 'settled', body: 'finished all the work',
+  });
+});
+
+test('pollLoop: a failure carries a row with no body, and the reason survives into it', async () => {
+  const failed = fixture(makeEntry('p-fail-row'));
+  docSettle(failed, 'p-fail-row', reportDoc('task-1', null, { stopReason: 'upstream error: 429 rate limited' }));
+  await start(failed);
+  assert.equal(failed.noticeRows[0]?.outcome, 'failed');
+  assert.equal(failed.noticeRows[0]?.body, null, 'nothing to carry: the turn produced no report');
+  assert.match(failed.noticeRows[0]?.note ?? '', /429 rate limited/, 'the reason survives into the row');
+});
+
+test('pollLoop: a report `output` already returned is pointed at, not repeated', async () => {
   const report = 'FULL REPORT: four files changed, two tests green, committed on the bugfix branch.';
   const f = fixture(makeEntry('p-seen', { reportDelivered: { fingerprint: report.slice(-64), at: 12_000 } }));
   docSettle(f, 'p-seen', reportDoc('task-1', report));
