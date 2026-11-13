@@ -327,3 +327,12 @@ instructions, the repo's `AGENTS.md` and the worker template — any command tha
 integration pass. Unproven: no live master run of C1 (the steer sequence is a scripted harness), no real
 core behind the replay batch, a buffered multi-pane replay does not mark its panes GC-exempt, and
 `reports` against a real `docGet` is still untested. Still open from the review: the six minor findings.
+L18. **Capacity, measured (the number the external review asked for)**: no code change, parent-level
+measurement. Live `pi` worker processes on this machine: **median 212 MB RSS, mean 210 MB, max 228 MB**.
+Projection: **20 workers ≈ 4.1 GB**, **40 workers ≈ 8.2 GB**, against **15 GB total and 6 GB available**
+here. So the physical ceiling of this box is about twenty to twenty-five workers, which is exactly the
+peak the target scenario asks for; forty does not fit here regardless of design. This is the number the
+capacity line should print when it becomes visible (P9), and it is the fact behind "the physics is not
+piher's to fix, only to make visible". Not measured: the core's own event fan-out at N=30 — the code
+holds one unfiltered `events.subscribe` per worker, so the cost is O(N) per element event by
+construction, but no instrumented run has counted it yet.
