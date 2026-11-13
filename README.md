@@ -215,8 +215,8 @@ noted. `PIHER_*` is the only namespace.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PIHER_SUBAGENT_TIMEOUT_MS` | `600000` | Inactivity budget before a subagent is terminated (a working turn renews it) |
-| `PIHER_READY_TIMEOUT_MS` | `90000` | How long to wait for a spawned pane to open its pipe (a dead pane fails fast) |
+| `PIHER_SUBAGENT_TIMEOUT_MS` | `300000` | Silence budget: how long a worker may say nothing before the master is told it never reported |
+| `PIHER_READY_TIMEOUT_MS` | `90000` | How long a spawned pane gets to report ready and take its first message (a dead pane fails fast) |
 | `PIHER_COMMAND_PICKUP_MS` | `1500` | Read-back budget of a steering command (`0`: no wait) |
 | `PIHER_GC_TICK_MS` | `30000` | Idle GC sweep cadence |
 | `PIHER_SESSION_TTL_SECONDS` | `600` | Session retention after a worker exits, before GC |

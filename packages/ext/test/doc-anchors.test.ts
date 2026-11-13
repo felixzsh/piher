@@ -30,14 +30,17 @@ function markdownUnder(dir: string): string[] {
   return out;
 }
 
-/** What a user reads: the README pair, `docs/`, and the shipped skill. The design records under
- *  `docs/spec/` are excluded on purpose: they quote knobs historically (a spec that says a knob was
- *  deleted names it, and that is the opposite of rot). */
+/** The plan records under `docs/spec/` are the exception, one file at a time: a phase log names a
+ *  knob precisely because it was deleted ("the suite is green with `X` removed"), which is the
+ *  opposite of rot. The contract itself (`docs/spec/contracts.md`) stays in scope. */
+const RECORD_DOCS: readonly string[] = ['docs/spec/hc-native/plan.md', 'docs/spec/plan.md'];
+
+/** What a user reads: the README pair, `docs/` (minus the phase-log records), and the shipped skill. */
 function shippedDocs(): string[] {
   return [
     'README.md',
     'packages/ext/README.md',
-    ...markdownUnder('docs').filter((path) => !path.startsWith('docs/spec/')),
+    ...markdownUnder('docs').filter((path) => !RECORD_DOCS.includes(path)),
     ...markdownUnder('packages/ext/skills'),
   ];
 }
