@@ -207,3 +207,25 @@ defects are now written as criteria rather than intentions — `docs/spec/hc-nat
 (E1-E12, with E3/E4/E7 recorded as closed and why) and `test/open-invariants.test.ts`, where a skipped
 test is an open invariant carrying its evidence, so the definition of done exists before the fixes.
 Not measured: attention still needs the fan-out, because 7 of 10 reports never arrived.
+L12. **E2/E9/E12 closed — a child that answered is not a failed start**: `fdbe126` (parent `0e3fb34`),
+Risk: item 6 (the boot's verdict changed: a start that cannot be confirmed now asks the settlement
+channel before it may be called a failure), `tsc` clean + `npm test` **559 tests, 553 pass, 6 skipped,
+0 fail** on that SHA; the same command on `0e3fb34` gives 558/549/9, so the unit adds four passing tests
+and closes three invariants without a single red. The defect, measured in L11: of ten spawns in one
+batch, two were reported to the master as failed starts, and one of them (`t1hr`) had already answered
+correctly. The fix: a boot that never confirmed its delivery reads `piher.rep.<pane>` and judges it with
+the same `planReportDelivery` the settlement watch uses, against its own `spawnedAt` with the same
+slack (`REQUEST_BOUNDARY_SLACK_MS`, now exported so the two readers cannot diverge). A report naming
+the task inside that window means the spawn **settled**: the row is kept, the watch is armed at
+`spawnedAt`, and the report arrives as an ordinary settlement; if the watch cannot arm, the notice says
+it settled, points at `output`, and says **not to spawn it again**. No document keeps the old failure
+verbatim, cause and advice included. The investigation answered the odd detail: `(waited 0s)` is not a
+shared budget — each boot owns its `deadline`, and the second `waitReady` starts a fresh clock whose
+first probe already finds `state: finished`; the race is the late submit (`started: null`, turn 0), the
+`resubmit` verdict, and the 500 ms retry sleep in which the child answers and exits. Rejected: teaching
+`planTaskSend`/`planReadyAttempt` to read the `turn` — a turn proves neither that an answer exists nor
+that a crash did not happen during boot, and would still leave the master without a report. Unproven:
+the fixture's late submit is a 20 ms timer against the core's real Enter cost (the live burst's 0.3 s
+child fits, but no live burst has been re-run since the fix); a child that ran a turn and left **no**
+document is still judged a boot failure, which is literally true but would read better as the
+`settled-without-report` ending at boot — a follow-up, not this unit.
