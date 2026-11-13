@@ -132,3 +132,18 @@ is an existing `.jsonl`; the resume refusal has three shapes and asserts only wh
 gone from the README and the decision notes, because `terminal.interrupt` presses the stop key in that pane.
 Residuals: the seam is the fake core, not a live `hc`; a channel-less worker's row still reads `idle`;
 `send` to a vanished pane still revives without a session.
+L8. **Post-run correction**: `4759f02` (parent `2c83642`), Risk: item 3 + item 6 (the resume contract
+and the refusal family changed; no test covered the record path that carried the defect), `tsc` clean +
+`npm test` **538/538** on that SHA, Route: delegated. Not part of the accepted run: a demo `reviewer`
+spawned after L7 read `511da5a` statically and found that `resume` skipped its `.jsonl` validation
+when the record already carried the value — `index.ts:246` fills a document's `session` with
+`report.file ?? (sessionId || null)` (a bare id when the worker had no readable `hresume` at settle) and
+`subagent-poller.ts:319` writes it into the record raw — so `reviveEntry` dropped `--resume` and the
+tool answered "session restored" over a fresh conversation. Fixed by validating the record value like any
+other candidate and by trying the record, the label and the document in order; `getTaskIdForPane` absent
+now yields a new `unestablished` report instead of `not-ours`. The three new tests fail on `2c83642`.
+Residuals: the `unestablished` refusal is pinned at the unit level only (the plugin wires the index, so
+no end-to-end path reaches it); an undecided address may not borrow the newest session files; a terminal
+from an older build still loses its live `hresume` report because the ownership gate needs the
+`piher.task` label only a spawn writes — that needs a label rewritten on adopt/restore, which was
+explicitly out of scope here.
