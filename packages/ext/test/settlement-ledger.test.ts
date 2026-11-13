@@ -500,7 +500,7 @@ test('E1 (d): a settlement whose report document is gone is re-delivered as a po
   }
 });
 
-/* ── the cursor as a prefix, never a high-water mark ───────────── */
+/* ── the cursor as a prefix, and one batch per restart ─────────── */
 
 test('E1 (a): an acceptance out of order does not hide the settlement below it', () => {
   // Acceptances do not arrive in seq order: a refused notice is requeued and retried while a later
@@ -545,3 +545,55 @@ test('E1 (a): an acceptance out of order does not hide the settlement below it',
   }
 });
 
+test('E1 (a): a restart carries every undelivered settlement in one delivery, and the cursor follows it', async () => {
+  // At a start the master is idle, so a notice injected per event goes out alone with its own turn:
+  // N settlements for N turns. The replay plans the same batch the live path plans — a row per
+  // settlement, the bodies budgeted, one pointer for what was withheld — and hands it over once.
+  const world = createWorld();
+  try {
+    const out = boot(world, { busy: () => false });
+    out.ledger.append({
+      at: 1_000, taskId: 'task-one', pane: 'p-one', turn: 1, kind: 'settled', payloadRef: 'piher.rep.p-one',
+    });
+    out.ledger.append({ at: 2_000, taskId: 'task-two', pane: 'p-two', turn: 1, kind: 'settled' });
+    out.ledger.append({ at: 3_000, taskId: 'task-three', pane: 'p-three', turn: 1, kind: 'failed' });
+    // Only the first settlement's document still holds exactly that settlement.
+    world.docs.set('piher.rep.p-one', {
+      taskId: 'task-one', turn: 1, stopReason: 'stop', session: null, text: 'ONE: the first conclusion', at: 1_000,
+    });
+
+    const second = boot(world, { busy: () => false });
+    assert.equal(await replaySettlements(second.host), 3, 'three settlements were carried');
+    assert.equal(second.accepted.length, 1, 'in one delivery: not one message and one turn per settlement');
+    const text = second.accepted[0]!;
+    for (const id of ['p-one', 'p-two', 'p-three']) {
+      assert.ok(text.includes(`${id} · `), `every settlement is named in the batch: ${id}`);
+    }
+    assert.ok(text.includes('ONE: the first conclusion'), 'a body whose document still matches travels inline');
+    assert.match(text, /re-delivered from the piher ledger \(seq 1\): this is its first delivery/);
+    assert.match(text, /re-delivered from the piher ledger \(seq 3\)/, 'the replay wording rides in the row');
+    assert.ok(text.includes('subagent(action:"output", agentId:"p-two")'), 'the absent body names its own read');
+    assert.equal(second.ledger.deliveredSeq(), 3, 'the cursor follows what the delivery carried');
+
+    const third = boot(world, { busy: () => false });
+    assert.equal(await replaySettlements(third.host), 0, 'nothing is re-delivered twice');
+    assert.deepEqual(third.accepted, []);
+  } finally {
+    world.dispose();
+  }
+
+  // A refused batch carries nothing, so it records nothing: every seq stays above the cursor.
+  const refusedWorld = createWorld();
+  try {
+    const out = boot(refusedWorld, { busy: () => false });
+    out.ledger.append({ at: 1_000, taskId: 'task-one', pane: 'p-one', turn: 1, kind: 'settled' });
+    out.ledger.append({ at: 2_000, taskId: 'task-two', pane: 'p-two', turn: 1, kind: 'settled' });
+    const second = boot(refusedWorld, { busy: () => false });
+    second.host.injectNotice = async () => { throw new Error('pi is mid-turn'); };
+    assert.equal(await replaySettlements(second.host), 0);
+    assert.deepEqual(second.accepted, []);
+    assert.equal(second.ledger.deliveredSeq(), 0, 'a batch nobody took advances no cursor');
+  } finally {
+    refusedWorld.dispose();
+  }
+});

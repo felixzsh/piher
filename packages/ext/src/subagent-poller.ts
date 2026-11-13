@@ -12,7 +12,7 @@ import {
 import { runtimePolicy, type RuntimePolicy } from './runtime-policy.ts';
 import { formatFailureNotice, formatSettlementNotice } from './vocab.ts';
 import { settlementCard, type SettlementCard, type SettlementOutcome } from './settlement-card.ts';
-import type { NoticeRow } from './index-notices.ts';
+import { planNoticeBatch, type NoticeRow } from './index-notices.ts';
 import { buildBlockedGateNotice, reportFingerprint } from './subagent-core.ts';
 import { planReportDelivery, readReportDocument, reportDeliveryKey, reportDocName } from './report-documents.ts';
 import { planLedgerReplay, type SettlementEvent, type SettlementEventKind, type SettlementLedger } from './settlement-ledger.ts';
@@ -822,8 +822,15 @@ function acceptReplay(h: PollerHost, event: SettlementEvent): void {
  * and `session_tree`, after the records are restored — a `/reload`, a crash or a compaction is the
  * same case, because what was lost is exactly what the notice buffer kept in RAM.
  *
- * Returns how many notices were handed over. A refused notice leaves its seq below the cursor, so the
- * next start tries again: at-least-once, deduplicated by `(taskId, at)`.
+ * One delivery, not one per settlement: at a start the master is idle, so a notice injected per event
+ * would go out alone with its own turn — N settlements for N turns, the fan-out the batch exists to
+ * avoid. The replay therefore plans the same batch the live path plans (`planNoticeBatch`: a row per
+ * settlement, bodies budgeted, one `reports` pointer) and hands it over once. A lone settlement is
+ * still its own text, and the replay's own wording rides in the row's note, so a batch row still says
+ * this is a first delivery and not a new settlement.
+ *
+ * Returns how many settlements were carried. A refused batch records nothing, so its seqs stay above
+ * the cursor and the next start tries again: at-least-once, deduplicated by `(taskId, at)`.
  */
 export async function replaySettlements(h: PollerHost): Promise<number> {
   const now = h.now ?? Date.now;
@@ -840,11 +847,18 @@ export async function replaySettlements(h: PollerHost): Promise<number> {
       return row.gen.consumedAt ?? -1;
     },
   });
-  let handed = 0;
+  /** Everything the one delivery will carry: the notice as a lone settlement would say it, the row a
+   *  batch keeps of it, and the card only a batch of one renders. */
+  const carried: Array<{
+    event: SettlementEvent;
+    content: string;
+    row: NoticeRow;
+    card: SettlementCard;
+  }> = [];
   for (const event of plan) {
     const row = h.tasks.get(event.taskId);
     const { report, reason } = await readReplayBody(h, event);
-    const notice = formatReplayNotice({
+    const content = formatReplayNotice({
       seq: event.seq,
       paneId: event.pane,
       description: row?.description ?? '',
@@ -858,18 +872,37 @@ export async function replaySettlements(h: PollerHost): Promise<number> {
       outcome: event.kind === 'settled' ? 'settled' : 'failed',
       now: now(),
     });
-    try {
-      await h.injectNotice(notice, event.pane, card, () => acceptReplay(h, event), {
+    const note = reason === null
+      ? `re-delivered from the piher ledger (seq ${event.seq}): this is its first delivery`
+      : `re-delivered from the piher ledger (seq ${event.seq}) and it FAILED (${reason}): this is its first delivery`;
+    carried.push({
+      event,
+      content,
+      card,
+      row: {
         id: event.pane,
         description: row?.description ?? '',
         outcome: event.kind === 'settled' ? 'settled' : 'failed',
         body: report,
-        note: `re-delivered from the piher ledger (seq ${event.seq}): this is its first delivery`,
-      });
-      handed += 1;
-    } catch {
-      // The cursor stays below this seq: the next start re-delivers instead of dropping it.
-    }
+        note,
+      },
+    });
   }
-  return handed;
+  const batch = planNoticeBatch(carried.map(({ content, row }) => ({ content, row })));
+  if (batch === null || batch.text === '') return 0;
+  // A batch of one keeps the address and the card a lone settlement has always carried; a real batch
+  // has no single pane to exempt from the sweeps and no single card to draw.
+  const lone = carried.length === 1 ? carried[0]! : null;
+  try {
+    await h.injectNotice(batch.text, lone?.event.pane, lone?.card, () => {
+      // pi took the whole batch, so every settlement it carried is delivered — and the cursor moves
+      // one carried seq at a time, never past one the batch left out.
+      for (const { event } of carried) acceptReplay(h, event);
+    });
+  } catch {
+    // The cursor stays below every seq this batch carried: the next start re-delivers instead of
+    // dropping them.
+    return 0;
+  }
+  return carried.length;
 }
