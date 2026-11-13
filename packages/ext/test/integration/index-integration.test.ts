@@ -592,6 +592,9 @@ interface DocCall { method: string; params: Record<string, unknown> }
 
 /** A core socket that answers the calls a worker's settle makes, recording them in order. */
 async function withWorkerCore(
+  /** A timeline shared with the caller's own channel, so a test can assert which request landed
+   *  first across the core socket and the pipe — exactly what findings 1 and 4 are about. */
+  order: string[],
   body: (socketPath: string, calls: DocCall[]) => Promise<void>,
 ): Promise<void> {
   const socketPath = join(mkdtempSync(join(tmpdir(), 'piher-worker-core-')), 's.sock');
@@ -605,6 +608,7 @@ async function withWorkerCore(
       if (idx < 0) return;
       const req = JSON.parse(buf.slice(0, idx)) as { id: number; method: string; params: Record<string, unknown> };
       calls.push({ method: req.method, params: req.params });
+      order.push(req.method);
       const result = req.method === 'terminal.get'
         ? { address: 't2', turn: 2, state: 'live', cwd: '/w', labels: {} }
         : req.method === 'doc.get' ? { value: null, version: 0 }
@@ -638,7 +642,7 @@ test('worker settle: the report document is written with no request pending, sta
     transcriptMessage('toolResult', 'Error: role "worker" does not permit tool "bash"', Date.now(), 'stop'),
     { type: 'message', message: { role: 'assistant', content: [], timestamp: Date.now(), stopReason: 'stop' } },
   ));
-  await withWorkerCore(async (socketPath, calls) => {
+  await withWorkerCore([], async (socketPath, calls) => {
     const pi = await mountIndex(cleanup, 'core-worker', {
       HC_TERMINAL_SOCKET: socketPath,
       HC_TERMINAL_ID: 't2',
@@ -678,13 +682,15 @@ test('worker settle: a one-shot worker waits for its document write before shutt
   const sessionFile = join(agentDir, '2026-01-01T00-00-00-000Z_bbbbbbbb-0000-4000-8000-000000000000.jsonl');
   const masterPipe = pipeNameFor(cwd, 'tm');
   const replies: PipeRequest[] = [];
+  const order: string[] = [];
   const master = startPipeServer(masterPipe, async (req) => {
     replies.push(req);
+    order.push(req.type);
     return { type: 'ok', id: req.id };
   });
   await new Promise<void>((resolve) => master.once('listening', resolve));
   try {
-    await withWorkerCore(async (socketPath, calls) => {
+    await withWorkerCore(order, async (socketPath, calls) => {
       const pi = await mountIndex(cleanup, 'core-worker', {
         HC_TERMINAL_SOCKET: socketPath,
         HC_TERMINAL_ID: 't2',
@@ -719,9 +725,21 @@ test('worker settle: a one-shot worker waits for its document write before shutt
         await waitFor(() => shutdowns.length === 1);
         assert.equal(shutdowns.length, 1, 'the one-shot worker exits once its report is out');
         assert.match(shutdowns[0]!, /doc\.set/, 'the document write completed before the shutdown');
-        assert.ok(replies.some((r) => r.type === 'reply'), 'the pipe push went out too');
-        const value = calls.find((c) => c.method === 'doc.set')!.params.value as { text: string | null };
+        const reply = replies.find((r) => r.type === 'reply');
+        assert.ok(reply, 'the pipe push went out too');
+        const value = calls.find((c) => c.method === 'doc.set')!.params.value as { text: string | null; at: number };
         assert.equal(value.text, 'REPORT: one-shot done');
+        // The document is on disk BEFORE the reply leaves the worker: the master reclaims a
+        // one-shot worker's pane as soon as it handles that reply, so a write still in flight would be
+        // cut short and the durable document S6/S12 rely on would never exist (finding 4).
+        const setAt = order.indexOf('doc.set');
+        const replyAt = order.indexOf('reply');
+        assert.ok(setAt >= 0, 'the document was written');
+        assert.ok(setAt < replyAt, `doc.set (${setAt}) precedes the reply (${replyAt}): ${order.join(',')}`);
+        // The reply names the very document it settles, which is how the master records the delivery
+        // as an identity instead of comparing its own clock with the worker's (spec S7).
+        assert.equal((reply as { docAt?: number }).docAt, value.at,
+          'the reply carries the settlement document identity');
       } finally {
         await fire(pi, 'session_shutdown');
       }

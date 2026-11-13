@@ -49,7 +49,9 @@ export async function handlePipeRequest(
       s.port.current?.applyReplySession(req.paneId, req.sessionFile);
       // Consume before the finish notice: otherwise listRunningSubs still reports the pane and the
       // next master settle injects "still running" for an agent just announced finished.
-      s.port.current?.consumeReply(req.paneId, req.text);
+      // The reply names the document it is the settlement of, so the row records exactly what the
+      // pipe delivered and a re-armed watch cannot read the same report again (spec S7).
+      s.port.current?.consumeReply(req.paneId, req.text, req.docAt ?? null);
       // B8: the claim key `${paneId}:${requestId}` must match the poll loop's (subagent-poller.ts):
       // a child echoes the id of the pipe request it answered (`id: req.id` in index.ts's settle
       // push) and the parent hands that same id to startPoller (`prompt-<taskId>` / `fu-<ts>`).

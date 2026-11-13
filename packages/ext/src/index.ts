@@ -263,17 +263,55 @@ export default async function (pi: ExtensionAPI) {
     return { text: state.text, why: state.why ?? null, file: ownFile };
   }
 
+  /** Everything one settle reports, resolved once: the closing words (or the reason the turn ended
+   *  without any) and the core's turn. The push and the document read it from the same place, so
+   *  they cannot disagree about which turn settled, and the turn costs one round trip instead of
+   *  two. */
+  type SettleReport = { text: string | null; why: string | null; file: string | null; turn: number | null };
+
+  async function collectSettleReport(sinceTs: number): Promise<SettleReport> {
+    const { text, why, file } = ownClosing(sinceTs);
+    let turn: number | null = null;
+    if (env?.terminalId) {
+      try {
+        turn = (await client.getTerminal(env.terminalId))?.turn ?? null;
+      } catch {
+        turn = null; // reported below; the push still carries the words
+      }
+    }
+    return { text, why, file, turn };
+  }
+
   /** Returns whether a settlement reply actually went out: a worker whose report never reached the
-   *  master must not exit as if it had (S54 — the push comes first, the shutdown after). */
-  async function pushSettleReply(aborted = false): Promise<boolean> {
-    const req = pendingMachineRequest;
+   *  master must not exit as if it had (S54 — the push comes first, the shutdown after).
+   *
+   *  Everything it decides on arrives in `input`, captured when the settle happened: the document is
+   *  written before this runs, and `lastStopReason`/`pendingMachineRequest` are live state that a
+   *  later turn (or a newer request) would have moved by then.
+   *
+   *  `docAt` is the `at` of the report document this reply settles, or null when no document was
+   *  written. The master records it against the row, which is how a re-armed watch knows the report
+   *  is already delivered (spec S7) — an identity, not a comparison of two clocks. */
+  async function pushSettleReply(input: {
+    aborted: boolean;
+    turnStopReason: string | null;
+    request: MachineRequest | null;
+    report: SettleReport;
+    docAt: number | null;
+  }): Promise<boolean> {
+    const { aborted, turnStopReason, request: req, report, docAt } = input;
     if (!req || !req.from) {
       return false;
     }
     // An aborted settle is not a settlement: the closing message is still coming, and answering now
     // would burn the one-shot request + the parent's claim latch on a null-text reply ("left no
     // closing message") — the real closing message then never gets delivered. Keep the request armed.
-    if (!shouldPushSettleReply({ aborted, lastStopReason })) {
+    if (!shouldPushSettleReply({ aborted, lastStopReason: turnStopReason })) {
+      return false;
+    }
+    // A newer request landed while this settlement's document was being written: the report answers
+    // the request it settled, not that one.
+    if (pendingMachineRequest !== req) {
       return false;
     }
     pendingMachineRequest = null;
@@ -281,18 +319,18 @@ export default async function (pi: ExtensionAPI) {
       // A turn that ended with nothing to say but a reason — a refused tool, an error — must say
       // it: staying silent left the master waiting the whole vacuum budget for a report that was
       // never coming.
-      const { text, why, file } = ownClosing(req.sinceTs);
-      const report = text ?? why ?? null;
-      if (report === null) {
+      const reportText = report.text ?? report.why ?? null;
+      if (reportText === null) {
         return false;
       }
       await pipeRequest(req.from, {
         type: 'reply',
         id: req.id,
         paneId: env?.terminalId ?? '',
-        text: report,
+        text: reportText,
         // Push the resolved PATH when readable; fall back to the bare id for the master-side mapping.
-        sessionFile: file ?? (sessionId || null),
+        sessionFile: report.file ?? (sessionId || null),
+        ...(docAt !== null ? { docAt } : {}),
       }, 5000);
     } catch (err) {
       /* The requester's pollLoop is the fallback; surface the dead letter for triage. */
@@ -307,32 +345,32 @@ export default async function (pi: ExtensionAPI) {
    *  master-side guess had to exist at all. Best effort like the push, but never silent: a write
    *  that could not land is logged with its reason, and the master still learns the report through
    *  the push (when one is pending) or the transcript fallback. */
-  async function writeSettleDocument(input: { aborted: boolean; sinceTs: number; hadRequest: boolean }): Promise<boolean> {
-    const { aborted, sinceTs, hadRequest } = input;
+  async function writeSettleDocument(input: {
+    aborted: boolean;
+    turnStopReason: string | null;
+    report: SettleReport;
+    hadRequest: boolean;
+    /** The settlement's own `at`, minted by the caller so the push can name the document it settles. */
+    at: number;
+  }): Promise<boolean> {
+    const { aborted, turnStopReason, report, hadRequest, at } = input;
     if (!isSubagent || !client.available || !env?.terminalId || !delegation) return false;
-    if (!shouldPushSettleReply({ aborted, lastStopReason })) return false;
-    const { text, why, file } = ownClosing(sinceTs);
+    if (!shouldPushSettleReply({ aborted, lastStopReason: turnStopReason })) return false;
     // A worker still thinking has no closing text and no reason: withhold like the pipe push.
-    if (text === null && why === null) return false;
-    let turn: number | null = null;
-    try {
-      turn = (await client.getTerminal(env.terminalId))?.turn ?? null;
-    } catch {
-      /* reported below */
-    }
-    if (turn === null) {
+    if (report.text === null && report.why === null) return false;
+    if (report.turn === null) {
       console.error(`piher: settle document for ${env.terminalId} skipped: the core would not report its turn`);
       return false;
     }
     const written = await writeReportDocument(client, env.terminalId, {
       taskId: delegation.taskId,
-      turn,
+      turn: report.turn,
       // A turn that ended without words states its reason here instead (spec S8): `stopReason`
       // alone would say "stop", which reads as a finished turn that had nothing to report.
-      stopReason: text === null ? why : lastStopReason,
-      session: file ?? (sessionId || null),
-      text,
-      at: Date.now(),
+      stopReason: report.text === null ? report.why : turnStopReason,
+      session: report.file ?? (sessionId || null),
+      text: report.text,
+      at,
     });
     if (!written.ok) {
       console.error(`piher: settle document for ${env.terminalId} was not written: ${written.reason}`
@@ -459,19 +497,34 @@ export default async function (pi: ExtensionAPI) {
       void sendUserMessageAs(notice, 'followUp');
     }
     if (lastStopReason !== ABORT_STOP_REASON && !aborted) void notices.flush('followUp');
-    // The request this settlement answers, read before the push consumes it: the pipe reply and the
-    // report document must reason about the same turn, and the push clears the request synchronously.
-    const settleSinceTs = pendingMachineRequest?.sinceTs ?? 0;
-    const hadRequest = pendingMachineRequest !== null;
-    const pushed = pushSettleReply(aborted);
-    // P1: the report document goes out on every settle regardless of the pipe push above.
-    const documented = writeSettleDocument({ aborted, sinceTs: settleSinceTs, hadRequest });
+    // One report for this settle, resolved before either channel uses it: the request (read before
+    // the push consumes it), the turn's stop reason, the closing words and the core's turn. All of it
+    // is captured HERE, synchronously — the document write runs before the push, and by then a newer
+    // turn or a newer request would have moved the live state these decisions depend on.
+    const request = pendingMachineRequest;
+    const turnStopReason = lastStopReason;
+    const at = Date.now();
+    const settled = collectSettleReport(request?.sinceTs ?? 0).catch((err: unknown) => {
+      // A report that cannot be read must not become an unhandled rejection that silently cancels the
+      // push: the words are gone, but the settle is still reported as "no closing message".
+      console.error(`piher: settle report could not be read: ${(err as Error)?.message ?? err}`);
+      return { text: null, why: null, file: ownSessionFile, turn: null } satisfies SettleReport;
+    });
+    // P1: the report document is written on every settle, and written BEFORE the reply leaves this
+    // process. Two reasons, both ordering: the master's reply handling reclaims a one-shot worker's
+    // pane immediately (the retire would otherwise cut the write short), and the reply names the
+    // document's `at` so the master can record exactly which settlement the pipe delivered (S7).
+    const pushed = settled
+      .then((report) => writeSettleDocument({ aborted, turnStopReason, report, hadRequest: request !== null, at })
+        .then((written) => pushSettleReply({
+          aborted, turnStopReason, request, report, docAt: written ? at : null,
+        })));
     // S54: a role-declared `one-shot` worker exits once its report is in the master's hands. The
-    // ordering is the whole risk — shutting down first loses the report the parent waits for — so the
-    // exit hangs off the push AND waits for the document write: three core round-trips the shutdown
-    // would otherwise cut short. An aborted turn reports nothing (S52).
+    // ordering is the whole risk — shutting down first loses the report the parent waits for — and
+    // `pushed` already resolves after the document write, so the exit waits for both. An aborted
+    // turn reports nothing (S52).
     if (isSubagent && !aborted && delegation?.lifecycle === 'one-shot') {
-      void Promise.all([pushed, documented]).then(([sent]) => { if (sent) ctx.shutdown(); });
+      void pushed.then((sent) => { if (sent) ctx.shutdown(); });
     } else {
       void pushed;
     }

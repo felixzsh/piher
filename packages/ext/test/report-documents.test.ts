@@ -35,16 +35,16 @@ test('isReportDocumentValue: only a full report value qualifies', () => {
 });
 
 test('planReportDelivery: one notice per settlement; another task is foreign, an earlier turn stale', () => {
-  const base = { taskId: 'task-1', address: 'p2', sinceTs: value().at, delivered: new Set<string>() };
+  const base = { taskId: 'task-1', address: 'p2', sinceTs: value().at, deliveredKeys: new Set<string>() };
   assert.deepEqual(planReportDelivery({ ...base, value: value() }), { kind: 'deliver' });
   assert.deepEqual(
-    planReportDelivery({ ...base, value: value(), delivered: new Set([reportDeliveryKey('p2', 3)]) }),
+    planReportDelivery({ ...base, value: value(), deliveredKeys: new Set([reportDeliveryKey('p2', value().at)]) }),
     { kind: 'duplicate' },
   );
   assert.deepEqual(
-    planReportDelivery({ ...base, value: value(), delivered: new Set([reportDeliveryKey('p2', 2)]) }),
+    planReportDelivery({ ...base, value: value(), deliveredKeys: new Set([reportDeliveryKey('p2', value().at - 1)]) }),
     { kind: 'deliver' },
-    'a new turn is a new settlement',
+    'a new settle is a new settlement',
   );
   assert.deepEqual(
     planReportDelivery({ ...base, value: value(), taskId: 'other-task' }),
@@ -60,31 +60,84 @@ test('planReportDelivery: one notice per settlement; another task is foreign, an
 });
 
 test('planReportDelivery: a revived generation is not the predecessor\'s duplicate', () => {
-  // Same task, same turn value, different terminal (spec S3): `turn` counts per terminal, so the pair
-  // (taskId, turn) alone would refuse a revived worker's own first settlement.
-  const delivered = new Set([reportDeliveryKey('p2', 1)]);
+  // Same task, same turn value, different terminal (spec S3): `turn` counts per terminal, so a key
+  // built on it would refuse a revived worker's own first settlement.
+  const deliveredKeys = new Set([reportDeliveryKey('p2', value().at)]);
   assert.deepEqual(
-    planReportDelivery({ value: value({ turn: 1 }), taskId: 'task-1', address: 'p7', sinceTs: 0, delivered }),
+    planReportDelivery({ value: value({ turn: 1 }), taskId: 'task-1', address: 'p7', sinceTs: 0, deliveredKeys }),
     { kind: 'deliver' },
   );
   assert.deepEqual(
-    planReportDelivery({ value: value({ turn: 1 }), taskId: 'task-1', address: 'p2', sinceTs: 0, delivered }),
+    planReportDelivery({ value: value({ turn: 1 }), taskId: 'task-1', address: 'p2', sinceTs: 0, deliveredKeys }),
     { kind: 'duplicate' },
   );
 });
 
-test('fitReportDocument: a value that fits is untouched, an oversized one is trimmed, not lost', () => {
-  const small = value();
-  assert.deepEqual(fitReportDocument(small), small, 'no rewrite when it fits');
+test('planReportDelivery: the pipe\'s document is suppressed even when its `at` is newer than the read that recorded it', () => {
+  // The harmful ordering finding 1 named: the reply is written before the document, so the document's
+  // `at` can land AFTER the master stamped the row. The identity the pipe reports is the document's
+  // own `at`, so the comparison is exact — a later read cannot slip past it.
+  const base = { taskId: 'task-1', address: 'p2', sinceTs: 0, deliveredKeys: new Set<string>() };
+  const doc = value({ at: 1_700_000_009_999 });
+  assert.deepEqual(
+    planReportDelivery({ ...base, value: doc, delivered: { address: 'p2', at: doc.at } }),
+    { kind: 'duplicate' },
+    'the document the pipe delivered is never announced again',
+  );
+  assert.deepEqual(
+    planReportDelivery({ ...base, value: doc, delivered: { address: 'p2', at: doc.at - 5_000 } }),
+    { kind: 'deliver' },
+    'a document from an earlier settle is still not suppressed by a newer watermark',
+  );
+  assert.deepEqual(
+    planReportDelivery({ ...base, value: doc, delivered: { address: 'p9', at: doc.at + 60_000 } }),
+    { kind: 'deliver' },
+    'a watermark for another address (another generation) suppresses nothing',
+  );
+  assert.deepEqual(
+    planReportDelivery({ ...base, value: doc, delivered: null }),
+    { kind: 'deliver' },
+    'nothing delivered yet',
+  );
+});
 
-  const huge = value({ text: 'x'.repeat(MAX_DOCUMENT_BYTES + 5_000) });
-  const fitted = fitReportDocument(huge);
-  assert.ok(Buffer.byteLength(JSON.stringify(fitted), 'utf8') <= MAX_DOCUMENT_BYTES, 'the value fits the core limit');
-  assert.ok((fitted.text ?? '').startsWith('xxx'), 'the report keeps its beginning');
-  assert.match(fitted.text ?? '', /\[report truncated: \d+ characters over the core's document limit\]/);
-  assert.equal(fitted.turn, huge.turn);
-  assert.equal(fitted.taskId, huge.taskId);
-  assert.equal(fitted.stopReason, huge.stopReason, 'only the text is trimmed');
+test('planReportDelivery: a stale turn read cannot swallow a settlement', () => {
+  // If the core had not published the turn change when the worker read it, two genuinely different
+  // settles can carry the same `turn`. They are different documents, so both are delivered: the
+  // settlement identity is the document, never the core's counter.
+  const deliveredKeys = new Set([reportDeliveryKey('p2', 1_700_000_000_000)]);
+  assert.deepEqual(
+    planReportDelivery({
+      value: value({ turn: 3, at: 1_700_000_005_000 }),
+      taskId: 'task-1', address: 'p2', sinceTs: 0, deliveredKeys,
+    }),
+    { kind: 'deliver' },
+    'same turn, later settle: a real settlement, not a duplicate',
+  );
+});
+
+test('fitReportDocument: an escape-heavy report keeps a real prefix, not just the marker', () => {
+  // NUL and SOH serialize to `\u0000`/`\u0001` — six bytes per character — so a byte overage is
+  // nothing like a character count: subtracting it from the character index drove the whole report to
+  // nothing, and a body that is only the marker is delivered as if it were the report.
+  const head = 'REPORT: the survey is done.\n';
+  const escapeHeavy = head + '\u0000\u0001'.repeat(400_000);
+  assert.ok(Buffer.byteLength(JSON.stringify(escapeHeavy), 'utf8') > 2 * MAX_DOCUMENT_BYTES);
+  const fitted = fitReportDocument(value({ text: escapeHeavy }));
+  const text = fitted.text ?? '';
+  assert.ok(Buffer.byteLength(JSON.stringify(fitted), 'utf8') <= MAX_DOCUMENT_BYTES, 'the value fits the ceiling');
+  assert.ok(text.startsWith(head), 'the beginning of the report survives');
+  assert.ok(text.length > 100_000, `a real prefix survives (kept ${text.length} of ${escapeHeavy.length} characters)`);
+  assert.match(text, /\[report truncated: \d+ characters over the core's document limit\]/);
+  const kept = text.slice(0, text.indexOf('\n\n[report truncated'));
+  assert.ok(escapeHeavy.startsWith(kept), 'the kept text is a verbatim prefix');
+  assert.ok(text.includes(`truncated: ${escapeHeavy.length - kept.length} characters`), 'the marker counts exactly what was dropped');
+});
+
+test('fitReportDocument: a report at the ceiling is kept whole', () => {
+  const text = 'z'.repeat(MAX_DOCUMENT_BYTES - 1_000);
+  const fitted = fitReportDocument(value({ text }));
+  assert.equal(fitted.text, text, 'no marker when nothing had to be dropped');
 });
 
 test('writeReportDocument: the first write lands at version 0', async () => {
@@ -155,21 +208,3 @@ test('writeReportDocument: repeated conflicts and a broken store fail with a rea
   assert.equal((await writeReportDocument(fakeCore(), 'T9', value())).ok, false, 'no document name, no write');
 });
 
-test('planReportDelivery: a document no newer than the delivered settlement is a duplicate', () => {
-  const base = { taskId: 'task-1', address: 'p2', sinceTs: 0, delivered: new Set<string>() };
-  assert.deepEqual(
-    planReportDelivery({ ...base, value: value(), deliveredAt: value().at }),
-    { kind: 'duplicate' },
-    'the pipe already delivered this one (S7)',
-  );
-  assert.deepEqual(
-    planReportDelivery({ ...base, value: value(), deliveredAt: value().at - 1 }),
-    { kind: 'deliver' },
-    'a newer document is a new settlement',
-  );
-  assert.deepEqual(
-    planReportDelivery({ ...base, value: value(), deliveredAt: null }),
-    { kind: 'deliver' },
-    'nothing delivered yet',
-  );
-});

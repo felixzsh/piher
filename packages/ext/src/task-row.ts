@@ -7,6 +7,7 @@
  * liveness is an observation from core and lives in memory only (S11).
  */
 import { foldWorktree, type WorktreeRecord } from './worktree.ts';
+import type { DeliveredReport } from './report-documents.ts';
 import type { Lifecycle } from './role-manifest.ts';
 
 /** One observation of a task's liveness, read from core when a surface needs it (S11). It feeds
@@ -82,15 +83,15 @@ export interface TaskEntry extends TaskRow {
    *  and the claim is per request, so this is what stops the master from reading one
    *  settlement twice. */
   noticeAnnounced?: { fingerprint: string; at: number } | null;
-  /** When this row's settlement was delivered from the worker's report document, by ANY path:
-   *  the pipe push or a poller. A document whose `at` is not newer belongs to that settlement, so
-   *  a re-armed watch never announces it again (spec S7). */
-  deliveredReportAt?: number | null;
+  /** The settlement last delivered for this row, by ANY path: the pipe push or a poller. It names
+   *  the document instance (address + the worker's `at`), which is exactly what the pipe reports
+   *  when it delivers, so a re-armed watch can never read the same report as news (spec S7). */
+  deliveredReport?: DeliveredReport | null;
 }
 
 /** The durable row alone: what a record file holds. */
 export function toTaskRow(entry: TaskEntry): TaskRow {
-  const { settleWindowStartedAt: _w, noticeAnnounced: _n, deliveredReportAt: _d, ...row } = entry;
+  const { settleWindowStartedAt: _w, noticeAnnounced: _n, deliveredReport: _d, ...row } = entry;
   void _w;
   void _n;
   void _d;

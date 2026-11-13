@@ -185,11 +185,10 @@ export function createPoller(h: PollerHost): Poller {
   /** Current tracked request per pane. startPoller refreshes it even while a poller runs: a
    * follow_up must judge settlement against its own injectTs, not the original request's. */
   const requestByPane = new Map<string, { injectTs: number; description: string; requestId: string }>();
-  /** Settlements already handed over from a report document, keyed by (address, turn) — the
-   *  address identifies the generation, because `turn` counts per terminal and a revived task gets a
-   *  new one (spec S3, S7). Survives `follow_up` re-arms within this mount, so a second `turn` event
-   *  for the same document value never delivers a second notice, while a revived worker's own first
-   *  settlement is still delivered. */
+  /** Settlements already handed over from a report document, keyed by (`address`, `at`) — the
+   *  document instance (spec S7). The address identifies the generation and `at` identifies the
+   *  settle, so a re-read of the same document is a repeat while a revived worker's own settlement
+   *  is still delivered. */
   const deliveredReports = new Set<string>();
   const now = h.now ?? Date.now;
   const settleWindowMs = h.policy?.settleWindowMs ?? runtimePolicy.settleWindowMs;
@@ -354,8 +353,8 @@ export function createPoller(h: PollerHost): Poller {
         taskId: entry.taskId,
         address: paneId,
         sinceTs: request.injectTs,
-        deliveredAt: entry.deliveredReportAt ?? null,
-        delivered: deliveredReports,
+        delivered: entry.deliveredReport ?? null,
+        deliveredKeys: deliveredReports,
       });
       if (plan.kind !== 'deliver') return plan.kind;
       if (!entry.gen.sessionFile && value.session) {
@@ -367,8 +366,8 @@ export function createPoller(h: PollerHost): Poller {
       // act on.
       const failure = value.text === null ? (value.stopReason ?? null) : null;
       if (await handOver(entry, value.text, true, request, failure) === 'retry') return 'retry';
-      deliveredReports.add(reportDeliveryKey(paneId, value.turn));
-      entry.deliveredReportAt = value.at;
+      deliveredReports.add(reportDeliveryKey(paneId, value.at));
+      entry.deliveredReport = { address: paneId, at: value.at };
       return 'delivered';
     }
 
@@ -377,18 +376,17 @@ export function createPoller(h: PollerHost): Poller {
      *  settlement is out), the second lets the transcript heuristic take over — a worker whose
      *  document channel broke still settles through the fallback. */
     let duplicateWakes = 0;
-    /** Whether THIS loop settled the row. Only then does it stay on as a reader for the worker's
-     *  next settle; a row consumed elsewhere (the pipe push, an earlier arming) ends the watch. */
-    let settledHere = false;
+    /** Whether the row was already settled when this watch was armed. Such a watch was armed for
+     *  nothing and ends at once. A row settled WHILE the loop runs — by the pipe push, which is the
+     *  normal path — does not end it: that worker's next settle (a person typing in its pane, a
+     *  queued steer) writes a document, and S6 says the master must read it. */
+    const armedConsumed = taskForPane(h.tasks, h.panes, paneId)?.gen.consumedAt !== null;
     try {
       while (true) {
         const current = requestByPane.get(paneId) ?? { injectTs, description, requestId };
         const entry = taskForPane(h.tasks, h.panes, paneId);
         if (!entry || isClosed(entry) || isSpent(entry)) return;
-        // A row settled elsewhere (the pipe push, an earlier arming) ends this watch: the request it
-        // was armed for already reached its end. Only a row THIS loop settled stays on as the reader
-        // for the worker's next settle (spec S6).
-        if (entry.gen.consumedAt !== null && !settledHere) return;
+        if (armedConsumed) return;
 
         // Read the version BEFORE the state: an event landing in between still wakes the park below.
         const seen = watch.version(paneId);
@@ -430,6 +428,24 @@ export function createPoller(h: PollerHost): Poller {
         }
         if (gate.kind === 'clear-gate') h.blockedGateNotified.delete(paneId);
 
+        // A row settled while this loop ran — normally by the pipe push, which is the ordinary path —
+        // keeps one reader and nothing else: the worker's next settle (a person typing in its
+        // attachable pane, a queued steer) writes a document, and S6 says the master must read it.
+        // No heuristic, no vacuum, no gate here: those would re-announce or fail a worker that has
+        // already reported. The wait is the vacuum budget, not the poll interval — a new settle
+        // changes the core's status first, and that event wakes this park, so an idle worker costs
+        // no RPCs (a `doc` event is no help: spec S23 keeps them off this subscription).
+        if (entry.gen.consumedAt !== null) {
+          const landed = await deliverDocument(entry, current);
+          if (isSpent(entry) || state === 'exited' || !alive) return;
+          if (landed === 'retry') await park(recheckMs);
+          else {
+            lastActivityAt = now();
+            await park(timeoutMs);
+          }
+          continue;
+        }
+
         // ── the report document: the settlement channel (spec S6–S8, S23) ──
         // Read on any wake that does not say the worker is mid-turn. A pane that has exited is
         // included: its document may hold a complete report, and announcing "stopped before
@@ -441,37 +457,19 @@ export function createPoller(h: PollerHost): Poller {
             continue;
           }
           if (doc === 'delivered') {
-            settledHere = true;
             duplicateWakes = 0;
-            // A spent or ended worker has no later settle to read: the watch ends with it.
-            if (isSpent(entry) || state === 'exited' || !alive) return;
-            // Otherwise the row stays under watch as a reader (spec S6): the worker writes its
-            // document on every settle, including one the master never asked for, and that later
-            // report must reach the master too. The row stays consumed; only this channel runs.
-            // The wait is the vacuum budget, not the poll interval: a new settle changes the core's
-            // status first, and that event wakes this park — an idle worker costs no RPCs, which is
-            // why a document event is not needed (spec S23: doc events are not delivered here).
-            lastActivityAt = now();
-            await park(timeoutMs);
-            continue;
+            continue; // the consumed-row reader above takes over on the next pass
           }
           if (doc === 'duplicate' && duplicateWakes === 0) {
             // This request's settlement is already out. Park once: the next settle writes a new
-            // document. On the wake after that the transcript heuristic takes over, so a row still
-            // awaiting its settlement is never stranded by a document channel that broke.
+            // document, and on the wake after that the transcript heuristic takes over, so a row
+            // still awaiting its settlement is never stranded by a document channel that broke.
             duplicateWakes += 1;
-            if (isSpent(entry) || state === 'exited' || !alive) return;
             await park(recheckMs);
             continue;
           }
-          // `stale`, `foreign` and `absent` fall through: the document says nothing about THIS
-          // request, and the transcript heuristic below stays the worker's channel. A row settled by
-          // this loop has nothing left for that heuristic or for the vacuum — it stays a reader.
-          if (entry.gen.consumedAt !== null) {
-            if (isSpent(entry) || state === 'exited' || !alive) return;
-            await park(timeoutMs);
-            continue;
-          }
+          // `stale`, `foreign` and `absent` fall through: the document says nothing about THIS request,
+          // and the transcript heuristic below stays the worker's channel.
         }
 
         if (state === 'idle' || state === 'done' || state === 'error') {

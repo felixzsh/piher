@@ -397,7 +397,9 @@ test('pollLoop: a blocked worker parks at the poll interval and makes no RPC', a
   f.waitState('blocked');
   let parks = 0;
   f.onPark(() => {
-    if (++parks >= 5) f.entry!.gen.consumedAt = f.virtual.now; // end supervision without consuming
+    // Closing the task is the unconditional end of supervision now that a consumed row keeps a
+    // reader (spec S6): this test ends the loop without settling anything.
+    if (++parks >= 5) f.entry!.closedAt = f.virtual.now;
     return false;
   });
   await start(f);
@@ -411,7 +413,7 @@ test('pollLoop: an idle pane that is not yet settleable parks at the poll interv
   f.state({ text: null, pendingTool: false, activity: false, turnEnded: false });
   let parks = 0;
   f.onPark(() => {
-    if (++parks >= 4) f.entry!.gen.consumedAt = f.virtual.now;
+    if (++parks >= 4) f.entry!.closedAt = f.virtual.now;
     return false;
   });
   await start(f);
@@ -434,11 +436,11 @@ test('pollLoop: a disconnected watch never settles nor reports pane-closed/timeo
   f.panes.length = 0; // even a getTerminal fallback would read "gone"
   let parks = 0;
   f.onPark(() => {
-    if (++parks >= 20) f.entry!.gen.consumedAt = f.virtual.now; // end supervision without consuming
+    if (++parks >= 20) f.entry!.closedAt = f.virtual.now; // end supervision without settling
     return false;
   });
   await start(f);
-  assert.ok(f.entry!.gen.consumedAt !== null);
+  assert.ok(f.entry!.closedAt !== null, 'the watch ended on the test’s own close');
   assert.deepEqual(f.getTerminalCalls, [], 'a stale snapshot is never trusted, and no fallback is made');
   assert.equal(f.writes.length, 0, 'blindness never consumes the row');
   assert.equal(f.notices.length, 0, 'no pane-closed and no timeout notice while blind');
@@ -749,11 +751,12 @@ test('pollLoop: an already-settled row whose pane closes announces no failure', 
 });
 
 test('pollLoop: a settlement the pipe already delivered is not re-announced from its document', async () => {
-  // The exact shape finding 1 named: the worker settled, the pipe push delivered the report and
-  // consumed the row, the master sent a follow-up (which clears the consume time), and the old
-  // document is still the only one the core holds. It must not read as the new request's answer.
+  // The exact shape finding 1 named, in its HARMFUL ordering: the pipe reply was written before the
+  // document, so the document's `at` is STRICTLY NEWER than anything a clock-based watermark could
+  // have recorded. The pipe reports the document's own `at`, so the row's identity is exact and the
+  // document is still recognised as already delivered.
   const f = docFixture();
-  f.entry!.deliveredReportAt = DOC_STARTED_MS; // what consumeReply stamps
+  f.entry!.deliveredReport = { address: 'p-doc', at: DOC_STARTED_MS }; // what consumeReply records
   f.seed(1, { text: 'REPORT: already delivered by the pipe', at: DOC_STARTED_MS });
   const events = [
     () => true,
@@ -764,11 +767,32 @@ test('pollLoop: a settlement the pipe already delivered is not re-announced from
   assert.equal(f.notices.filter((n) => /finished and will do no further work/.test(n)).length, 0,
     `the earlier settlement is not announced again: ${JSON.stringify(f.notices)}`);
   assert.ok(f.notices.every((n) => !n.includes('already delivered by the pipe')));
+  assert.deepEqual(f.claimKeys, [], 'and it claims nothing for the re-armed request');
+});
+
+test('pollLoop: a document written after the reply landed is still suppressed by identity', async () => {
+  // Regression for the reviewer's ordering argument: the reply leaves the worker before the document
+  // write completes, and the document's `at` is taken after core round trips — it is NEWER than the
+  // instant the master handled the reply. A watermark compared as "newer than the stamp" would hand
+  // this document over as a new settlement. The reply names the document's own `at`, so the match is
+  // exact and the ordering cannot matter.
+  const f = docFixture();
+  const writtenAt = DOC_STARTED_MS + 3_000; // the document, written after the reply was consumed
+  f.entry!.deliveredReport = { address: 'p-doc', at: writtenAt }; // what the reply's docAt recorded
+  f.seed(1, { text: 'REPORT: written after the reply landed', at: writtenAt });
+  const events = [
+    () => true,
+    () => { f.waitState('exited'); return true; },
+  ];
+  f.onPark(async () => (events.shift() ?? (() => false))());
+  await start(f);
+  assert.equal(f.notices.filter((n) => /finished and will do no further work/.test(n)).length, 0,
+    `the document the reply named is never announced again: ${JSON.stringify(f.notices)}`);
 });
 
 test('pollLoop: the next settle after a pipe delivery is delivered again', async () => {
   const f = docFixture();
-  f.entry!.deliveredReportAt = DOC_STARTED_MS;
+  f.entry!.deliveredReport = { address: 'p-doc', at: DOC_STARTED_MS };
   f.seed(1, { text: 'REPORT: already delivered by the pipe', at: DOC_STARTED_MS });
   const events = [
     () => { f.seed(2, { text: 'REPORT: the follow-up answer', at: DOC_STARTED_MS + 5_000 }); return true; },
@@ -778,4 +802,40 @@ test('pollLoop: the next settle after a pipe delivery is delivered again', async
   await start(f);
   assert.equal(f.notices.length, 1, `one settlement, the new one: ${JSON.stringify(f.notices)}`);
   assert.ok(f.notices[0]!.includes('REPORT: the follow-up answer'));
+});
+
+test('pollLoop: a settlement the pipe consumed mid-watch still has a reader for the next one', async () => {
+  // S6 on the ordinary path: the pipe delivered this settlement (so the row is consumed by the pipe,
+  // not by this loop), and the watch was armed before that. The worker's next unrequested settle —
+  // a person typing in its attachable pane — writes a document the master must still receive.
+  const f = docFixture();
+  f.entry!.deliveredReport = { address: 'p-doc', at: DOC_STARTED_MS };
+  f.seed(1, { text: 'REPORT: delivered by the pipe', at: DOC_STARTED_MS });
+  const events = [
+    // The pipe consumes the row in the middle of the armed watch, exactly as consumeReply does.
+    () => { f.entry!.gen.consumedAt = DOC_STARTED_MS + 1_000; return true; },
+    () => { f.seed(2, { text: 'REPORT: the person typed something', at: DOC_STARTED_MS + 9_000 }); return true; },
+    () => { f.waitState('exited'); return true; },
+  ];
+  f.onPark(async () => (events.shift() ?? (() => false))());
+  await start(f);
+  assert.equal(f.notices.length, 1, `the later settle reaches the master: ${JSON.stringify(f.notices)}`);
+  assert.ok(f.notices[0]!.includes('REPORT: the person typed something'));
+  assert.ok(!f.notices[0]!.includes('delivered by the pipe'));
+});
+
+test('pollLoop: two settles sharing a core turn value are both delivered', async () => {
+  // Finding 5's immunity: if the worker read the core's turn before it advanced, two different
+  // settles carry the same `turn`. The settlement identity is the document, so neither is lost.
+  const f = docFixture();
+  const events = [
+    () => { f.seed(3, { text: 'REPORT: first settle', at: DOC_STARTED_MS }); return true; },
+    () => { f.seed(3, { text: 'REPORT: second settle, same turn', at: DOC_STARTED_MS + 7_000 }); return true; },
+    () => { f.waitState('exited'); return true; },
+  ];
+  f.onPark(async () => (events.shift() ?? (() => false))());
+  await start(f);
+  assert.equal(f.notices.length, 2, `both settlements are delivered: ${JSON.stringify(f.notices)}`);
+  assert.ok(f.notices[0]!.includes('REPORT: first settle'));
+  assert.ok(f.notices[1]!.includes('REPORT: second settle, same turn'));
 });

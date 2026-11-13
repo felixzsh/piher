@@ -530,8 +530,10 @@ export interface SubagentPort {
   listRunningSubs(): WorkerWidgetRow[];
   /** The `piher.settlement` card for a pipe-delivered settlement (S57). */
   settlementCard(paneId: string, outcome: SettlementOutcome): SettlementCard;
-  /** Pipe settlement: drop the row out of listRunningSubs before the finish notice wakes the master. */
-  consumeReply(paneId: string, outcome: string | null): void;
+  /** Pipe settlement: drop the row out of listRunningSubs before the finish notice wakes the master.
+   *  `docAt` is the settlement document's own `at` when the worker wrote one: the row records it so
+   *  a re-armed watch treats that document as delivered (spec S7). */
+  consumeReply(paneId: string, outcome: string | null, docAt?: number | null): void;
 }
 
 export interface SubagentPortBox {

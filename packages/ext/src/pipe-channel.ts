@@ -63,6 +63,11 @@ export type PipeRequest =
       paneId: string;
       text: string | null;
       sessionFile: string | null;
+      /** The `at` of the report document this reply is the settlement of, when the worker wrote
+       *  one. It lets the master record exactly which settlement the pipe delivered, so a re-armed
+       *  watch never reads the same document as news (spec S7) — an identity, not a race between
+       *  two clocks. */
+      docAt?: number | null;
     };
 
 export type PipeResponse =

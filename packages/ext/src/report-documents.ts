@@ -26,9 +26,6 @@ export interface ReportDocumentValue {
 /** The core's per-document ceiling; a value at or under it always fits. */
 export const MAX_DOCUMENT_BYTES = 1024 * 1024;
 
-/** Room kept for the truncation marker while fitting a value. */
-const TRUNCATION_SLACK_BYTES = 200;
-
 export function truncationMarker(droppedChars: number): string {
   return `\n\n[report truncated: ${droppedChars} characters over the core's document limit]`;
 }
@@ -64,15 +61,23 @@ export function isReportDocumentValue(value: unknown): value is ReportDocumentVa
     && typeof v.at === 'number';
 }
 
-/** Dedupe key for one settlement delivery (spec S7): one notice per (`taskId`, `turn`).
+/** Dedupe key for one settlement delivery (spec S7): one notice per settlement.
  *
- *  The address is part of the key because `turn` counts per terminal and a revived task gets a new
- *  terminal (spec S3): two generations can each settle on the same turn value. Keying on the pair
- *  alone would read a revived worker's first settlement as a repeat of its predecessor's and refuse
- *  it. The task id is checked separately (a document from another task is never ours), so this pair
- *  is strictly finer than S7's — one delivery per settlement, never fewer. */
-export function reportDeliveryKey(address: string, turn: number): string {
-  return `${address}:${turn}`;
+ *  The identity is the *document instance* — its address and the worker's own `at` — not
+ *  (`taskId`, `turn`). `turn` is the core's counter and is recorded in the value for the master's
+ *  eyes, but it cannot be the key: a revive reuses turn values on a new terminal (spec S3), and a
+ *  settle that reads the record before the core has published the turn change would file a genuine
+ *  settlement under the previous turn and lose it as a duplicate. `at` is minted by the worker once
+ *  per settle, so it names exactly one settlement and repeats exactly for a re-read of the same
+ *  document. */
+export function reportDeliveryKey(address: string, at: number): string {
+  return `${address}:${at}`;
+}
+
+/** The last settlement delivered for a row: which document, identified the same way. */
+export interface DeliveredReport {
+  address: string;
+  at: number;
 }
 
 export type ReportDeliveryPlan =
@@ -91,44 +96,63 @@ export type ReportDeliveryPlan =
 export function planReportDelivery(input: {
   value: ReportDocumentValue;
   taskId: string;
-  /** The worker address the document was read from; identifies the generation (`turn` is per it). */
+  /** The worker address the document was read from; identifies the generation. */
   address: string;
   /** The current request's boundary: a document written before it answers an earlier request. */
   sinceTs: number;
-  /** When this row's settlement was last delivered, by any path (`deliveredReportAt`). A document
-   *  no newer than that IS the settlement already announced — a follow-up clearing the consume time
-   *  must not make the pipe-delivered report look like news. */
-  deliveredAt?: number | null;
-  delivered: ReadonlySet<string>;
+  /** The settlement already delivered for this row, by any path — the pipe push or a poller. The
+   *  pipe reports the very `at` of the document it delivered, so this is an exact identity, never a
+   *  race between two clocks: a follow-up clearing the consume time must not make the report the
+   *  pipe already announced look like news. */
+  delivered?: DeliveredReport | null;
+  /** Settlements this mount delivered, by `reportDeliveryKey`. */
+  deliveredKeys: ReadonlySet<string>;
 }): ReportDeliveryPlan {
   if (input.value.taskId !== input.taskId) return { kind: 'foreign' };
-  if (input.deliveredAt != null && input.value.at <= input.deliveredAt) return { kind: 'duplicate' };
+  if (input.delivered && input.delivered.address === input.address && input.value.at <= input.delivered.at) {
+    return { kind: 'duplicate' };
+  }
   if (input.value.at < input.sinceTs) return { kind: 'stale' };
-  if (input.delivered.has(reportDeliveryKey(input.address, input.value.turn))) return { kind: 'duplicate' };
+  if (input.deliveredKeys.has(reportDeliveryKey(input.address, input.value.at))) return { kind: 'duplicate' };
   return { kind: 'deliver' };
 }
 
 /**
  * Fit a report value inside the core's per-document ceiling (spec S13): the document keeps the
- * whole report when it fits, and otherwise keeps a prefix of it plus a marker saying how much was
- * dropped. Only the text is trimmed — the settlement facts stay exact, so a truncated report is
- * still delivered rather than lost to an unwritable document.
+ * whole report when it fits, and otherwise keeps the longest prefix that does, plus a marker saying
+ * how much was dropped. Only the text is trimmed — the settlement facts stay exact, so a truncated
+ * report is still delivered rather than lost to an unwritable document.
+ *
+ * The prefix is found by binary search over the fit itself: byte length is not a function of the
+ * character count (a quote, a newline or an escaped control character costs several bytes), so
+ * shrinking by the overage in characters would overshoot — and for an escape-heavy report it drove
+ * the text to nothing, delivering a body that was only the marker.
  */
 export function fitReportDocument(value: ReportDocumentValue, maxBytes = MAX_DOCUMENT_BYTES): ReportDocumentValue {
   if (byteLength(value) <= maxBytes) return value;
   const original = value.text ?? '';
-  let keep = original.length;
-  let candidate: ReportDocumentValue = { ...value };
-  // Shrink towards a fit, one marker-sized step at a time; the loop is bounded by the text length.
-  for (let attempt = 0; attempt < 24 && keep > 0; attempt++) {
-    const dropped = original.length - keep;
-    const text = original.slice(0, keep) + truncationMarker(dropped);
-    candidate = { ...value, text };
-    if (byteLength(candidate) <= maxBytes) return candidate;
-    const overBy = byteLength(candidate) - maxBytes;
-    keep = Math.max(0, keep - Math.max(1, overBy + TRUNCATION_SLACK_BYTES));
+  const withPrefix = (keep: number): ReportDocumentValue => ({
+    ...value,
+    text: original.slice(0, keep) + truncationMarker(original.length - keep),
+  });
+  // Largest `keep` whose value fits. The marker alone may still not fit a pathological ceiling, in
+  // which case the text is empty: never more than the ceiling, and never a silent lie about length.
+  let low = 0;
+  let high = original.length;
+  let best: ReportDocumentValue | null = null;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = withPrefix(mid);
+    if (byteLength(candidate) <= maxBytes) {
+      best = candidate;
+      low = mid + 1;
+    } else if (mid === 0) {
+      break;
+    } else {
+      high = mid - 1;
+    }
   }
-  return { ...value, text: truncationMarker(original.length) };
+  return best ?? { ...value, text: '' };
 }
 
 function byteLength(value: unknown): number {
