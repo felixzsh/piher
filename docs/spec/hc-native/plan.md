@@ -301,3 +301,29 @@ Residuals: no live master run of a ten-settlement batch; `reports` is untested a
 `docGet`; the `timeout` readiness verdict is now unreachable through the core's vocabulary and is kept
 only as the wait loop's terminator; E1 still needs `inbox`, E6 still needs a session-wide budget, and
 the review's critical finding (a deferred acceptance stamping a row it no longer owns) is still open.
+L17. **The review's critical and two majors, closed — and the 44-minute hang**: `bb90406` (M1) +
+`db18021` (C1) + `1f16d42` (M2), parent `1ce8c8c`, plus `4abba7f` (the wall clock and the long-command
+rule), Risk: item 5 (who owns a row at acceptance time, and what a cursor means), `tsc` clean +
+`npm test` **600 tests, 594 pass, 6 skipped, 0 fail** on `1f16d42`, verified by the parent. All three
+findings were confirmed, none refuted. **C1**: `acceptSettlement` re-resolved the row at flush time and
+stamped `consumedAt` with an `at` that predated a steer, then reclaimed a one-shot pane the steer was
+running; now the acceptance carries the `PaneRequest` it was judged against and mutates the row only
+while `requestByPane.get(pane).id` is still that one — the steer registers a new request, so the old
+acceptance no longer owns the row, while the **delivery is still recorded** because pi did read the
+notice. The map is not cleared on dispose, so a normal acceptance is unaffected. **M1**: `markDelivered`
+was a high-water mark, so accepting seq 2 while 1 was pending hid 1 forever; the cursor now crosses only
+the contiguous prefix, at the cost that an acceptance made above a gap by a dead process is not
+remembered and re-delivers (at-least-once, normally suppressed by the row). **M2**: the replay loop
+injected per event with `triggerTurn`, so a restart cost one turn per settlement; it now plans one batch
+with the live path's `planNoticeBatch`. **The hang, for the record**: a worker spent 44 minutes in a
+single `node --test` that never terminated — its own fixture deferred *every* acceptance, so the steer's
+settlement was never accepted and the poll loop parked forever, and it ran the file without
+`--test-timeout`, so the run blocked instead of failing. The parent reproduced it (179 s, `Promise
+resolution is still pending but the event loop has already resolved`) and added the protections that
+make it impossible to lose another hour: `npm test` is wrapped in `timeout 240` (`4abba7f`), so the
+suite fails at four minutes naming the file (measured: `EXIT=124`, 239.9 s), and one rule in the global
+instructions, the repo's `AGENTS.md` and the worker template — any command that may take a while goes to
+`bg_job`, and a test that takes long is unacceptable except for a full suite, an e2e or a complete
+integration pass. Unproven: no live master run of C1 (the steer sequence is a scripted harness), no real
+core behind the replay batch, a buffered multi-pane replay does not mark its panes GC-exempt, and
+`reports` against a real `docGet` is still untested. Still open from the review: the six minor findings.
