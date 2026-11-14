@@ -19,13 +19,16 @@ its own rules.
 | Piece | Package | Role |
 |---|---|---|
 | **pi extension** | `packages/ext` (npm: [`piher`](https://www.npmjs.com/package/piher)) | Registers `subagent` and `bg_job`; starts, reads and reclaims their terminals through core; carries the role manifests and the task records |
-| **herdr-core** | `hc` ≥ 0.1.16 | Terminal server: `terminal.run/read/wait/send/keys/interrupt/label/kill/rm` plus status and events over `HC_TERMINAL_SOCKET` |
+| **herdr-core** | `hc` ≥ 0.1.16 | Terminal server: `terminal.run/read/wait/send/keys/interrupt/label/kill/rm`, `doc.get`/`doc.set` and `events.subscribe`, over its own socket (`HC_TERMINAL_SOCKET`) |
 | **Herdr app** | `herdr-app` (optional) | Displays core terminals as spaces, tabs and panes; its built-in sidebar shows agents and raises blocked notifications |
 
 ## Architecture
 
-- piher talks to core over the terminal socket it inherits: `HC_TERMINAL_SOCKET` (the socket) and
-  `HC_TERMINAL_ID` (its own address). Both are injected by core and read-only for piher.
+- **One transport, and it is the core's own**: piher dials the `HC_TERMINAL_SOCKET` it inherits —
+  core's JSON-RPC 2.0 endpoint — and `HC_TERMINAL_ID` is its own address. Both are injected by core
+  and read-only for piher. One connection per request, plus one long-lived `events.subscribe` per
+  worker. piher opens **no listener** and owns **no socket, pipe or channel of its own**; nothing
+  survives from the private pipe this extension used to run.
 - A worker is one `terminal.run {argv, cwd, env, labels: {herdr.space, herdr.tab}, noNotify: true}`
   call. Core starts the program; the app adopts that terminal as an unfocused pane of the caller's
   tab. A **new** `herdr.tab` id makes the app create a new tab — piher never does placement math. A
@@ -43,15 +46,22 @@ its own rules.
   what tells this task's worker from whatever a reused address holds now; spec S26). `hc get
   <terminal> --json` shows them. A worker's **session identity** comes from the core's own `hresume`
   label, written by the worker's Herdr extension — piher writes no session label of its own.
-- Machine-to-machine messages use **the core's documents** (`piher.rep.<address>`,
-  `piher.cmd.<address>`), never a socket of piher's, and the extension opens no listener: a report, a
-  steer and a replacement request all travel as document values. Two keystrokes are piher's and only
-  two: the worker's first task (`terminal.send`, then `enter` when the brief stayed in the composer,
-  gated on the core's `idle`) and `interrupt` (`terminal.interrupt` presses the pane's own stop key,
-  `esc` or `ctrl+c`). Everything else leaves the pane's keyboard to the person at it, and core's
-  parent notes are disabled for worker terminals (`noNotify: true`).
+- Machine-to-machine messages are **core documents**, not a channel of piher's:
+  `piher.rep.<address>` for a worker's report and `piher.cmd.<address>` for a steer or a replacement
+  request. The core stores them, so neither a core restart nor a master restart loses a report, and a
+  command carries the `taskId` it belongs to — an address alone restarts with the core and cannot
+  identify a reader. Two keystrokes are piher's and only two: the worker's first task
+  (`terminal.send`, with `enter` when the brief stayed in the composer — delivery proven by
+  `started: true` or by a turn that began, never by an `idle` sample alone) and `interrupt`
+  (`terminal.interrupt` presses the pane's own stop key, `esc` or `ctrl+c`). Everything else leaves
+  the pane's keyboard to the person at it, and core's parent notes are disabled for worker terminals
+  (`noNotify: true`).
 - State arrives through core's `events.subscribe` (`status` / `turn` / `finished` / `labels`); a
-  snapshot is pulled only when an event fires or a `missed` event says to resync.
+  snapshot is pulled only when an event fires or a `missed` event says to resync. Nothing polls a
+  worker's state.
+- **A settlement is `turn` plus the report document** — never a timer, pane text or a parsed
+  transcript. The only timer left in settlement is the silence budget, and what it produces is a
+  notice that the worker never reported, not a verdict about what it did.
 
 ## The two tools
 
@@ -65,6 +75,8 @@ worker's result arrives later, as a settlement notice at the caller's next turn 
 | `spawn` (default) | Start a worker from `prompt` (the whole task), `description`, `cwd` **or** `worktree`, `role`, `allowed_tools`, `tab`. Several spawns in one message run in parallel (cap four) |
 | `send` | Follow-up steered between tool calls; a task with no pane revives first, a closed or spent one is refused |
 | `output` | What the worker printed since the previous `output` call, plus the final report once it has one |
+| `reports` | The bodies a notice withheld, by the `ids` that notice printed — one turn instead of ten |
+| `inbox` | The facts after `since` (default: this session's delivered cursor), `limit` at a time — how a lost notice is recovered without guessing |
 | `list` | Every actionable task with state, handle, role and last activity, plus another session's live ones marked |
 | `interrupt` | Abort the current turn only — the pane and its session stay, and no report arrives for that turn |
 | `retry` | Re-send the stored spawn prompt after a fault outside the task; a closed task starts a new one |
@@ -152,16 +164,30 @@ hand-written body, and an integration test fails when the two disagree — the d
 
 ## The task documents
 
-One spawned worker is one task, and a task is two documents: one record per task at
+One spawned worker is one task, and a task is three things: one record per task at
 `<repo>/.piher/tasks/<taskId>.json` in the **main** checkout — a worker in a linked worktree records
-into the repository, never into the worktree — plus this session's view. Liveness is observed, never
-stored: `list` shows `running`, `idle`, `no report` or `no pane` from live probes, not from a saved
-status. `close` is final for every session, so further work always starts a new subagent.
-Outside a git repository nothing is recorded and `resume` says so.
+into the repository, never into the worktree — this session's settlement ledger beside it, and this
+session's view. Liveness is observed, never stored: `list` shows `running`, `idle`, `no report` or
+`no pane` from live probes, not from a saved status. `close` is final for every session, so further
+work always starts a new subagent. Outside a git repository nothing is recorded and `resume` says
+so.
 
-On the parent side, a finished worker's result arrives as a notice that names the worker and marks its
-text as that worker's output; while the parent is busy, notices are buffered and the batch shows the
-first few plus a tail that says how many were withheld.
+The ledger (`settlement-<sessionId>.jsonl`) is append-only, one line per fact, and its cursor is
+written **only after pi accepted the message**: a crash, a `/reload` or a compaction re-delivers
+what was never read instead of losing it, and every fact carries its (`taskId`, `turn`) so a repeat
+is recognisable rather than silent. `inbox` reads those facts, `reports` reads the withheld bodies
+from the same documents, and a report outlives its pane, its record and a core restart.
+
+On the parent side, a finished worker's result arrives as a notice that names the worker and marks
+its text as that worker's output; while the parent is busy, notices are buffered and the batch shows
+the first few plus a tail that says how many were withheld. Report text is budgeted twice — 4 KiB
+inline per delivery, 32 KiB across a session with a durable counter — and past either ceiling a row
+arrives with a pointer instead of a body, saying which budget withheld it. A compaction pauses the
+buffer, so a settlement that lands mid-cut is delivered after it, with a roster of running,
+settled-unread and failed tasks riding the same message.
+
+A worker is a real pi process, measured here at a median 212 MB RSS: about twenty fit this machine
+and forty do not. The extension states that limit instead of hiding it.
 
 ## Install
 
@@ -226,6 +252,8 @@ noted. `PIHER_*` is the only namespace.
 | `PIHER_COMMAND_PICKUP_MS` | `1500` | Read-back budget of a steering command (`0`: no wait) |
 | `PIHER_GC_TICK_MS` | `30000` | Idle GC sweep cadence |
 | `PIHER_SESSION_TTL_SECONDS` | `600` | Session retention after a worker exits, before GC |
+| `PIHER_NOTICE_BODY_BUDGET_BYTES` | `4096` | Report text one settlement delivery carries inline; over it the notice is a row with a pointer |
+| `PIHER_SESSION_REPORT_BUDGET_BYTES` | `32768` | Report text one session carries inline across every delivery; once spent, further reports arrive as rows |
 | `PIHER_GIT_TIMEOUT_MS` | `10000` | git command timeout (worktree creation, status probes) |
 | `PIHER_JOBS_DIR` | system temp `piher-jobs` | Directory receiving one log file per background job |
 | `PIHER_WRITE_LOCK` | – | `1` makes a conflicting `write`/`edit` block instead of warn |
@@ -256,8 +284,9 @@ extension that owns `subagent` (for example `@tintinweb/pi-subagents`, `@minhduy
 
 - **The session transcript is the source of truth**: delegations and role switches replay
   from session branches, so a restart or a branch switch stays correct.
-- **Event-driven, never poll**: core's `events.subscribe` drives state; polling is a safety net with a
-  long interval, not the mechanism.
+- **Event-driven, never poll**: core's `events.subscribe` drives state. The two timers that remain —
+  the silence budget and the pane GC sweep — produce a notice or a sweep, never a verdict about
+  whether a worker finished.
 - **Zero app-side mod**: piher writes terminals and labels through core; the app decides how they look.
 - **PTY input belongs to humans**: machine-to-machine messages travel as core documents; core's
   parent notes are off for worker terminals.
@@ -275,13 +304,15 @@ docs/              # install guide, configuration overview, decision index, rele
 
 ```sh
 npm install --ignore-scripts
-npm test                  # typecheck + the whole suite (473 tests, ~15 s)
+npm test                  # typecheck + the whole suite (652 tests, ~25 s)
 npm run test:mutation
 ```
 
 `test/integration/` gathers what spawns a process, opens a socket, touches a real git worktree or
 boots the composition root; the rest is pure logic. That is directory order, not a separate command —
-the same `npm test` runs both, in about fifteen seconds.
+the same `npm test` runs both, in about half a minute. One test stays skipped on purpose: E10, the
+per-worker subscription cost, is a limit of the core, written down in
+[docs/spec/hc-native/invariants.md](docs/spec/hc-native/invariants.md).
 
 ## License
 

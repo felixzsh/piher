@@ -23,7 +23,7 @@ loads and both tools answer with that install command instead of running anythin
 
 | Surface | Names |
 |---|---|
-| Tools | `subagent` (`spawn`, `send`, `retry`, `output`, `list`, `interrupt`, `resume`, `close`, `help`), `bg_job` (`start`, `status`, `log`, `stop`, `list`) |
+| Tools | `subagent` (`spawn`, `send`, `retry`, `output`, `reports`, `inbox`, `list`, `interrupt`, `resume`, `close`, `help`), `bg_job` (`start`, `status`, `log`, `stop`, `list`) |
 | Commands | `/piher-role`, `/piher-config`, `/piher-locks` |
 | Skill | `piher-tools` — when to delegate, what a prompt must contain, the answer-or-`BLOCKED:` report contract |
 | Session entries | `piher.delegation`, `piher.settlement`, `piher.role-manifest`, `piher.job-exit`, `piher.config-guide` |
